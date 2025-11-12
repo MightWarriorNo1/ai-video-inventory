@@ -122,3 +122,4 @@ class MediaRotator:
         
         return [str(f) for f in image_files]
 
+

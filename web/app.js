@@ -170,3 +170,4 @@ async function setupCameraFilter() {
 // Manual refresh functions
 window.loadEvents = loadEvents;
 
+

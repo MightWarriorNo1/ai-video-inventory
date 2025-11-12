@@ -112,3 +112,4 @@ class SpotResolver:
         """
         return self.spots.copy()
 
+

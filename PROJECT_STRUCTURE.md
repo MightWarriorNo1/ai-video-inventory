@@ -189,3 +189,4 @@ Access at `http://<device-ip>:8080/`:
 - `GET /healthz` - Health check
 - `GET /events` - Recent events from CSV
 
+

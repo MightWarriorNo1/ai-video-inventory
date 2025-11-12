@@ -297,3 +297,4 @@ class MultiPublisher:
                 total += pub.queue.qsize()
         return total
 
+

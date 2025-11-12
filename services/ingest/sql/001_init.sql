@@ -44,3 +44,4 @@ SELECT add_continuous_aggregate_policy('trailer_events_hourly',
     if_not_exists => TRUE
 );
 
+
