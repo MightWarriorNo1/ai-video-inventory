@@ -1,0 +1,20 @@
+globals:
+  use_gstreamer: true  # Use GStreamer pipeline on Jetson for NVDEC
+  detector_conf: 0.35  # Detection confidence threshold
+  detect_every_n: 5    # Run detector every N frames (tracking runs every frame)
+  save_frames: true    # Save screenshots
+  keep_screenshots: 10 # Keep last N screenshots per camera
+
+cameras:
+  - id: gate-cam-01
+    rtsp_url: rtsp://user:pass@192.168.1.100:554/stream
+    width: 1920
+    height: 1080
+    fps_cap: 30
+
+  - id: spotter-truck-01
+    rtsp_url: rtsp://user:pass@192.168.1.101:554/stream
+    width: 1920
+    height: 1080
+    fps_cap: 30
+

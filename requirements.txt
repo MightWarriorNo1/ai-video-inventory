@@ -1,0 +1,21 @@
+opencv-python>=4.8.0
+numpy>=1.21.0
+pyyaml>=6.0
+flask>=2.3.0
+prometheus-client>=0.18.0
+azure-servicebus>=7.11.0
+boto3>=1.28.0
+azure-storage-blob>=12.19.0
+kafka-python>=2.0.2
+paho-mqtt>=1.6.1
+geojson>=3.1.0
+shapely>=2.0.0
+fastapi>=0.104.0
+uvicorn>=0.24.0
+psycopg2-binary>=2.9.9
+python-dotenv>=1.0.0
+requests>=2.31.0
+# TensorRT and CUDA (install separately on Jetson with JetPack)
+# nvidia-tensorrt>=8.0.0
+# pycuda>=2021.1
+

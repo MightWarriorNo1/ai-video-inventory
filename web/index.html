@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Trailer Vision Edge - Dashboard</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>AI EdgeBox Orion - Trailer Vision Dashboard</h1>
+            <div class="status-indicator">
+                <span class="status-dot" id="statusDot"></span>
+                <span id="statusText">Connected</span>
+            </div>
+        </header>
+
+        <div class="metrics-grid">
+            <div class="metrics-section">
+                <h2>Camera Metrics</h2>
+                <div id="cameraMetrics" class="camera-list">
+                    <!-- Populated by JavaScript -->
+                </div>
+            </div>
+
+            <div class="events-section">
+                <h2>Recent Events</h2>
+                <div class="events-controls">
+                    <select id="cameraFilter">
+                        <option value="">All Cameras</option>
+                    </select>
+                    <input type="number" id="eventLimit" value="50" min="1" max="500">
+                    <button onclick="loadEvents()">Refresh</button>
+                </div>
+                <div class="events-table-container">
+                    <table id="eventsTable">
+                        <thead>
+                            <tr>
+                                <th>Timestamp</th>
+                                <th>Camera</th>
+                                <th>Track ID</th>
+                                <th>Text</th>
+                                <th>Confidence</th>
+                                <th>Spot</th>
+                                <th>Method</th>
+                            </tr>
+                        </thead>
+                        <tbody id="eventsBody">
+                            <!-- Populated by JavaScript -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
+
