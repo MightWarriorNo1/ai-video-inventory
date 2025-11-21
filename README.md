@@ -14,7 +14,7 @@ Production-ready, Jetson-optimized edge application for video-based trailer inve
 ```bash
 sudo apt-get update && sudo apt-get install -y python3-pip python3-opencv git
 pip3 install -r requirements.txt
-sudo nvpmodel -m 0 && sudo jetson_clocks
+clear
 ```
 
 ### Configuration

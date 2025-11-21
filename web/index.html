@@ -16,6 +16,61 @@
             </div>
         </header>
 
+        <div class="video-section">
+            <h2>Live Camera Feeds</h2>
+            <div id="videoFeeds" class="video-grid">
+                <!-- Populated by JavaScript -->
+            </div>
+        </div>
+
+        <div class="video-processing-section">
+            <h2>Video Processing (Test Mode)</h2>
+            <div class="video-upload-controls">
+                <input type="file" id="videoFileInput" accept="video/*" style="display: none;">
+                <button id="selectVideoBtn" class="btn-primary">Select Video File</button>
+                <button id="processVideoBtn" class="btn-primary" disabled>Process Video</button>
+                <button id="stopProcessingBtn" class="btn-secondary" disabled>Stop Processing</button>
+                <span id="processingStatus" class="processing-status"></span>
+            </div>
+            <div class="processed-video-container">
+                <div class="processed-video-wrapper">
+                    <h3>Processed Video</h3>
+                    <div id="processedVideoContainer" class="processed-video-placeholder">
+                        <p>No video processed yet. Select and process a video file to see results.</p>
+                    </div>
+                </div>
+                <div class="processing-results-wrapper">
+                    <h3>Processing Results</h3>
+                    <div id="processingResults" class="processing-results">
+                        <div class="results-stats" id="resultsStats">
+                            <div class="stat-item">
+                                <span class="stat-label">Frames Processed:</span>
+                                <span class="stat-value" id="framesProcessed">0</span>
+                            </div>
+                            <div class="stat-item">
+                                <span class="stat-label">Detections:</span>
+                                <span class="stat-value" id="totalDetections">0</span>
+                            </div>
+                            <div class="stat-item">
+                                <span class="stat-label">Tracks:</span>
+                                <span class="stat-value" id="totalTracks">0</span>
+                            </div>
+                            <div class="stat-item">
+                                <span class="stat-label">OCR Results:</span>
+                                <span class="stat-value" id="totalOCR">0</span>
+                            </div>
+                        </div>
+                        <div class="results-events">
+                            <h4>Processing Events</h4>
+                            <div id="processingEvents" class="events-list">
+                                <p class="no-events">No events yet. Start processing to see results.</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
         <div class="metrics-grid">
             <div class="metrics-section">
                 <h2>Camera Metrics</h2>
@@ -40,8 +95,10 @@
                                 <th>Timestamp</th>
                                 <th>Camera</th>
                                 <th>Track ID</th>
+                                <th>Trailer Size</th>
                                 <th>Text</th>
-                                <th>Confidence</th>
+                                <th>OCR Conf</th>
+                                <th>Det Conf</th>
                                 <th>Spot</th>
                                 <th>Method</th>
                             </tr>

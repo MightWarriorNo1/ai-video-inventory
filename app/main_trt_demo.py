@@ -21,6 +21,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional
 import signal
+import threading
 
 # Load environment variables
 from dotenv import load_dotenv
@@ -37,6 +38,7 @@ from app.media_rotator import MediaRotator
 from app.event_bus import MultiPublisher
 from app.uploader import UploadManager
 from app.metrics_server import MetricsServer
+from app.video_processor import VideoProcessor
 import requests
 
 
@@ -72,6 +74,10 @@ class TrailerVisionApp:
         
         # Metrics tracking
         self.camera_metrics = {}
+        
+        # Frame storage for video streaming (thread-safe)
+        self.latest_frames = {}
+        self.frame_lock = threading.Lock()
         
         self._initialize_components()
     
@@ -155,6 +161,47 @@ class TrailerVisionApp:
                 'fps_ema': 0.0,
                 'last_publish': None
             }
+        
+        # Initialize video processor for testing
+        def create_tracker():
+            return ByteTrackWrapper()
+        
+        # Get homography for first camera (or None) for video processing
+        test_homography = None
+        cameras_list = self.config.get('cameras', [])
+        if cameras_list:
+            first_camera_id = cameras_list[0]['id']
+            if first_camera_id in self.homographies:
+                test_homography = self.homographies[first_camera_id]
+        
+        print(f"[TrailerVisionApp] Initializing video processor:")
+        print(f"  - Detector: {'Available' if self.detector else 'NOT AVAILABLE'}")
+        print(f"  - OCR: {'Available' if self.ocr else 'NOT AVAILABLE'}")
+        print(f"  - Spot Resolver: {'Available' if self.spot_resolver else 'NOT AVAILABLE'}")
+        print(f"  - Homography: {'Available' if test_homography is not None else 'NOT AVAILABLE'}")
+        
+        try:
+            self.video_processor = VideoProcessor(
+                detector=self.detector,
+                ocr=self.ocr,
+                tracker_factory=create_tracker,
+                spot_resolver=self.spot_resolver,
+                homography=test_homography
+            )
+            print(f"[TrailerVisionApp] Video processor created successfully")
+        except Exception as e:
+            print(f"[TrailerVisionApp] ERROR: Failed to create video processor: {e}")
+            import traceback
+            traceback.print_exc()
+            self.video_processor = None
+        
+        # Update metrics server with video processor and frame storage
+        if self.metrics_server:
+            self.metrics_server.video_processor = self.video_processor
+            self.metrics_server.frame_storage = self
+            print(f"[TrailerVisionApp] Video processor assigned to metrics server: {self.metrics_server.video_processor is not None}")
+        else:
+            print(f"[TrailerVisionApp] ERROR: Metrics server not initialized!")
     
     def _project_to_world(self, camera_id: str, x_img: float, y_img: float) -> Optional[tuple]:
         """
@@ -190,6 +237,10 @@ class TrailerVisionApp:
             frame: BGR image frame
             frame_count: Current frame number
         """
+        # Store latest frame for video streaming (thread-safe)
+        with self.frame_lock:
+            self.latest_frames[camera_id] = frame.copy()
+        
         globals_cfg = self.config.get('globals', {})
         detect_every_n = globals_cfg.get('detect_every_n', 5)
         save_frames = globals_cfg.get('save_frames', False)
@@ -395,6 +446,32 @@ class TrailerVisionApp:
 
 def main():
     """Main entry point."""
+    # Initialize CUDA context in main thread before loading TensorRT engines
+    # This ensures all worker threads can access the same context
+    try:
+        import pycuda.driver as cuda
+        import pycuda.autoinit
+        
+        # Get the primary context created by autoinit
+        primary_ctx = cuda.Context.get_current()
+        if primary_ctx is not None:
+            # Store it globally so worker threads can access it
+            import sys
+            # Store in both module names for compatibility
+            if '__main__' in sys.modules:
+                sys.modules['__main__']._cuda_primary_context = primary_ctx
+            # Also store in the actual module
+            if 'app.main_trt_demo' in sys.modules:
+                sys.modules['app.main_trt_demo']._cuda_primary_context = primary_ctx
+            # Also store in this module's globals
+            globals()['_cuda_primary_context'] = primary_ctx
+            print(f"CUDA context initialized in main thread (via autoinit), context: {primary_ctx}")
+        else:
+            print("Warning: CUDA context initialization returned None")
+    except Exception as e:
+        print(f"Warning: Failed to initialize CUDA context: {e}")
+        # Continue anyway - might work with autoinit in worker threads
+    
     app = TrailerVisionApp()
     
     # Handle signals
