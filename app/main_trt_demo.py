@@ -153,9 +153,13 @@ class TrailerVisionApp:
                 print(f"Warning: Homography not found for {camera_id}: {calib_path}")
         
         # Initialize trackers for each camera
+        # Use lower track threshold to match detector confidence
+        globals_cfg = self.config.get('globals', {})
+        track_thresh = globals_cfg.get('detector_conf', 0.20)
+        
         for camera in self.config.get('cameras', []):
             camera_id = camera['id']
-            self.trackers[camera_id] = ByteTrackWrapper()
+            self.trackers[camera_id] = ByteTrackWrapper(track_thresh=track_thresh)
             self.camera_metrics[camera_id] = {
                 'frames_processed': 0,
                 'fps_ema': 0.0,
@@ -164,7 +168,7 @@ class TrailerVisionApp:
         
         # Initialize video processor for testing
         def create_tracker():
-            return ByteTrackWrapper()
+            return ByteTrackWrapper(track_thresh=track_thresh)
         
         # Get homography for first camera (or None) for video processing
         test_homography = None

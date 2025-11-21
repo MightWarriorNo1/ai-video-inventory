@@ -34,14 +34,14 @@ class TrtEngineYOLO:
     Supports YOLOv5/YOLOv8-style detection models with TensorRT optimization.
     """
     
-    def __init__(self, engine_path: str, input_size: Tuple[int, int] = (640, 640), conf_threshold: float = 0.35):
+    def __init__(self, engine_path: str, input_size: Tuple[int, int] = (640, 640), conf_threshold: float = 0.20):
         """
         Initialize TensorRT YOLO detector.
         
         Args:
             engine_path: Path to TensorRT engine file (.engine)
             input_size: Input image size (width, height)
-            conf_threshold: Confidence threshold for detections
+            conf_threshold: Confidence threshold for detections (lowered to 0.20 for better detection)
         """
         self.engine_path = engine_path
         self.input_size = input_size

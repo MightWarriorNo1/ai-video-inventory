@@ -95,13 +95,13 @@ class ByteTrackWrapper:
     Maintains track identities across frames using IoU matching and Kalman filtering.
     """
     
-    def __init__(self, frame_rate: int = 30, track_thresh: float = 0.5, track_buffer: int = 30, match_thresh: float = 0.8):
+    def __init__(self, frame_rate: int = 30, track_thresh: float = 0.20, track_buffer: int = 30, match_thresh: float = 0.8):
         """
         Initialize ByteTrack tracker.
         
         Args:
             frame_rate: Video frame rate
-            track_thresh: Detection confidence threshold for tracking
+            track_thresh: Detection confidence threshold for tracking (lowered to 0.20 for better detection)
             track_buffer: Number of frames to keep lost tracks
             match_thresh: IoU threshold for matching
         """

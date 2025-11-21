@@ -1,21 +1,14 @@
 globals:
-  use_gstreamer: true  # Use GStreamer pipeline on Jetson for NVDEC
-  detector_conf: 0.35  # Detection confidence threshold
+  use_gstreamer: false  # USB cameras don't use GStreamer (only RTSP streams do)
+  detector_conf: 0.20  # Detection confidence threshold (lowered to detect more trailers)
   detect_every_n: 5    # Run detector every N frames (tracking runs every frame)
   save_frames: true    # Save screenshots
   keep_screenshots: 10 # Keep last N screenshots per camera
 
 cameras:
-  - id: gate-cam-01
-    rtsp_url: rtsp://user:pass@192.168.1.100:554/stream
-    width: 1920
-    height: 1080
-    fps_cap: 30
-
-  - id: spotter-truck-01
-    rtsp_url: rtsp://user:pass@192.168.1.101:554/stream
-    width: 1920
-    height: 1080
-    fps_cap: 30
-
+  - id: lifecam-hd6000-01
+    rtsp_url: "0"  # USB camera device index (0 = /dev/video0)
+    width: 1280    # Maximum resolution at 30fps with MJPG
+    height: 720    # 720p HD resolution
+    fps_cap: 30    # Maximum supported FPS at this resolution
 
