@@ -515,27 +515,63 @@ class TrtEngineYOLO:
                 output_shape = output_tensor['shape']
                 
                 # Reshape output based on engine output shape
-                # YOLOv8 output: [batch, num_detections, 6] or [1, N, 6] where 6 = [x1, y1, x2, y2, conf, cls]
-                # YOLOv5 output: [batch, num_boxes, 85] where 85 = [x, y, w, h, conf, 80 classes]
+                # YOLOv8 TensorRT output: [batch, 84, 8400] where 84 = 4 bbox + 80 classes
+                # YOLOv5 TensorRT output: [batch, 25200, 85] where 85 = 4 bbox + 1 conf + 80 classes
                 
                 if len(output_shape) == 3:
-                    # [batch, N, features]
+                    # [batch, features, num_detections] or [batch, num_detections, features]
                     output = output.reshape(output_shape)
-                    output = output[0]  # Remove batch dimension
+                    output = output[0]  # Remove batch dimension -> [features, num_detections] or [num_detections, features]
                 elif len(output_shape) == 2:
-                    # [N, features]
+                    # [N, features] - already 2D
                     output = output.reshape(output_shape)
                 
+                # Detect YOLOv8 transposed format: [84, N] instead of [N, 84]
+                # YOLOv8 has 84 features (4 bbox + 80 classes), YOLOv5 has 85 features (4 bbox + 1 conf + 80 classes)
+                if output.shape[0] == 84 or (output.shape[0] < 100 and output.shape[1] > 1000):
+                    # YOLOv8 transposed format: [84, 8400] -> transpose to [8400, 84]
+                    output = output.T  # Now [num_detections, 84]
+                
                 # Handle different output formats
-                if output.shape[1] == 6:
-                    # Already in [x1, y1, x2, y2, conf, cls] format (YOLOv8-style)
-                    detections = output
+                if output.shape[1] == 84:
+                    # YOLOv8 format: [N, 84] where 84 = 4 bbox coords + 80 class scores
+                    # YOLOv8 doesn't have separate confidence, it's max(class_scores)
+                    
+                    boxes = output[:, :4]  # [x, y, w, h] in center format
+                    class_scores = output[:, 4:]  # [80 classes]
+                    
+                    # Get confidence as max class score
+                    max_scores = class_scores.max(axis=1)  # [N]
+                    class_ids = class_scores.argmax(axis=1)  # [N]
+                    
+                    # YOLOv8 scores might not be normalized - check and normalize if needed
+                    if max_scores.max() > 1.0:
+                        # Scores are not in [0, 1] range, apply sigmoid to normalize
+                        max_scores = 1 / (1 + np.exp(-max_scores))  # Sigmoid normalization
+                    
+                    # Convert center format (x_center, y_center, w, h) to corner format (x1, y1, x2, y2)
+                    x_center, y_center, w, h = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+                    x1 = x_center - w / 2
+                    y1 = y_center - h / 2
+                    x2 = x_center + w / 2
+                    y2 = y_center + h / 2
+                    
+                    # Combine into [x1, y1, x2, y2, conf, cls]
+                    detections = np.column_stack([x1, y1, x2, y2, max_scores, class_ids])
+                    
                 elif output.shape[1] == 85:
-                    # YOLOv5-style: [x, y, w, h, conf, 80 classes]
-                    # Convert to [x1, y1, x2, y2, conf, cls] format
+                    # YOLOv5 format: [N, 85] where 85 = 4 bbox + 1 conf + 80 classes
+                    
                     boxes = output[:, :4]  # [x, y, w, h]
-                    confs = output[:, 4:5]  # confidence
-                    classes = output[:, 5:].argmax(axis=1, keepdims=True)  # class index
+                    obj_conf = output[:, 4]  # objectness confidence
+                    class_scores = output[:, 5:]  # [80 classes]
+                    
+                    # Get class with highest score
+                    class_ids = class_scores.argmax(axis=1)
+                    class_confs = class_scores.max(axis=1)
+                    
+                    # Final confidence = obj_conf * class_conf
+                    final_conf = obj_conf * class_confs
                     
                     # Convert center+size to corner format
                     x_center, y_center, w, h = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
@@ -545,10 +581,20 @@ class TrtEngineYOLO:
                     y2 = y_center + h / 2
                     
                     # Combine into [x1, y1, x2, y2, conf, cls]
-                    detections = np.column_stack([x1, y1, x2, y2, confs.flatten(), classes.flatten()])
+                    detections = np.column_stack([x1, y1, x2, y2, final_conf, class_ids])
+                    
+                elif output.shape[1] == 6:
+                    # Already in [x1, y1, x2, y2, conf, cls] format
+                    detections = output
                 else:
-                    # Unknown format, try to extract first 6 columns
+                    # Unknown format
                     detections = output[:, :6] if output.shape[1] >= 6 else output
+                
+                # Debug: Show confidence range before filtering
+                if len(detections) > 0:
+                    conf_min = detections[:, 4].min()
+                    conf_max = detections[:, 4].max()
+                    conf_mean = detections[:, 4].mean()
                 
                 # Apply confidence threshold
                 detections = detections[detections[:, 4] >= self.conf_threshold]

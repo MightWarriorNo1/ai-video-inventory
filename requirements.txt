@@ -15,6 +15,7 @@ uvicorn>=0.24.0
 psycopg2-binary>=2.9.9
 python-dotenv>=1.0.0
 requests>=2.31.0
+ultralytics>=8.0.0  # YOLOv8 for training custom trailer detection models
 # TensorRT and CUDA (install separately on Jetson with JetPack)
 # nvidia-tensorrt>=8.0.0
 # pycuda>=2021.1

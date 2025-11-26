@@ -54,13 +54,28 @@ Access web UI at: `http://<device-ip>:8080/`
 ## Project Structure
 
 - `app/` - Core application code
-- `config/` - Camera configs, homography, parking spots
+- `config/` - Camera configs, homography, parking spots, dataset configs
 - `models/` - TensorRT engines
-- `tools/` - Calibration utilities
+- `tools/` - Calibration utilities, training scripts
 - `web/` - Web dashboard
 - `services/ingest/` - REST API for TimescaleDB ingestion
 - `observability/` - Prometheus & Grafana configs
 
-See the full runbook for detailed documentation.
+## Training Custom YOLOv8 Model
+
+To improve trailer back detection accuracy, you can train a custom YOLOv8 model:
+
+1. **Prepare dataset**: Annotate trailer back images
+2. **Train model**: `python tools/train_yolo_trailer.py --data config/trailer_dataset.yaml`
+3. **Export to ONNX**: `python tools/export_trained_model.py --weights runs/detect/trailer_back_detector/weights/best.pt`
+4. **Build TensorRT engine**: `python build_engines.py --detector-onnx models/best.onnx --fp16`
+
+See [TRAINING_GUIDE.md](TRAINING_GUIDE.md) for detailed instructions.
+
+## Documentation
+
+- **Training Guide**: [TRAINING_GUIDE.md](TRAINING_GUIDE.md) - Train custom YOLOv8 models
+- **Engine Building**: [BUILD_ENGINES.md](BUILD_ENGINES.md) - Rebuild TensorRT engines
+- **OCR Training**: [tools/EXTRACT_TRAINING_DATA_README.md](tools/EXTRACT_TRAINING_DATA_README.md) - OCR data extraction
 
 

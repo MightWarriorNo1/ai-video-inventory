@@ -48,6 +48,9 @@ class VideoProcessor:
             'ocr_results': 0
         }
     
+        # Last detected nearest trailer (for persistent display)
+        self.last_nearest_trailer = None  # {bbox, track_id, conf, text, ocr_conf}
+    
     def process_video(self, video_path: str, camera_id: str = "test-video", 
                      detect_every_n: int = 5) -> Generator[Tuple[int, np.ndarray, List[Dict]], None, None]:
         """
@@ -68,6 +71,7 @@ class VideoProcessor:
             self.stop_flag = False
             self.processed_frames = {}
             self.events = []
+            self.last_nearest_trailer = None  # Reset persistent display
             self.stats = {
                 'frames_processed': 0,
                 'detections': 0,
@@ -121,15 +125,19 @@ class VideoProcessor:
                 try:
                     tracks = tracker.update(detections, frame)
                     
-                    # Filter out non-trailer objects (false positives like mirrors, signs, etc.)
-                    # Trailers have specific characteristics:
-                    # 1. Minimum size (trailers are large objects)
-                    # 2. Aspect ratio (wider than tall, typically 2:1 to 5:1)
+                    # Filter to ONLY detect REAR-FACING trailers (back side of trailer)
+                    # Rear trailers have specific characteristics:
+                    # - Wider than tall (aspect ratio 1.5:1 to 4:1 typical for rear view)
+                    # - Reasonable size (not too small, not too large)
+                    # - More rectangular/wide shape (not tall/narrow like side views)
                     MIN_TRAILER_WIDTH = 150   # Minimum width in pixels
                     MIN_TRAILER_HEIGHT = 50   # Minimum height in pixels
-                    MIN_AREA = 10000          # Minimum area (150*50 = 7500, use higher for safety)
-                    MIN_ASPECT_RATIO = 1.5    # Width/Height ratio (trailers are wider than tall)
-                    MAX_ASPECT_RATIO = 6.0    # Maximum aspect ratio to avoid detecting long thin objects
+                    MIN_AREA = 10000          # Minimum area (150*50 = 7500, buffer for safety)
+                    # REAR TRAILER ASPECT RATIO: Rear-facing trailers are WIDER than tall
+                    # Typical rear trailer: width ~2-3x height (e.g., 8ft wide x 13ft tall = ~2.4:1)
+                    # Filter out side views (tall/narrow) and front views (too square)
+                    MIN_ASPECT_RATIO = 1.5    # Must be wider than tall (rear trailers are wide)
+                    MAX_ASPECT_RATIO = 4.0    # Not too wide (filters out extreme angles/panoramic views)
                     
                     filtered_tracks = []
                     for track in tracks:
@@ -140,16 +148,35 @@ class VideoProcessor:
                         area = width * height
                         aspect_ratio = width / (height + 1e-6)  # Avoid division by zero
                         
-                        # Apply filters for trailer characteristics
-                        if (width >= MIN_TRAILER_WIDTH and 
+                        # Apply strict filters for REAR-FACING trailer characteristics
+                        # This filters out:
+                        # - Side views (tall/narrow, aspect ratio < 1.5)
+                        # - Front views (too square, aspect ratio close to 1.0)
+                        # - Extreme angles (aspect ratio > 4.0)
+                        is_rear_trailer = (
+                            width >= MIN_TRAILER_WIDTH and 
                             height >= MIN_TRAILER_HEIGHT and 
                             area >= MIN_AREA and
-                            MIN_ASPECT_RATIO <= aspect_ratio <= MAX_ASPECT_RATIO):
+                            MIN_ASPECT_RATIO <= aspect_ratio <= MAX_ASPECT_RATIO
+                        )
+                        
+                        if is_rear_trailer:
                             filtered_tracks.append(track)
                         else:
                             # Log filtered out tracks for debugging
                             if frame_count % 30 == 0:  # Only log occasionally
-                                print(f"[VideoProcessor] Filtered Track {track['track_id']}: size={width}x{height}, aspect={aspect_ratio:.2f}")
+                                reason = []
+                                if width < MIN_TRAILER_WIDTH:
+                                    reason.append(f"width={width}<{MIN_TRAILER_WIDTH}")
+                                if height < MIN_TRAILER_HEIGHT:
+                                    reason.append(f"height={height}<{MIN_TRAILER_HEIGHT}")
+                                if area < MIN_AREA:
+                                    reason.append(f"area={area}<{MIN_AREA}")
+                                if aspect_ratio < MIN_ASPECT_RATIO:
+                                    reason.append(f"aspect={aspect_ratio:.2f}<{MIN_ASPECT_RATIO} (side view?)")
+                                elif aspect_ratio > MAX_ASPECT_RATIO:
+                                    reason.append(f"aspect={aspect_ratio:.2f}>{MAX_ASPECT_RATIO} (extreme angle?)")
+                                print(f"[VideoProcessor] Filtered Track {track['track_id']} (not rear-facing): {', '.join(reason)}")
                     
                     tracks = filtered_tracks
                     
@@ -175,7 +202,12 @@ class VideoProcessor:
                                 max_y2 = y2
                                 nearest_track_id = track['track_id']
                 
-                # Process each track
+                # Only process and draw tracks if trailers are actually detected in current frame
+                # Clear last_nearest_trailer if no trailers detected (no ghost detections)
+                if not tracks:
+                    self.last_nearest_trailer = None
+                
+                # Process each track (only if tracks exist)
                 for track in tracks:
                     try:
                         track_id = track['track_id']
@@ -203,9 +235,9 @@ class VideoProcessor:
                             overlay = processed_frame.copy()
                             cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 255, 0), -1)
                             cv2.addWeighted(overlay, 0.1, processed_frame, 0.9, 0, processed_frame)
-                            
+                        
                             # Draw detection confidence and track ID in green above the box with background
-                            det_conf_percent = det_conf * 100.0
+                        det_conf_percent = det_conf * 100.0
                             conf_text = f"Track {track_id} - {det_conf_percent:.1f}% [NEAREST]"
                             text_size = cv2.getTextSize(conf_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
                             
@@ -234,7 +266,7 @@ class VideoProcessor:
                             
                             # Draw size text
                             cv2.putText(processed_frame, size_text, (text_x, size_y),
-                                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                         else:
                             # Draw subtle gray bounding box for other detected trailers
                             cv2.rectangle(processed_frame, (x1, y1), (x2, y2), (128, 128, 128), 1)
@@ -245,146 +277,469 @@ class VideoProcessor:
                             cv2.putText(processed_frame, conf_text, (x1, max(y1 - 5, 15)),
                                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (128, 128, 128), 1)
                         
-                        # Crop region for OCR - focus on areas where text/license plates appear
-                        # On trailers, text/numbers are typically on the front face, center-left area
+                        # Multi-region OCR: Trailer text can appear in different locations
+                        # (top - company name/ID, middle - branding, bottom - license plate/numbers)
+                        # We'll scan multiple horizontal bands and combine results
                         h, w = frame.shape[:2]
                         
-                        # Calculate focused crop region (center-left 70% width, center 50% height)
-                        # This reduces background noise and focuses on text areas
                         bbox_width = x2 - x1
                         bbox_height = y2 - y1
                         
-                        # Focus on center-left area where trailer text typically appears
-                        text_crop_x1 = int(x1 + bbox_width * 0.1)   # Start 10% from left
-                        text_crop_x2 = int(x1 + bbox_width * 0.8)   # End at 80% (70% width)
-                        text_crop_y1 = int(y1 + bbox_height * 0.25)  # Start 25% from top
-                        text_crop_y2 = int(y1 + bbox_height * 0.75)  # End at 75% (50% height)
+                        # Define multiple crop regions to scan
+                        crop_regions = []
                         
-                        # Ensure coordinates are within frame bounds
-                        text_crop_x1 = max(0, min(text_crop_x1, w - 1))
-                        text_crop_y1 = max(0, min(text_crop_y1, h - 1))
-                        text_crop_x2 = max(text_crop_x1 + 1, min(text_crop_x2, w))
-                        text_crop_y2 = max(text_crop_y1 + 1, min(text_crop_y2, h))
+                        # Region 1: Full bbox (90% with 5% margins)
+                        full_x1 = int(x1 + bbox_width * 0.05)
+                        full_x2 = int(x2 - bbox_width * 0.05)
+                        full_y1 = int(y1 + bbox_height * 0.05)
+                        full_y2 = int(y2 - bbox_height * 0.05)
+                        crop_regions.append(('full', full_x1, full_y1, full_x2, full_y2))
                         
-                        crop = frame[text_crop_y1:text_crop_y2, text_crop_x1:text_crop_x2]
-                        if crop.size == 0 or crop.shape[0] < 10 or crop.shape[1] < 10:
-                            continue
+                        # Region 2: Top third (where company names often appear)
+                        top_x1 = int(x1 + bbox_width * 0.05)
+                        top_x2 = int(x2 - bbox_width * 0.05)
+                        top_y1 = int(y1 + bbox_height * 0.05)
+                        top_y2 = int(y1 + bbox_height * 0.40)  # Top 35% of trailer
+                        crop_regions.append(('top', top_x1, top_y1, top_x2, top_y2))
                         
-                        # Draw OCR region indicator for nearest trailer (helps debugging)
+                        # Region 3: Bottom third (where numbers/license plates often appear)
+                        bot_x1 = int(x1 + bbox_width * 0.05)
+                        bot_x2 = int(x2 - bbox_width * 0.05)
+                        bot_y1 = int(y1 + bbox_height * 0.60)  # Bottom 40% of trailer
+                        bot_y2 = int(y2 - bbox_height * 0.05)
+                        crop_regions.append(('bottom', bot_x1, bot_y1, bot_x2, bot_y2))
+                        
+                        # Debug: print crop regions for nearest trailer
+                        if is_nearest and frame_count % 10 == 0:
+                            print(f"[VideoProcessor] Frame {frame_count}, Track {track_id}: Crop regions defined")
+                            print(f"  Bbox: ({x1}, {y1}) to ({x2}, {y2}), size: {bbox_width}x{bbox_height}")
+                            for rname, rx1, ry1, rx2, ry2 in crop_regions:
+                                print(f"  Region '{rname}': ({rx1}, {ry1}) to ({rx2}, {ry2})")
+                        
+                        # Draw OCR region indicators for nearest trailer (ALWAYS draw for debugging)
                         if is_nearest:
-                            cv2.rectangle(processed_frame, (text_crop_x1, text_crop_y1), 
-                                        (text_crop_x2, text_crop_y2), (0, 255, 255), 1)
+                            # Draw all crop regions in different colors for debugging
+                            for region_name, rx1, ry1, rx2, ry2 in crop_regions:
+                                # Ensure coordinates are within bounds
+                                rx1 = max(0, min(rx1, w - 1))
+                                ry1 = max(0, min(ry1, h - 1))
+                                rx2 = max(rx1 + 1, min(rx2, w))
+                                ry2 = max(ry1 + 1, min(ry2, h))
+                                
+                                # Color coding: full=yellow, top=cyan, bottom=magenta
+                                if region_name == 'full':
+                                    color = (0, 255, 255)  # Yellow
+                                elif region_name == 'top':
+                                    color = (255, 255, 0)  # Cyan
+                                else:
+                                    color = (255, 0, 255)  # Magenta
+                                
+                                cv2.rectangle(processed_frame, (rx1, ry1), (rx2, ry2), color, 2)  # Thicker for visibility
                         
-                        # Run OCR with multiple preprocessing strategies
-                        # Strategy 1: Original image (best for clear text with good contrast)
-                        # Strategy 2: CLAHE enhancement (best for low contrast)
-                        # Strategy 3: Light preprocessing (balanced approach)
+                        # Run OCR on multiple regions with multiple preprocessing strategies
+                        # This ensures we capture text that appears in different locations on the trailer
                         
                         text = ""
                         conf_ocr = 0.0
-                        if self.ocr:
+                        if not self.ocr:
+                            if frame_count % 50 == 0:  # Log occasionally
+                                print(f"[VideoProcessor] WARNING: OCR engine is not initialized!")
+                        elif is_nearest:  # Only run OCR on nearest trailer to save resources
+                            if frame_count % 10 == 0:
+                                print(f"[VideoProcessor] Frame {frame_count}, Track {track_id}: Starting OCR on {len(crop_regions)} regions")
                             try:
-                                ocr_results = []
+                                all_ocr_results = []  # Store results from all regions and strategies
                                 
-                                # Strategy 1: Try original crop first (often best for numbers)
-                                try:
-                                    result_orig = self.ocr.recognize(crop)
-                                    ocr_results.append({
-                                        'text': result_orig.get('text', ''),
-                                        'conf': result_orig.get('conf', 0.0),
-                                        'method': 'original'
-                                    })
-                                except Exception as e:
-                                    print(f"[VideoProcessor] OCR strategy 1 failed: {e}")
-                                
-                                # Strategy 2: CLAHE enhancement only (preserve details, enhance contrast)
-                                try:
-                                    if len(crop.shape) == 3:
-                                        crop_gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-                                    else:
-                                        crop_gray = crop
+                                # Process each crop region
+                                for region_name, rx1, ry1, rx2, ry2 in crop_regions:
+                                    # Ensure coordinates are within bounds
+                                    rx1 = max(0, min(rx1, w - 1))
+                                    ry1 = max(0, min(ry1, h - 1))
+                                    rx2 = max(rx1 + 1, min(rx2, w))
+                                    ry2 = max(ry1 + 1, min(ry2, h))
                                     
-                                    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-                                    crop_clahe = clahe.apply(crop_gray)
-                                    crop_clahe_bgr = cv2.cvtColor(crop_clahe, cv2.COLOR_GRAY2BGR)
+                                    crop = frame[ry1:ry2, rx1:rx2]
                                     
-                                    result_clahe = self.ocr.recognize(crop_clahe_bgr)
-                                    ocr_results.append({
-                                        'text': result_clahe.get('text', ''),
-                                        'conf': result_clahe.get('conf', 0.0),
-                                        'method': 'clahe'
-                                    })
-                                except Exception as e:
-                                    print(f"[VideoProcessor] OCR strategy 2 failed: {e}")
-                                
-                                # Strategy 3: Light denoising + sharpening (good for slightly blurry images)
-                                try:
-                                    if len(crop.shape) == 3:
-                                        crop_gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-                                    else:
-                                        crop_gray = crop
-                                    
-                                    # Denoise slightly
-                                    crop_denoised = cv2.fastNlMeansDenoising(crop_gray, None, 10, 7, 21)
-                                    
-                                    # Sharpen to make text edges crisper
-                                    kernel = np.array([[-1,-1,-1],
-                                                      [-1, 9,-1],
-                                                      [-1,-1,-1]])
-                                    crop_sharp = cv2.filter2D(crop_denoised, -1, kernel)
-                                    crop_sharp_bgr = cv2.cvtColor(crop_sharp, cv2.COLOR_GRAY2BGR)
-                                    
-                                    result_sharp = self.ocr.recognize(crop_sharp_bgr)
-                                    ocr_results.append({
-                                        'text': result_sharp.get('text', ''),
-                                        'conf': result_sharp.get('conf', 0.0),
-                                        'method': 'sharpened'
-                                    })
-                                except Exception as e:
-                                    print(f"[VideoProcessor] OCR strategy 3 failed: {e}")
-                                
-                                # Select the best result based on:
-                                # 1. Presence of both letters AND numbers (trailer IDs usually have both)
-                                # 2. Higher confidence
-                                # 3. Longer text length
-                                best_result = None
-                                for result in ocr_results:
-                                    if not result['text']:
+                                    # Skip if crop is too small
+                                    if crop.size == 0 or crop.shape[0] < 15 or crop.shape[1] < 30:
                                         continue
                                     
+                                    # Convert to grayscale once for all strategies
+                                    if len(crop.shape) == 3:
+                                        crop_gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+                                    else:
+                                        crop_gray = crop
+                                    
+                                    # Strategy 0: Original with minimal processing (baseline)
+                                    try:
+                                        h_crop, w_crop = crop.shape[:2]
+                                        
+                                        # Only upscale if text is small
+                                        if h_crop < 40 or w_crop < 80:
+                                            scale = 2.5
+                                            crop_scaled = cv2.resize(crop, None, fx=scale, fy=scale, 
+                                                                   interpolation=cv2.INTER_CUBIC)
+                                        else:
+                                            crop_scaled = crop
+                                        
+                                        result_orig = self.ocr.recognize(crop_scaled)
+                                        all_ocr_results.append({
+                                            'text': result_orig.get('text', ''),
+                                            'conf': result_orig.get('conf', 0.0),
+                                            'method': f'{region_name}-original',
+                                            'region': region_name
+                                        })
+                                    except Exception as e:
+                                        print(f"[VideoProcessor] OCR strategy 0 ({region_name}) failed: {e}")
+                                    
+                                    # Strategy 0b: Morphological preprocessing (character separation)
+                                    # This helps separate touching characters and remove small noise
+                                    try:
+                                        h_crop, w_crop = crop_gray.shape
+                                        
+                                        # Upscale first
+                                        if h_crop < 48:
+                                            scale = 2.5
+                                            crop_up = cv2.resize(crop_gray, None, fx=scale, fy=scale,
+                                                               interpolation=cv2.INTER_CUBIC)
+                                        else:
+                                            crop_up = crop_gray
+                                        
+                                        # Apply bilateral filter to reduce noise while keeping edges sharp
+                                        crop_smooth = cv2.bilateralFilter(crop_up, 9, 40, 40)
+                                        
+                                        # Apply Otsu's threshold
+                                        _, crop_thresh = cv2.threshold(crop_smooth, 0, 255,
+                                                                      cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                                        
+                                        # Morphological opening to remove small noise
+                                        kernel_small = np.ones((2, 2), np.uint8)
+                                        crop_morph = cv2.morphologyEx(crop_thresh, cv2.MORPH_OPEN, kernel_small)
+                                        
+                                        # Morphological closing to fill small holes in characters
+                                        kernel_med = np.ones((2, 3), np.uint8)
+                                        crop_morph = cv2.morphologyEx(crop_morph, cv2.MORPH_CLOSE, kernel_med)
+                                        
+                                        # Try both normal and inverted
+                                        crop_morph_bgr = cv2.cvtColor(crop_morph, cv2.COLOR_GRAY2BGR)
+                                        result_morph = self.ocr.recognize(crop_morph_bgr)
+                                        all_ocr_results.append({
+                                            'text': result_morph.get('text', ''),
+                                            'conf': result_morph.get('conf', 0.0),
+                                            'method': f'{region_name}-morphological',
+                                            'region': region_name
+                                        })
+                                        
+                                        # Inverted version
+                                        crop_morph_inv = cv2.bitwise_not(crop_morph)
+                                        crop_morph_inv_bgr = cv2.cvtColor(crop_morph_inv, cv2.COLOR_GRAY2BGR)
+                                        result_morph_inv = self.ocr.recognize(crop_morph_inv_bgr)
+                                        all_ocr_results.append({
+                                            'text': result_morph_inv.get('text', ''),
+                                            'conf': result_morph_inv.get('conf', 0.0),
+                                            'method': f'{region_name}-morphological-inv',
+                                            'region': region_name
+                                        })
+                                    except Exception as e:
+                                        print(f"[VideoProcessor] OCR strategy 0b ({region_name}) failed: {e}")
+                                    
+                                    # Strategy 1: CLAHE + Border removal (for low-contrast text)
+                                    try:
+                                        h_crop, w_crop = crop_gray.shape
+                                        
+                                        # Upscale if needed
+                                        if h_crop < 48:
+                                            scale = 2.5
+                                            crop_up = cv2.resize(crop_gray, None, fx=scale, fy=scale, 
+                                                               interpolation=cv2.INTER_CUBIC)
+                                        else:
+                                            crop_up = crop_gray
+                                        
+                                        # Remove 10% border to eliminate edge noise
+                                        h_up, w_up = crop_up.shape
+                                        border_h = max(1, int(h_up * 0.1))
+                                        border_w = max(1, int(w_up * 0.1))
+                                        if h_up > border_h*2 and w_up > border_w*2:
+                                            crop_up = crop_up[border_h:-border_h, border_w:-border_w]
+                                        
+                                        # Denoise slightly
+                                        crop_smooth = cv2.GaussianBlur(crop_up, (3, 3), 0)
+                                        
+                                        # Apply CLAHE for local contrast enhancement
+                                        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
+                                        crop_clahe = clahe.apply(crop_smooth)
+                                        
+                                        # Sharpen slightly
+                                        kernel_sharp = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
+                                        crop_clahe = cv2.filter2D(crop_clahe, -1, kernel_sharp)
+                                        
+                                        crop_clahe_bgr = cv2.cvtColor(crop_clahe, cv2.COLOR_GRAY2BGR)
+                                        result_clahe = self.ocr.recognize(crop_clahe_bgr)
+                                        all_ocr_results.append({
+                                            'text': result_clahe.get('text', ''),
+                                            'conf': result_clahe.get('conf', 0.0),
+                                            'method': f'{region_name}-clahe-sharp',
+                                            'region': region_name
+                                        })
+                                    except Exception as e:
+                                        print(f"[VideoProcessor] OCR strategy 1 ({region_name}) failed: {e}")
+                                    
+                                    # Strategy 2: Adaptive thresholding (best for varying lighting)
+                                    # Handles shadows and uneven illumination
+                                    try:
+                                        h_crop, w_crop = crop_gray.shape
+                                        
+                                        # Upscale for better quality
+                                        if h_crop < 48:
+                                            scale = 2.5
+                                            crop_up = cv2.resize(crop_gray, None, fx=scale, fy=scale,
+                                                               interpolation=cv2.INTER_CUBIC)
+                                        else:
+                                            crop_up = crop_gray
+                                        
+                                        # Remove border noise (5% on each side)
+                                        h_up, w_up = crop_up.shape
+                                        border = int(min(h_up, w_up) * 0.05)
+                                        if border > 0 and h_up > border*2 and w_up > border*2:
+                                            crop_up = crop_up[border:-border, border:-border]
+                                        
+                                        # Denoise with bilateral filter
+                                        crop_denoised = cv2.bilateralFilter(crop_up, 9, 50, 50)
+                                        
+                                        # Adaptive Gaussian thresholding - better for varying lighting
+                                        crop_adaptive = cv2.adaptiveThreshold(
+                                            crop_denoised, 255,
+                                            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                            cv2.THRESH_BINARY, 11, 2
+                                        )
+                                        
+                                        # Apply morphological operations to clean up
+                                        kernel = np.ones((2, 2), np.uint8)
+                                        crop_adaptive = cv2.morphologyEx(crop_adaptive, cv2.MORPH_CLOSE, kernel)
+                                        
+                                        crop_adaptive_bgr = cv2.cvtColor(crop_adaptive, cv2.COLOR_GRAY2BGR)
+                                        result_adaptive = self.ocr.recognize(crop_adaptive_bgr)
+                                        all_ocr_results.append({
+                                            'text': result_adaptive.get('text', ''),
+                                            'conf': result_adaptive.get('conf', 0.0),
+                                            'method': f'{region_name}-adaptive',
+                                            'region': region_name
+                                        })
+                                        
+                                        # Inverted adaptive threshold
+                                        crop_adaptive_inv = cv2.bitwise_not(crop_adaptive)
+                                        crop_adaptive_inv_bgr = cv2.cvtColor(crop_adaptive_inv, cv2.COLOR_GRAY2BGR)
+                                        result_adaptive_inv = self.ocr.recognize(crop_adaptive_inv_bgr)
+                                        all_ocr_results.append({
+                                            'text': result_adaptive_inv.get('text', ''),
+                                            'conf': result_adaptive_inv.get('conf', 0.0),
+                                            'method': f'{region_name}-adaptive-inv',
+                                            'region': region_name
+                                        })
+                                    except Exception as e:
+                                        print(f"[VideoProcessor] OCR strategy 2 ({region_name}) failed: {e}")
+                                    
+                                    # Strategy 3: High-contrast enhancement with dilation
+                                    # Good for faded or low-contrast text
+                                    try:
+                                        h_crop, w_crop = crop_gray.shape
+                                        
+                                        # Upscale
+                                        if h_crop < 48:
+                                            scale = 2.5
+                                            crop_up = cv2.resize(crop_gray, None, fx=scale, fy=scale,
+                                                               interpolation=cv2.INTER_CUBIC)
+                                        else:
+                                            crop_up = crop_gray
+                                        
+                                        # Increase contrast dramatically
+                                        crop_contrast = cv2.convertScaleAbs(crop_up, alpha=1.5, beta=0)
+                                        
+                                        # Apply CLAHE for local contrast enhancement
+                                        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+                                        crop_clahe = clahe.apply(crop_contrast)
+                                        
+                                        # Threshold
+                                        _, crop_high = cv2.threshold(crop_clahe, 0, 255,
+                                                                    cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                                        
+                                        # Dilate slightly to thicken thin characters
+                                        kernel_dilate = np.ones((2, 2), np.uint8)
+                                        crop_high = cv2.dilate(crop_high, kernel_dilate, iterations=1)
+                                        
+                                        crop_high_bgr = cv2.cvtColor(crop_high, cv2.COLOR_GRAY2BGR)
+                                        result_high = self.ocr.recognize(crop_high_bgr)
+                                        all_ocr_results.append({
+                                            'text': result_high.get('text', ''),
+                                            'conf': result_high.get('conf', 0.0),
+                                            'method': f'{region_name}-high-contrast',
+                                            'region': region_name
+                                        })
+                                        
+                                        # Inverted version
+                                        crop_high_inv = cv2.bitwise_not(crop_high)
+                                        crop_high_inv_bgr = cv2.cvtColor(crop_high_inv, cv2.COLOR_GRAY2BGR)
+                                        result_high_inv = self.ocr.recognize(crop_high_inv_bgr)
+                                        all_ocr_results.append({
+                                            'text': result_high_inv.get('text', ''),
+                                            'conf': result_high_inv.get('conf', 0.0),
+                                            'method': f'{region_name}-high-contrast-inv',
+                                            'region': region_name
+                                        })
+                                    except Exception as e:
+                                        print(f"[VideoProcessor] OCR strategy 3 ({region_name}) failed: {e}")
+                                
+                                # Combine results from all regions intelligently
+                                # Group by region to find the best result per region, then combine unique texts
+                                
+                                # Log all OCR attempts for debugging (every frame for nearest trailer)
+                                if is_nearest and frame_count % 5 == 0:  # Log every 5 frames
+                                    print(f"[VideoProcessor] Frame {frame_count}, Track {track_id}: {len(all_ocr_results)} OCR attempts from all regions")
+                                    for i, result in enumerate(all_ocr_results):
+                                        print(f"  {i+1}. {result['method']}: '{result['text']}' (conf: {result['conf']:.3f})")
+                                
+                                # Find best result per region with relaxed filtering to capture more results
+                                region_best = {}  # region_name -> best result for that region
+                                MIN_TEXT_LENGTH = 1  # Allow single characters (will be filtered by scoring)
+                                MIN_CONFIDENCE = 0.005  # Very low threshold (0.5%) to see what OCR detects
+                                
+                                for result in all_ocr_results:
+                                    # Filter out only completely empty results
+                                    if not result['text']:
+                                        continue
+                                    # Very permissive filtering to see what we're getting
+                                    if len(result['text']) < MIN_TEXT_LENGTH:
+                                        continue
+                                    if result['conf'] < MIN_CONFIDENCE:
+                                        continue
+                                    
+                                    # Check for alphanumeric content
                                     has_letter = any(c.isalpha() for c in result['text'])
                                     has_digit = any(c.isdigit() for c in result['text'])
                                     has_both = has_letter and has_digit
+                                    has_alphanumeric = has_letter or has_digit
                                     
-                                    # Scoring: prioritize results with both letters and numbers
+                                    # Skip results with no alphanumeric characters
+                                    if not has_alphanumeric:
+                                        continue
+                                    
+                                    # Enhanced scoring system
                                     score = result['conf']
-                                    if has_both:
-                                        score += 0.15  # Bonus for having both
-                                    score += len(result['text']) * 0.01  # Small bonus for length
                                     
-                                    if best_result is None or score > best_result['score']:
-                                        best_result = {
-                                            'text': result['text'],
-                                            'conf': result['conf'],
-                                            'method': result['method'],
-                                            'score': score
-                                        }
+                                    # Trailer IDs usually have both letters and numbers
+                                    if has_both:
+                                        score += 0.2  # Strong bonus
+                                    elif has_digit:
+                                        score += 0.1  # Numbers are important
+                                    elif has_letter and len(result['text']) >= 4:
+                                        score += 0.05  # Some trailers have only letters
+                                    
+                                    # Length bonus (trailers typically have 3-12 character IDs)
+                                    text_len = len(result['text'])
+                                    if 3 <= text_len <= 12:
+                                        score += 0.15
+                                    elif text_len >= 4:
+                                        score += 0.08
+                                    
+                                    # Store score for comparison
+                                    result['score'] = score
+                                    
+                                    # Update best for this region
+                                    region_name = result['region']
+                                    if region_name not in region_best or score > region_best[region_name]['score']:
+                                        region_best[region_name] = result
                                 
-                                if best_result:
-                                    text = best_result['text']
-                                    conf_ocr = best_result['conf']
-                                    if frame_count % 10 == 0:  # Log occasionally
-                                        print(f"[VideoProcessor] Best OCR method: {best_result['method']} for '{text}'")
+                                # Combine unique texts from different regions
+                                # If we found different text in different regions, combine them
+                                unique_texts = {}  # text -> result
                                 
-                                # Filter out very low confidence results
-                                MIN_OCR_CONF = 0.01  # 1% minimum confidence
-                                if text and conf_ocr >= MIN_OCR_CONF:
+                                for region_name, result in region_best.items():
+                                    text_found = result['text'].strip()  # Strip whitespace
+                                    if not text_found:  # Skip empty after stripping
+                                        continue
+                                    
+                                    if text_found not in unique_texts:
+                                        unique_texts[text_found] = result
+                                    else:
+                                        # Keep the one with higher score
+                                        if result['score'] > unique_texts[text_found]['score']:
+                                            unique_texts[text_found] = result
+                                
+                                # Draw red boxes around regions that detected text
+                                # This shows where characters/numbers were found on the trailer
+                                text_regions = []  # Store regions with detected text for drawing
+                                
+                                # Combine all unique texts (e.g., "RZ/IMVZ" from top + "399" from bottom)
+                                if unique_texts:
+                                    # Sort by score to prioritize best results
+                                    sorted_results = sorted(unique_texts.values(), key=lambda x: x['score'], reverse=True)
+                                    
+                                    # Collect regions that have detected text
+                                    for result in sorted_results:
+                                        region_name = result['region']
+                                        # Find the crop region coordinates
+                                        for rname, rx1, ry1, rx2, ry2 in crop_regions:
+                                            if rname == region_name:
+                                                text_regions.append((rx1, ry1, rx2, ry2, result['text'], result['conf']))
+                                                break
+                                    
+                                    # Only combine if we have valid results
+                                    valid_texts = []
+                                    combined_conf = 0.0
+                                    combined_methods = []
+                                    
+                                    for result in sorted_results:
+                                        text_item = result['text'].strip()
+                                        if text_item and len(text_item) >= 1:  # Accept single chars for now
+                                            valid_texts.append(text_item)
+                                            combined_conf = max(combined_conf, result['conf'])
+                                            combined_methods.append(result['method'])
+                                    
+                                    # Join valid texts only
+                                    if valid_texts:
+                                        text = ' | '.join(valid_texts)
+                                        conf_ocr = combined_conf
+                                        
+                                        print(f"[VideoProcessor] Frame {frame_count}, Track {track_id}: COMBINED OCR '{text}' from {len(valid_texts)} regions")
+                                        print(f"  Methods: {', '.join(combined_methods)}")
+                                        print(f"  Confidence: {conf_ocr:.3f}")
+                                
+                                # Accept OCR results if we have text (scoring already filtered quality)
+                                if text and len(text) >= 1:  # Accept even single chars now since we're combining regions
                                     with self.lock:
                                         self.stats['ocr_results'] += 1
-                                    print(f"[VideoProcessor] Frame {frame_count}, Track {track_id}: OCR result '{text}' (conf: {conf_ocr:.2f})")
+                                    print(f"[VideoProcessor] Frame {frame_count}, Track {track_id}: OCR ACCEPTED '{text}' (conf: {conf_ocr:.3f})")
                                 else:
+                                    if is_nearest and not text:
+                                        print(f"[VideoProcessor] Frame {frame_count}, Track {track_id}: No valid OCR result (all attempts failed)")
                                     text = ""
                                     conf_ocr = 0.0
+                                
+                                # Draw red bounding boxes around detected text/character regions on the trailer rear
+                                # This shows exactly where characters and numbers were detected on the back of the trailer
+                                if is_nearest and text_regions:
+                                    for tx1, ty1, tx2, ty2, detected_text, text_conf in text_regions:
+                                        # Ensure coordinates are within frame bounds
+                                        tx1 = max(0, min(tx1, w - 1))
+                                        ty1 = max(0, min(ty1, h - 1))
+                                        tx2 = max(tx1 + 1, min(tx2, w))
+                                        ty2 = max(ty1 + 1, min(ty2, h))
+                                        
+                                        # Draw red bounding box around text region (thick, visible - RED for detected characters/numbers)
+                                        cv2.rectangle(processed_frame, (tx1, ty1), (tx2, ty2), (0, 0, 255), 3)
+                                        
+                                        # Draw text label on the box showing what was detected
+                                        if text_conf > 0.05:  # Show label if confidence is reasonable (5% threshold)
+                                            label_text = f"{detected_text[:15]}"  # Truncate if too long
+                                            label_size = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+                                            # Draw label above the box with red background
+                                            label_y = max(ty1 - 8, 20)
+                                            cv2.rectangle(processed_frame,
+                                                         (tx1 - 3, label_y - label_size[1] - 3),
+                                                         (tx1 + label_size[0] + 3, label_y + 3),
+                                                         (0, 0, 255), -1)
+                                            cv2.putText(processed_frame, label_text, (tx1, label_y),
+                                                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
                                 
                                 # Draw OCR text in red ONLY for the nearest trailer
                                 if text and is_nearest:
@@ -468,10 +823,108 @@ class VideoProcessor:
                         frame_events.append(event)
                         with self.lock:
                             self.events.append(event)
+                        
+                        # Update last nearest trailer if this is the nearest one
+                        if is_nearest:
+                            self.last_nearest_trailer = {
+                                'bbox': bbox,
+                                'track_id': track_id,
+                                'det_conf': det_conf,
+                                'text': text,
+                                'ocr_conf': conf_ocr,
+                                'width': width,
+                                'height': height
+                            }
                     except Exception as e:
                         print(f"[VideoProcessor] Error processing track at frame {frame_count}: {e}")
                         import traceback
                         traceback.print_exc()
+                
+                # Only draw detection if trailer is actually detected in current frame
+                # Do NOT show persistent/ghost detections when no trailer is visible
+                # (Removed persistent display - only show when trailer is actually detected)
+                if False and self.last_nearest_trailer:  # Disabled persistent display
+                    trailer = self.last_nearest_trailer
+                    x1, y1, x2, y2 = [int(v) for v in trailer['bbox']]
+                    width = trailer['width']
+                    height = trailer['height']
+                    track_id = trailer['track_id']
+                    det_conf = trailer['det_conf']
+                    text = trailer['text']
+                    ocr_conf = trailer['ocr_conf']
+                    
+                    h, w = processed_frame.shape[:2]
+                    
+                    # Draw bounding box in green (thicker for better visibility)
+                    cv2.rectangle(processed_frame, (x1, y1), (x2, y2), (0, 255, 0), 3)
+                    
+                    # Draw semi-transparent green overlay
+                    overlay = processed_frame.copy()
+                    cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 255, 0), -1)
+                    cv2.addWeighted(overlay, 0.1, processed_frame, 0.9, 0, processed_frame)
+                    
+                    # Draw detection confidence and track ID in green above the box
+                    det_conf_percent = det_conf * 100.0
+                    conf_text = f"Track {track_id} - {det_conf_percent:.1f}% [NEAREST]"
+                    text_size = cv2.getTextSize(conf_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+                    
+                    # Draw black background for text
+                    text_x = x1
+                    text_y = max(y1 - 10, 20)
+                    cv2.rectangle(processed_frame, 
+                                 (text_x - 2, text_y - text_size[1] - 2), 
+                                 (text_x + text_size[0] + 2, text_y + 2),
+                                 (0, 0, 0), -1)
+                    
+                    # Draw text
+                    cv2.putText(processed_frame, conf_text, (text_x, text_y),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    
+                    # Draw trailer size below track ID
+                    size_text = f"Size: {width}x{height}px"
+                    size_text_size = cv2.getTextSize(size_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+                    size_y = text_y + text_size[1] + 5
+                    
+                    # Draw black background for size text
+                    cv2.rectangle(processed_frame,
+                                 (text_x - 2, size_y - size_text_size[1] - 2),
+                                 (text_x + size_text_size[0] + 2, size_y + 2),
+                                 (0, 0, 0), -1)
+                    
+                    # Draw size text
+                    cv2.putText(processed_frame, size_text, (text_x, size_y),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                    
+                    # Draw OCR text in red if available
+                    if text:
+                        ocr_conf_percent = ocr_conf * 100.0
+                        ocr_text = f"TEXT: {text}"
+                        ocr_conf_text = f"Conf: {ocr_conf_percent:.1f}%"
+                        
+                        # Position text below the bounding box
+                        text_y_pos = min(y2 + 30, h - 30)
+                        
+                        # Draw OCR text with black background
+                        ocr_text_size = cv2.getTextSize(ocr_text, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
+                        cv2.rectangle(processed_frame,
+                                     (x1 - 2, text_y_pos - ocr_text_size[1] - 2),
+                                     (x1 + ocr_text_size[0] + 2, text_y_pos + 2),
+                                     (0, 0, 0), -1)
+                        
+                        # Draw OCR text in red
+                        cv2.putText(processed_frame, ocr_text, (x1, text_y_pos),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                        
+                        # Draw confidence below OCR text
+                        conf_y = text_y_pos + 20
+                        ocr_conf_size = cv2.getTextSize(ocr_conf_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+                        cv2.rectangle(processed_frame,
+                                     (x1 - 2, conf_y - ocr_conf_size[1] - 2),
+                                     (x1 + ocr_conf_size[0] + 2, conf_y + 2),
+                                     (0, 0, 0), -1)
+                        
+                        cv2.putText(processed_frame, ocr_conf_text, (x1, conf_y),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
                 
                 # Store processed frame (always store, even if no detections)
                 # Store BEFORE yielding to ensure it's available immediately
