@@ -4,6 +4,13 @@ globals:
   detect_every_n: 5    # Run detector every N frames (tracking runs every frame)
   save_frames: true    # Save screenshots
   keep_screenshots: 10 # Keep last N screenshots per camera
+  
+  # Image preprocessing configuration
+  preprocessing:
+    enable_yolo: true      # Enable preprocessing for YOLO detection
+    enable_ocr: true       # Enable preprocessing for OCR recognition
+    yolo_strategy: "enhanced"  # YOLO strategy: "none", "basic", "enhanced"
+    ocr_strategy: "multi"     # OCR strategy: "none", "morphological", "clahe", "adaptive", "multi"
 
 cameras:
   - id: lifecam-hd6000-01

@@ -125,19 +125,14 @@ class VideoProcessor:
                 try:
                     tracks = tracker.update(detections, frame)
                     
-                    # Filter to ONLY detect REAR-FACING trailers (back side of trailer)
-                    # Rear trailers have specific characteristics:
-                    # - Wider than tall (aspect ratio 1.5:1 to 4:1 typical for rear view)
-                    # - Reasonable size (not too small, not too large)
-                    # - More rectangular/wide shape (not tall/narrow like side views)
+                    # Filter out non-trailer objects (false positives like mirrors, signs, etc.)
+                    # Trailers have specific characteristics but need LENIENT filters
+                    # to account for different viewing angles and distances
                     MIN_TRAILER_WIDTH = 150   # Minimum width in pixels
                     MIN_TRAILER_HEIGHT = 50   # Minimum height in pixels
                     MIN_AREA = 10000          # Minimum area (150*50 = 7500, buffer for safety)
-                    # REAR TRAILER ASPECT RATIO: Rear-facing trailers are WIDER than tall
-                    # Typical rear trailer: width ~2-3x height (e.g., 8ft wide x 13ft tall = ~2.4:1)
-                    # Filter out side views (tall/narrow) and front views (too square)
-                    MIN_ASPECT_RATIO = 1.5    # Must be wider than tall (rear trailers are wide)
-                    MAX_ASPECT_RATIO = 4.0    # Not too wide (filters out extreme angles/panoramic views)
+                    MIN_ASPECT_RATIO = 1.2    # Wider than tall (lenient for angled views)
+                    MAX_ASPECT_RATIO = 8.0    # Very wide range to catch all trailers
                     
                     filtered_tracks = []
                     for track in tracks:
@@ -148,35 +143,16 @@ class VideoProcessor:
                         area = width * height
                         aspect_ratio = width / (height + 1e-6)  # Avoid division by zero
                         
-                        # Apply strict filters for REAR-FACING trailer characteristics
-                        # This filters out:
-                        # - Side views (tall/narrow, aspect ratio < 1.5)
-                        # - Front views (too square, aspect ratio close to 1.0)
-                        # - Extreme angles (aspect ratio > 4.0)
-                        is_rear_trailer = (
-                            width >= MIN_TRAILER_WIDTH and 
+                        # Apply filters for trailer characteristics
+                        if (width >= MIN_TRAILER_WIDTH and 
                             height >= MIN_TRAILER_HEIGHT and 
                             area >= MIN_AREA and
-                            MIN_ASPECT_RATIO <= aspect_ratio <= MAX_ASPECT_RATIO
-                        )
-                        
-                        if is_rear_trailer:
+                            MIN_ASPECT_RATIO <= aspect_ratio <= MAX_ASPECT_RATIO):
                             filtered_tracks.append(track)
                         else:
                             # Log filtered out tracks for debugging
                             if frame_count % 30 == 0:  # Only log occasionally
-                                reason = []
-                                if width < MIN_TRAILER_WIDTH:
-                                    reason.append(f"width={width}<{MIN_TRAILER_WIDTH}")
-                                if height < MIN_TRAILER_HEIGHT:
-                                    reason.append(f"height={height}<{MIN_TRAILER_HEIGHT}")
-                                if area < MIN_AREA:
-                                    reason.append(f"area={area}<{MIN_AREA}")
-                                if aspect_ratio < MIN_ASPECT_RATIO:
-                                    reason.append(f"aspect={aspect_ratio:.2f}<{MIN_ASPECT_RATIO} (side view?)")
-                                elif aspect_ratio > MAX_ASPECT_RATIO:
-                                    reason.append(f"aspect={aspect_ratio:.2f}>{MAX_ASPECT_RATIO} (extreme angle?)")
-                                print(f"[VideoProcessor] Filtered Track {track['track_id']} (not rear-facing): {', '.join(reason)}")
+                                print(f"[VideoProcessor] Filtered Track {track['track_id']}: size={width}x{height}, aspect={aspect_ratio:.2f}")
                     
                     tracks = filtered_tracks
                     
@@ -202,12 +178,7 @@ class VideoProcessor:
                                 max_y2 = y2
                                 nearest_track_id = track['track_id']
                 
-                # Only process and draw tracks if trailers are actually detected in current frame
-                # Clear last_nearest_trailer if no trailers detected (no ghost detections)
-                if not tracks:
-                    self.last_nearest_trailer = None
-                
-                # Process each track (only if tracks exist)
+                # Process each track
                 for track in tracks:
                     try:
                         track_id = track['track_id']
@@ -220,40 +191,74 @@ class VideoProcessor:
                         if x2 <= x1 or y2 <= y1:
                             continue
                         
-                        # Calculate trailer dimensions
+                        # Refine bounding box to rear face (focus on back side only)
+                        # Rear face is typically in the center portion for wide detections
+                        orig_width = x2 - x1
+                        orig_height = y2 - y1
+                        orig_aspect = orig_width / orig_height if orig_height > 0 else 1.0
+                        
+                        # Store original bbox for OCR (we'll use refined bbox for display)
+                        orig_x1, orig_y1, orig_x2, orig_y2 = x1, y1, x2, y2
+                        
+                        # If aspect ratio suggests side view (wide), extract center portion for rear face
+                        if orig_aspect > 1.5:  # Wide detection (side view)
+                            center_x = (x1 + x2) / 2.0
+                            rear_width_ratio = 0.65  # Use 65% of width for rear face (centered)
+                            rear_width = int(orig_width * rear_width_ratio)
+                            rear_x1 = int(center_x - rear_width / 2)
+                            rear_x2 = int(center_x + rear_width / 2)
+                            # Keep full height
+                            rear_y1 = y1
+                            rear_y2 = y2
+                            
+                            # Clip to frame bounds
+                            h, w = processed_frame.shape[:2]
+                            rear_x1 = max(0, min(rear_x1, w - 1))
+                            rear_x2 = max(rear_x1 + 1, min(rear_x2, w - 1))
+                            rear_y1 = max(0, min(rear_y1, h - 1))
+                            rear_y2 = max(rear_y1 + 1, min(rear_y2, h - 1))
+                            
+                            # Use refined coordinates for display (rear face)
+                            x1, y1, x2, y2 = rear_x1, rear_y1, rear_x2, rear_y2
+                        # For narrow/tall detections (front/back view), use original bbox
+                        
+                        # Calculate trailer dimensions (using refined bbox)
                         width = x2 - x1
                         height = y2 - y1
                         
-                        # Only draw green bounding box and overlay for the NEAREST trailer
+                        # Draw green bounding box for ALL trailers (rear face)
                         is_nearest = (track_id == nearest_track_id)
                         
-                        if is_nearest:
-                            # Draw bounding box in green for detected trailer (thicker for better visibility)
-                            cv2.rectangle(processed_frame, (x1, y1), (x2, y2), (0, 255, 0), 3)
+                        # Draw bounding box in green for detected trailer rear face (thicker for better visibility)
+                        cv2.rectangle(processed_frame, (x1, y1), (x2, y2), (0, 255, 0), 3)
                             
-                            # Draw semi-transparent green overlay on the bounding box
-                            overlay = processed_frame.copy()
-                            cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 255, 0), -1)
-                            cv2.addWeighted(overlay, 0.1, processed_frame, 0.9, 0, processed_frame)
+                        # Draw semi-transparent green overlay on the bounding box (for all trailers)
+                        overlay = processed_frame.copy()
+                        cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 255, 0), -1)
+                        cv2.addWeighted(overlay, 0.1, processed_frame, 0.9, 0, processed_frame)
                         
-                            # Draw detection confidence and track ID in green above the box with background
+                        # Draw detection confidence and track ID above the box
                         det_conf_percent = det_conf * 100.0
+                        if is_nearest:
                             conf_text = f"Track {track_id} - {det_conf_percent:.1f}% [NEAREST]"
-                            text_size = cv2.getTextSize(conf_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
-                            
-                            # Draw black background for text
-                            text_x = x1
-                            text_y = max(y1 - 10, 20)
-                            cv2.rectangle(processed_frame, 
-                                         (text_x - 2, text_y - text_size[1] - 2), 
-                                         (text_x + text_size[0] + 2, text_y + 2),
-                                         (0, 0, 0), -1)
-                            
-                            # Draw text
-                            cv2.putText(processed_frame, conf_text, (text_x, text_y),
-                                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                            
-                            # Draw trailer size below track ID
+                        else:
+                            conf_text = f"Track {track_id} - {det_conf_percent:.1f}%"
+                        text_size = cv2.getTextSize(conf_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+                        
+                        # Draw black background for text
+                        text_x = x1
+                        text_y = max(y1 - 10, 20)
+                        cv2.rectangle(processed_frame, 
+                                     (text_x - 2, text_y - text_size[1] - 2), 
+                                     (text_x + text_size[0] + 2, text_y + 2),
+                                     (0, 0, 0), -1)
+                        
+                        # Draw text (green for all trailers)
+                        cv2.putText(processed_frame, conf_text, (text_x, text_y),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                        
+                        # Draw trailer size below track ID (only for nearest)
+                        if is_nearest:
                             size_text = f"Size: {width}x{height}px"
                             size_text_size = cv2.getTextSize(size_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
                             size_y = text_y + text_size[1] + 5
@@ -267,45 +272,38 @@ class VideoProcessor:
                             # Draw size text
                             cv2.putText(processed_frame, size_text, (text_x, size_y),
                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                        else:
-                            # Draw subtle gray bounding box for other detected trailers
-                            cv2.rectangle(processed_frame, (x1, y1), (x2, y2), (128, 128, 128), 1)
-                            
-                            # Draw small track ID in gray
-                            det_conf_percent = det_conf * 100.0
-                            conf_text = f"T{track_id}"
-                            cv2.putText(processed_frame, conf_text, (x1, max(y1 - 5, 15)),
-                                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (128, 128, 128), 1)
                         
                         # Multi-region OCR: Trailer text can appear in different locations
                         # (top - company name/ID, middle - branding, bottom - license plate/numbers)
                         # We'll scan multiple horizontal bands and combine results
+                        # Use refined rear face bbox for OCR (where text actually appears)
                         h, w = frame.shape[:2]
                         
+                        # Use refined rear face dimensions for OCR regions
                         bbox_width = x2 - x1
                         bbox_height = y2 - y1
                         
-                        # Define multiple crop regions to scan
+                        # Define multiple crop regions to scan (within rear face area)
                         crop_regions = []
                         
-                        # Region 1: Full bbox (90% with 5% margins)
+                        # Region 1: Full rear face (90% with 5% margins)
                         full_x1 = int(x1 + bbox_width * 0.05)
                         full_x2 = int(x2 - bbox_width * 0.05)
                         full_y1 = int(y1 + bbox_height * 0.05)
                         full_y2 = int(y2 - bbox_height * 0.05)
                         crop_regions.append(('full', full_x1, full_y1, full_x2, full_y2))
                         
-                        # Region 2: Top third (where company names often appear)
+                        # Region 2: Top third of rear face (where company names often appear)
                         top_x1 = int(x1 + bbox_width * 0.05)
                         top_x2 = int(x2 - bbox_width * 0.05)
                         top_y1 = int(y1 + bbox_height * 0.05)
-                        top_y2 = int(y1 + bbox_height * 0.40)  # Top 35% of trailer
+                        top_y2 = int(y1 + bbox_height * 0.40)  # Top 35% of rear face
                         crop_regions.append(('top', top_x1, top_y1, top_x2, top_y2))
                         
-                        # Region 3: Bottom third (where numbers/license plates often appear)
+                        # Region 3: Bottom third of rear face (where numbers/license plates often appear)
                         bot_x1 = int(x1 + bbox_width * 0.05)
                         bot_x2 = int(x2 - bbox_width * 0.05)
-                        bot_y1 = int(y1 + bbox_height * 0.60)  # Bottom 40% of trailer
+                        bot_y1 = int(y1 + bbox_height * 0.60)  # Bottom 40% of rear face
                         bot_y2 = int(y2 - bbox_height * 0.05)
                         crop_regions.append(('bottom', bot_x1, bot_y1, bot_x2, bot_y2))
                         
@@ -364,6 +362,10 @@ class VideoProcessor:
                                     if crop.size == 0 or crop.shape[0] < 15 or crop.shape[1] < 30:
                                         continue
                                     
+                                    # Check if text might be vertical (tall and narrow)
+                                    h_crop, w_crop = crop.shape[:2]
+                                    aspect_ratio = h_crop / w_crop if w_crop > 0 else 1.0
+                                    
                                     # Convert to grayscale once for all strategies
                                     if len(crop.shape) == 3:
                                         crop_gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
@@ -391,6 +393,33 @@ class VideoProcessor:
                                         })
                                     except Exception as e:
                                         print(f"[VideoProcessor] OCR strategy 0 ({region_name}) failed: {e}")
+                                    
+                                    # Strategy 0v: Vertical text detection (rotate if tall and narrow)
+                                    # If aspect ratio > 1.3 (tall and narrow), likely vertical text
+                                    if aspect_ratio > 1.3:
+                                        try:
+                                            # Rotate 90 degrees clockwise (to make vertical text horizontal)
+                                            crop_rotated_cw = cv2.rotate(crop_scaled, cv2.ROTATE_90_CLOCKWISE)
+                                            result_rot_cw = self.ocr.recognize(crop_rotated_cw)
+                                            all_ocr_results.append({
+                                                'text': result_rot_cw.get('text', ''),
+                                                'conf': result_rot_cw.get('conf', 0.0),
+                                                'method': f'{region_name}-rotated-90cw',
+                                                'region': region_name
+                                            })
+                                            
+                                            # Rotate 90 degrees counter-clockwise (alternative orientation)
+                                            crop_rotated_ccw = cv2.rotate(crop_scaled, cv2.ROTATE_90_COUNTERCLOCKWISE)
+                                            result_rot_ccw = self.ocr.recognize(crop_rotated_ccw)
+                                            all_ocr_results.append({
+                                                'text': result_rot_ccw.get('text', ''),
+                                                'conf': result_rot_ccw.get('conf', 0.0),
+                                                'method': f'{region_name}-rotated-90ccw',
+                                                'region': region_name
+                                            })
+                                        except Exception as e:
+                                            if frame_count % 50 == 0:
+                                                print(f"[VideoProcessor] OCR vertical text detection ({region_name}) failed: {e}")
                                     
                                     # Strategy 0b: Morphological preprocessing (character separation)
                                     # This helps separate touching characters and remove small noise
@@ -665,23 +694,10 @@ class VideoProcessor:
                                         if result['score'] > unique_texts[text_found]['score']:
                                             unique_texts[text_found] = result
                                 
-                                # Draw red boxes around regions that detected text
-                                # This shows where characters/numbers were found on the trailer
-                                text_regions = []  # Store regions with detected text for drawing
-                                
                                 # Combine all unique texts (e.g., "RZ/IMVZ" from top + "399" from bottom)
                                 if unique_texts:
                                     # Sort by score to prioritize best results
                                     sorted_results = sorted(unique_texts.values(), key=lambda x: x['score'], reverse=True)
-                                    
-                                    # Collect regions that have detected text
-                                    for result in sorted_results:
-                                        region_name = result['region']
-                                        # Find the crop region coordinates
-                                        for rname, rx1, ry1, rx2, ry2 in crop_regions:
-                                            if rname == region_name:
-                                                text_regions.append((rx1, ry1, rx2, ry2, result['text'], result['conf']))
-                                                break
                                     
                                     # Only combine if we have valid results
                                     valid_texts = []
@@ -714,32 +730,6 @@ class VideoProcessor:
                                         print(f"[VideoProcessor] Frame {frame_count}, Track {track_id}: No valid OCR result (all attempts failed)")
                                     text = ""
                                     conf_ocr = 0.0
-                                
-                                # Draw red bounding boxes around detected text/character regions on the trailer rear
-                                # This shows exactly where characters and numbers were detected on the back of the trailer
-                                if is_nearest and text_regions:
-                                    for tx1, ty1, tx2, ty2, detected_text, text_conf in text_regions:
-                                        # Ensure coordinates are within frame bounds
-                                        tx1 = max(0, min(tx1, w - 1))
-                                        ty1 = max(0, min(ty1, h - 1))
-                                        tx2 = max(tx1 + 1, min(tx2, w))
-                                        ty2 = max(ty1 + 1, min(ty2, h))
-                                        
-                                        # Draw red bounding box around text region (thick, visible - RED for detected characters/numbers)
-                                        cv2.rectangle(processed_frame, (tx1, ty1), (tx2, ty2), (0, 0, 255), 3)
-                                        
-                                        # Draw text label on the box showing what was detected
-                                        if text_conf > 0.05:  # Show label if confidence is reasonable (5% threshold)
-                                            label_text = f"{detected_text[:15]}"  # Truncate if too long
-                                            label_size = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
-                                            # Draw label above the box with red background
-                                            label_y = max(ty1 - 8, 20)
-                                            cv2.rectangle(processed_frame,
-                                                         (tx1 - 3, label_y - label_size[1] - 3),
-                                                         (tx1 + label_size[0] + 3, label_y + 3),
-                                                         (0, 0, 255), -1)
-                                            cv2.putText(processed_frame, label_text, (tx1, label_y),
-                                                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
                                 
                                 # Draw OCR text in red ONLY for the nearest trailer
                                 if text and is_nearest:
@@ -840,10 +830,9 @@ class VideoProcessor:
                         import traceback
                         traceback.print_exc()
                 
-                # Only draw detection if trailer is actually detected in current frame
-                # Do NOT show persistent/ghost detections when no trailer is visible
-                # (Removed persistent display - only show when trailer is actually detected)
-                if False and self.last_nearest_trailer:  # Disabled persistent display
+                # Draw persistent green box for the last detected nearest trailer
+                # This keeps the green box visible even when tracking is temporarily lost
+                if self.last_nearest_trailer:
                     trailer = self.last_nearest_trailer
                     x1, y1, x2, y2 = [int(v) for v in trailer['bbox']]
                     width = trailer['width']

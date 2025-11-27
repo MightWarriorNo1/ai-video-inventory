@@ -39,6 +39,7 @@ from app.event_bus import MultiPublisher
 from app.uploader import UploadManager
 from app.metrics_server import MetricsServer
 from app.video_processor import VideoProcessor
+from app.image_preprocessing import ImagePreprocessor
 import requests
 
 
@@ -67,6 +68,7 @@ class TrailerVisionApp:
         self.publisher = None
         self.uploader = None
         self.metrics_server = None
+        self.preprocessor = None
         
         # Per-camera trackers and homographies
         self.trackers = {}
@@ -139,6 +141,18 @@ class TrailerVisionApp:
         metrics_port = int(os.getenv('METRICS_PORT', '8080'))
         self.metrics_server = MetricsServer(port=metrics_port, csv_logger=self.csv_logger)
         self.metrics_server.start()
+        
+        # Initialize image preprocessor
+        preproc_cfg = globals_cfg.get('preprocessing', {})
+        self.preprocessor = ImagePreprocessor(
+            enable_yolo_preprocessing=preproc_cfg.get('enable_yolo', True),
+            enable_ocr_preprocessing=preproc_cfg.get('enable_ocr', True),
+            yolo_strategy=preproc_cfg.get('yolo_strategy', 'enhanced'),
+            ocr_strategy=preproc_cfg.get('ocr_strategy', 'multi')
+        )
+        print(f"[TrailerVisionApp] Image preprocessing enabled:")
+        print(f"  YOLO: {self.preprocessor.enable_yolo_preprocessing} ({self.preprocessor.yolo_strategy})")
+        print(f"  OCR: {self.preprocessor.enable_ocr_preprocessing} ({self.preprocessor.ocr_strategy})")
         
         # Load homographies for each camera
         for camera in self.config.get('cameras', []):
@@ -252,10 +266,15 @@ class TrailerVisionApp:
         tracker = self.trackers[camera_id]
         metrics = self.camera_metrics[camera_id]
         
+        # Preprocess frame for YOLO if enabled
+        processed_frame = frame
+        if self.preprocessor and self.preprocessor.enable_yolo_preprocessing:
+            processed_frame = self.preprocessor.preprocess_for_yolo(frame)
+        
         # Run detector every N frames
         detections = []
         if self.detector and frame_count % detect_every_n == 0:
-            detections = self.detector.detect(frame)
+            detections = self.detector.detect(processed_frame)
         
         # Update tracker
         tracks = tracker.update(detections, frame)
@@ -271,13 +290,53 @@ class TrailerVisionApp:
             if crop.size == 0:
                 continue
             
-            # Run OCR
+            # Run OCR with preprocessing
             text = ""
             conf_ocr = 0.0
+            ocr_method = "none"
             if self.ocr:
-                ocr_result = self.ocr.recognize(crop)
-                text = ocr_result['text']
-                conf_ocr = ocr_result['conf']
+                if self.preprocessor and self.preprocessor.enable_ocr_preprocessing:
+                    # Get multiple preprocessed versions
+                    preprocessed_crops = self.preprocessor.preprocess_for_ocr(crop)
+                    
+                    # Try OCR on each preprocessed version
+                    ocr_results = []
+                    for prep in preprocessed_crops:
+                        try:
+                            result = self.ocr.recognize(prep['image'])
+                            if result.get('text', '').strip():
+                                ocr_results.append({
+                                    'text': result.get('text', ''),
+                                    'conf': result.get('conf', 0.0),
+                                    'method': prep['method']
+                                })
+                        except Exception as e:
+                            if frame_count % 50 == 0:  # Log occasionally
+                                print(f"[TrailerVisionApp] OCR error with {prep['method']}: {e}")
+                    
+                    # Select best result
+                    if ocr_results:
+                        best_result = self.preprocessor.select_best_ocr_result(ocr_results)
+                        text = best_result['text']
+                        conf_ocr = best_result['conf']
+                        ocr_method = best_result['method']
+                        # Note: best_result may also include 'is_rotated' flag if needed
+                    else:
+                        # Fallback: try original crop if all preprocessing failed
+                        try:
+                            ocr_result = self.ocr.recognize(crop)
+                            text = ocr_result.get('text', '')
+                            conf_ocr = ocr_result.get('conf', 0.0)
+                            ocr_method = 'original-fallback'
+                        except Exception as e:
+                            if frame_count % 50 == 0:
+                                print(f"[TrailerVisionApp] OCR fallback failed: {e}")
+                else:
+                    # Original OCR without preprocessing
+                    ocr_result = self.ocr.recognize(crop)
+                    text = ocr_result['text']
+                    conf_ocr = ocr_result['conf']
+                    ocr_method = 'original'
             
             # Project center to world coordinates
             center_x = (x1 + x2) / 2.0
@@ -301,6 +360,7 @@ class TrailerVisionApp:
                 'bbox': bbox,
                 'text': text,
                 'conf': conf_ocr,
+                'ocr_method': ocr_method,  # Track which preprocessing method was used
                 'x_world': world_coords[0] if world_coords else None,
                 'y_world': world_coords[1] if world_coords else None,
                 'spot': spot,

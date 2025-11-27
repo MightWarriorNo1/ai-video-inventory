@@ -18,5 +18,7 @@ config/calib/*.json
 .DS_Store
 .vscode/
 .idea/
+training_data
+yolo_trailer_dataset
 
 

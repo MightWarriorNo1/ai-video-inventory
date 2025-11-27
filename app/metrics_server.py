@@ -322,17 +322,8 @@ class MetricsServer:
                 return []
             
             import csv
-            # Read file and remove NUL bytes (null characters) that can corrupt CSV parsing
-            with open(csv_path, 'rb') as f:
-                content = f.read()
-                # Remove NUL bytes
-                content = content.replace(b'\x00', b'')
-                # Decode to string
-                content_str = content.decode('utf-8', errors='replace')
-            
-            # Parse CSV from cleaned content
-            import io
-            reader = csv.DictReader(io.StringIO(content_str))
+            with open(csv_path, 'r', encoding='utf-8') as f:
+                reader = csv.DictReader(f)
                 for row in reader:
                     if camera_id and row.get('camera_id') != camera_id:
                         continue
@@ -342,8 +333,6 @@ class MetricsServer:
             return events[-limit:]
         except Exception as e:
             print(f"Error reading events: {e}")
-            import traceback
-            traceback.print_exc()
             return []
     
     def update_camera_metrics(self, camera_id: str, fps_ema: float, frames_processed_count: int, 
