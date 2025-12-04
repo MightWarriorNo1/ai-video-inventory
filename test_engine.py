@@ -303,25 +303,61 @@ def test_engine(engine_path, engine_type="detector"):
         return False
 
 if __name__ == "__main__":
-    # Test detector engine
-    detector_ok = test_engine("models/trailer_detector.engine", "detector")
+    results = {}
     
-    # Test OCR engine
-    ocr_ok = test_engine("models/ocr_crnn.engine", "OCR")
+    # Test YOLO detector engine (legacy)
+    if os.path.exists("models/trailer_detector.engine"):
+        results['YOLO Detector'] = test_engine("models/trailer_detector.engine", "YOLO Detector")
+    else:
+        print("⚠ YOLO detector engine not found: models/trailer_detector.engine")
+        results['YOLO Detector'] = None
+    
+    # Test PaddleOCR text detection engine
+    if os.path.exists("models/paddleocr_det.engine"):
+        results['PaddleOCR Det'] = test_engine("models/paddleocr_det.engine", "PaddleOCR Text Detector")
+    else:
+        print("⚠ PaddleOCR detection engine not found: models/paddleocr_det.engine")
+        results['PaddleOCR Det'] = None
+    
+    # Test OCR engine (legacy CRNN)
+    if os.path.exists("models/ocr_crnn.engine"):
+        results['OCR (CRNN)'] = test_engine("models/ocr_crnn.engine", "OCR (CRNN)")
+    else:
+        print("⚠ OCR engine not found: models/ocr_crnn.engine")
+        results['OCR (CRNN)'] = None
+    
+    # Test PaddleOCR recognition engine
+    if os.path.exists("models/paddleocr_rec.engine"):
+        results['PaddleOCR Rec'] = test_engine("models/paddleocr_rec.engine", "PaddleOCR Text Recognition")
+    else:
+        print("⚠ PaddleOCR recognition engine not found: models/paddleocr_rec.engine")
+        results['PaddleOCR Rec'] = None
     
     # Summary
     print(f"\n{'='*60}")
     print(f"TEST SUMMARY")
     print(f"{'='*60}")
-    print(f"Detector engine: {'✓ PASS' if detector_ok else '✗ FAIL'}")
-    print(f"OCR engine:      {'✓ PASS' if ocr_ok else '✗ FAIL'}")
+    for name, result in results.items():
+        if result is None:
+            status = "⚠ NOT FOUND"
+        elif result:
+            status = "✓ PASS"
+        else:
+            status = "✗ FAIL"
+        print(f"{name:20s}: {status}")
     print(f"{'='*60}\n")
     
-    if not detector_ok or not ocr_ok:
+    # Check if any engines failed
+    failed = [name for name, result in results.items() if result is False]
+    if failed:
         print("RECOMMENDATION: Rebuild engines on the target Jetson device.")
         print("The engines may have been built on a different device, causing")
         print("the 'invalid resource handle' errors.")
         sys.exit(1)
+    elif all(r is None for r in results.values()):
+        print("⚠ No engines found. Please build engines first:")
+        print("  python3 build_engines.py --paddleocr-det-onnx <path> --paddleocr-rec-onnx <path>")
+        sys.exit(1)
     else:
-        print("All engines are working correctly!")
+        print("All tested engines are working correctly!")
         sys.exit(0)

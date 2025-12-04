@@ -49,12 +49,24 @@ class PlateRecognizer:
         if not os.path.exists(engine_path):
             raise FileNotFoundError(f"TensorRT OCR engine not found: {engine_path}")
         
-        # Load alphabet
-        with open(alphabet_path, 'r') as f:
-            self.alphabet = f.read().strip()
+        # Load alphabet - PaddleOCR uses one character per line
+        # Index 0 = blank token, Index 1+ = characters from file
+        with open(alphabet_path, 'r', encoding='utf-8') as f:
+            lines = f.read().strip().split('\n')
+            # Remove empty lines
+            self.alphabet_list = [line for line in lines if line.strip()]
         
-        # CTC blank is typically at index 0
+        # CTC blank is at index 0
         self.blank_idx = 0
+        self.alphabet_size = len(self.alphabet_list)
+        
+        # For backwards compatibility, also store as string
+        self.alphabet = ''.join(self.alphabet_list)
+        
+        # Note: PaddleOCR models with 6625 output classes use a larger dictionary
+        # (e.g., ppocr_keys_v1.txt). If the model outputs indices > alphabet_size,
+        # those are likely special tokens or characters not in our alphabet.
+        # For now, we only decode indices 1 to alphabet_size.
         
         if not TRT_AVAILABLE:
             raise RuntimeError("TensorRT or PyCUDA not available. Cannot initialize OCR.")
@@ -148,7 +160,12 @@ class PlateRecognizer:
         print(f"Loaded TensorRT OCR engine: {engine_path}")
         print(f"  Input tensor: {self.input_names[0]}, shape: {self.input_shape}")
         print(f"  Output tensor: {self.output_names[0]}, shape: {self.output_shape}")
-        print(f"Alphabet: {self.alphabet} ({len(self.alphabet)} chars)")
+        if self.alphabet_size <= 100:
+            preview = ''.join(self.alphabet_list)
+        else:
+            preview = ''.join(self.alphabet_list[:50]) + "..."
+        print(f"Alphabet: {alphabet_path} ({self.alphabet_size} chars)")
+        print(f"Alphabet preview: {preview}")
     
     def _allocate_buffers(self):
         """Allocate GPU buffers for input and output using tensor-based API."""
@@ -318,26 +335,63 @@ class PlateRecognizer:
         """
         Preprocess cropped image for OCR input.
         
+        PaddleOCR recognition models expect:
+        - RGB input (3 channels)
+        - Normalization: img / 255.0 (normalized to [0, 1])
+        - Height: 48 pixels (for PaddleOCR models)
+        
+        Note: Some PaddleOCR models use (img - 127.5) / 127.5, but testing shows
+        [0, 1] normalization produces better results for this model.
+        
         Args:
-            image: BGR cropped image (H, W, 3)
+            image: BGR cropped image (H, W, 3) or grayscale (H, W)
             
         Returns:
-            Preprocessed image tensor (1, 1, H, W) normalized
+            Preprocessed image tensor (1, 3, H, W) normalized to [0, 1]
         """
-        # Resize to input size
-        img_resized = cv2.resize(image, self.input_size)
+        # Improve upscaling for small text - use better interpolation
+        # If image is very small, upscale more aggressively before resizing to model input
+        h, w = image.shape[:2]
+        target_h = self.input_size[1]  # 48 for PaddleOCR
         
-        # Convert to grayscale
-        if len(img_resized.shape) == 3:
-            img_gray = cv2.cvtColor(img_resized, cv2.COLOR_BGR2GRAY)
+        # If input is much smaller than target, upscale first with better interpolation
+        if h < target_h * 0.8:  # If height is less than 80% of target
+            # Upscale to at least 2x target height for better quality
+            scale = max(2.0, target_h * 2.0 / h)
+            new_h = int(h * scale)
+            new_w = int(w * scale)
+            # Use cubic interpolation for better quality on upscaling
+            img_upscaled = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
         else:
-            img_gray = img_resized
+            img_upscaled = image
         
-        # Normalize to [0, 1]
-        img_normalized = img_gray.astype(np.float32) / 255.0
+        # Resize to input size (width, height) - use area interpolation for downscaling
+        # Area interpolation is better for downscaling, linear is fine for upscaling
+        if img_upscaled.shape[0] > target_h or img_upscaled.shape[1] > self.input_size[0]:
+            # Downscaling - use area interpolation
+            img_resized = cv2.resize(img_upscaled, self.input_size, interpolation=cv2.INTER_AREA)
+        else:
+            # Upscaling or same size - use cubic for better quality
+            img_resized = cv2.resize(img_upscaled, self.input_size, interpolation=cv2.INTER_CUBIC)
         
-        # Add batch and channel dimensions: (1, 1, H, W)
-        img_batched = np.expand_dims(np.expand_dims(img_normalized, axis=0), axis=0)
+        # Convert BGR to RGB if needed (PaddleOCR expects RGB)
+        if len(img_resized.shape) == 3 and img_resized.shape[2] == 3:
+            img_rgb = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
+        elif len(img_resized.shape) == 2:
+            # Grayscale - convert to RGB by replicating channels
+            img_rgb = cv2.cvtColor(img_resized, cv2.COLOR_GRAY2RGB)
+        else:
+            img_rgb = img_resized
+        
+        # PaddleOCR recognition models: Use [0, 1] normalization
+        # Many PaddleOCR models are trained with simple [0, 1] normalization
+        # ImageNet normalization was causing garbled text (e.g., "PMARPONS" instead of "MAR JON")
+        img_float = img_rgb.astype(np.float32)
+        img_normalized = img_float / 255.0
+        
+        # Add batch dimension and transpose to CHW format: (1, 3, H, W)
+        # PaddleOCR expects NCHW format
+        img_batched = np.expand_dims(img_normalized.transpose(2, 0, 1), axis=0)
         
         return img_batched
     
@@ -482,30 +536,67 @@ class PlateRecognizer:
                         # Continue anyway - might still work
                 
                 # Prepare input data - ensure it matches the expected shape
-                # Note: OCR input shape is (1, 3, 48, W) where W is dynamic
-                # Preprocessed is (1, 1, H, W), need to convert to (1, 3, 48, W)
+                # Preprocessed is now (1, 3, H, W) - RGB format with PaddleOCR normalization
                 input_data = preprocessed.astype(input_tensor['dtype'])
                 
-                # Handle shape conversion: preprocessed is (1, 1, H, W), but engine expects (1, 3, 48, W)
-                if len(input_data.shape) == 4 and input_data.shape[1] == 1:
-                    # Convert (1, 1, H, W) to (1, 3, 48, W)
-                    # Resize height to 48 and replicate channel to 3
+                # Ensure data is contiguous in memory (required for CUDA)
+                if not input_data.flags['C_CONTIGUOUS']:
+                    input_data = np.ascontiguousarray(input_data)
+                
+                # Handle shape conversion: preprocessed is (1, 3, H, W)
+                # Get expected height from engine shape (48 for PaddleOCR)
+                expected_height = expected_shape[2] if len(expected_shape) >= 3 else 48
+                
+                # Resize height if needed (width is dynamic, height should match expected)
+                if len(input_data.shape) == 4 and input_data.shape[1] == 3:
                     h, w = input_data.shape[2], input_data.shape[3]
-                    if h != 48:
-                        # Resize to height 48
+                    # Resize to expected height (from engine)
+                    if h != expected_height:
                         import cv2
-                        img_2d = input_data[0, 0, :, :]  # (H, W)
-                        img_resized = cv2.resize(img_2d, (w, 48))  # (48, W)
-                        input_data = np.expand_dims(img_resized, axis=0)  # (1, 48, W)
-                        input_data = np.expand_dims(input_data, axis=0)  # (1, 1, 48, W)
-                    
-                    # Replicate channel: (1, 1, 48, W) -> (1, 3, 48, W)
-                    input_data = np.repeat(input_data, 3, axis=1)  # (1, 3, 48, W)
+                        # Resize each channel separately to maintain RGB format
+                        img_resized_channels = []
+                        for c in range(3):
+                            channel_2d = input_data[0, c, :, :]  # (H, W)
+                            channel_resized = cv2.resize(channel_2d, (w, expected_height), interpolation=cv2.INTER_LINEAR)  # (expected_height, W)
+                            img_resized_channels.append(channel_resized)
+                        # Stack channels: (3, expected_height, W)
+                        img_resized = np.stack(img_resized_channels, axis=0)
+                        # Add batch dimension: (1, 3, expected_height, W)
+                        input_data = np.expand_dims(img_resized, axis=0)
+                        # Ensure contiguous after reshape
+                        if not input_data.flags['C_CONTIGUOUS']:
+                            input_data = np.ascontiguousarray(input_data)
                 
                 # Reshape to match the host buffer shape
+                # Preprocessed is (1, 3, H, W), engine expects (1, 3, 48, W) or similar
                 if input_data.shape != expected_shape:
-                    # Check if we can reshape
+                    # Check if we can reshape (size matches but shape differs)
                     if input_data.size == np.prod(expected_shape):
+                        input_data = input_data.reshape(expected_shape)
+                    elif len(expected_shape) == 4 and expected_shape[1] == 3:
+                        # Engine expects RGB (3 channels) - ensure we have 3 channels
+                        if input_data.shape[1] != 3:
+                            # Replicate channel if needed (shouldn't happen with new preprocessing)
+                            if input_data.shape[1] == 1:
+                                input_data = np.repeat(input_data, 3, axis=1)
+                        # Handle height/width mismatch
+                        if expected_shape[2] != input_data.shape[2] or expected_shape[3] != input_data.shape[3]:
+                            import cv2
+                            h_actual, w_actual = input_data.shape[2], input_data.shape[3]
+                            h_expected, w_expected = expected_shape[2], expected_shape[3]
+                            # Resize each channel
+                            img_resized_channels = []
+                            for c in range(3):
+                                channel_2d = input_data[0, c, :, :]  # (H, W)
+                                channel_resized = cv2.resize(channel_2d, (w_expected, h_expected), interpolation=cv2.INTER_LINEAR)
+                                img_resized_channels.append(channel_resized)
+                            img_resized = np.stack(img_resized_channels, axis=0)
+                            input_data = np.expand_dims(img_resized, axis=0)
+                    
+                    # Check if we can reshape
+                    if input_data.shape == expected_shape:
+                        pass  # Already correct shape
+                    elif input_data.size == np.prod(expected_shape):
                         input_data = input_data.reshape(expected_shape)
                     else:
                         # Size mismatch - pad or truncate
@@ -517,8 +608,33 @@ class PlateRecognizer:
                             flat_data = np.pad(flat_data, (0, expected_size - flat_data.size))
                         input_data = flat_data.reshape(expected_shape)
                 
+                # Validate input data size matches buffer size
+                input_size = input_data.size
+                buffer_size = input_tensor['host'].size
+                if input_size != buffer_size:
+                    # Try to reshape if total size matches
+                    if input_size == buffer_size:
+                        input_data = input_data.reshape(input_tensor['host'].shape)
+                    else:
+                        raise RuntimeError(
+                            f"Input data size mismatch: input has {input_size} elements, "
+                            f"but buffer expects {buffer_size} elements. "
+                            f"Input shape: {input_data.shape}, Expected shape: {expected_shape}"
+                        )
+                
                 # Copy to host buffer (host buffer has the same shape)
+                # Ensure input_data is the right shape before copying
+                if input_data.shape != input_tensor['host'].shape:
+                    input_data = input_data.reshape(input_tensor['host'].shape)
+                
                 np.copyto(input_tensor['host'], input_data)
+                
+                # Debug: Log input statistics occasionally to verify preprocessing
+                import random
+                if random.random() < 0.01:  # 1% chance
+                    print(f"[OCR] Input debug: shape={input_data.shape}, dtype={input_data.dtype}, "
+                          f"min={np.min(input_data):.4f}, max={np.max(input_data):.4f}, "
+                          f"mean={np.mean(input_data):.4f}, std={np.std(input_data):.4f}")
                 
                 # Validate device memory pointers before setting addresses
                 input_device_ptr = int(input_tensor['device'])
@@ -574,14 +690,17 @@ class PlateRecognizer:
                     # Execute inference
                     try:
                         # Print debug info for OCR inference
-                        
-                        self.context.execute_async_v3(stream_handle=inference_stream.handle)
+                        # Suppress Cask errors if they're non-fatal (they seem to be warnings in some TensorRT versions)
+                        import warnings
+                        with warnings.catch_warnings():
+                            warnings.filterwarnings("ignore", category=RuntimeWarning)
+                            self.context.execute_async_v3(stream_handle=inference_stream.handle)
                     except (RuntimeError, Exception) as e:
                         error_str = str(e).lower()
                         error_msg = f"TensorRT inference failed: {e}"
                         
-                        # Check if it's a resource handle error
-                        if "invalid resource handle" in error_str or "cuda" in error_str or "cutensor" in error_str:
+                        # Check if it's a resource handle error or Cask error
+                        if "invalid resource handle" in error_str or "cuda" in error_str or "cutensor" in error_str or "cask" in error_str:
                             print(f"  CUDA resource error detected. Attempting recovery...")
                             print(f"  Input shape: {expected_shape}, Input device ptr: {input_device_ptr}")
                             if len(self.output_names) > 0:
@@ -609,6 +728,18 @@ class PlateRecognizer:
                                 self.context.execute_async_v3(stream_handle=inference_stream.handle)
                                 print(f"  Retry succeeded!")
                             except Exception as e2:
+                                # Provide specific guidance for Cask errors
+                                cask_guidance = ""
+                                if "cask" in error_str:
+                                    cask_guidance = (
+                                        "\n  Cask error specific guidance:\n"
+                                        "  - Verify input shape matches engine expectations exactly\n"
+                                        "  - Ensure input data is C-contiguous (use np.ascontiguousarray)\n"
+                                        "  - Check that buffer sizes match data sizes\n"
+                                        "  - Try rebuilding the engine with --fp32 instead of --fp16\n"
+                                        "  - Verify GPU memory is not corrupted\n"
+                                    )
+                                
                                 raise RuntimeError(
                                     f"CUDA inference failed after recovery attempt.\n"
                                     f"Original error: {e}\n"
@@ -617,7 +748,8 @@ class PlateRecognizer:
                                     f"  1. Engine was built on a different device\n"
                                     f"  2. CUDA context is invalid\n"
                                     f"  3. Dynamic shape handling issue\n"
-                                    f"  4. Insufficient GPU memory"
+                                    f"  4. Insufficient GPU memory\n"
+                                    f"  5. Input data shape/size mismatch{cask_guidance}"
                                 )
                         else:
                             # Non-resource error - raise as-is
@@ -683,37 +815,68 @@ class PlateRecognizer:
                 total_elements = output.size if hasattr(output, 'size') else len(output)
                 
                 if len(output_shape) == 3:
-                    # [batch, T, C]
-                    batch_size = output_shape[0]
-                    seq_len = output_shape[1]
-                    num_classes = output_shape[2]
-                    
-                    # Calculate expected size
-                    expected_size = batch_size * seq_len * num_classes
-                    
-                    if expected_size > 0 and expected_size <= total_elements:
-                        # Reshape to [batch, seq_len, num_classes]
-                        # Flatten first to ensure we have a 1D array, then reshape
-                        output_flat = output.flatten()[:expected_size]
-                        output = output_flat.reshape(batch_size, seq_len, num_classes)
-                        output = output[0]  # Remove batch dimension -> [seq_len, num_classes]
-                    else:
-                        # Fallback: calculate from buffer size
-                        actual_seq_len = total_elements // (batch_size * num_classes)
-                        if actual_seq_len > 0:
-                            expected_size = batch_size * actual_seq_len * num_classes
+                    # [batch, T, C] or [T, batch, C] - TensorRT might return different order
+                    # Check if dimensions are swapped: if first dim is large and second is 1, likely swapped
+                    # Model outputs 6625 classes (blank + 6623 chars + 1 padding token)
+                    num_classes_from_shape = output_shape[2]
+                    if output_shape[0] > 1 and output_shape[1] == 1 and num_classes_from_shape >= self.alphabet_size:
+                        # Likely swapped: (seq_len, 1, num_classes) -> should be (1, seq_len, num_classes)
+                        batch_size = 1
+                        seq_len = output_shape[0]
+                        num_classes = output_shape[2]
+                        # Reshape as (seq_len, batch, num_classes) then transpose
+                        expected_size = seq_len * batch_size * num_classes
+                        if expected_size > 0 and expected_size <= total_elements:
                             output_flat = output.flatten()[:expected_size]
-                            output = output_flat.reshape(batch_size, actual_seq_len, num_classes)
-                            output = output[0]  # Remove batch dimension -> [T, C]
+                            output = output_flat.reshape(seq_len, batch_size, num_classes)
+                            # Transpose from (seq_len, batch, num_classes) to (batch, seq_len, num_classes)
+                            output = np.transpose(output, (1, 0, 2))  # -> (batch, seq_len, num_classes)
+                            output = output[0]  # Remove batch dimension -> [seq_len, num_classes]
+                            # Debug: log when we detect swapped dimensions (only once per session)
+                            if not hasattr(self, '_swapped_dim_logged'):
+                                print(f"[OCR] Detected swapped dimensions: {output_shape} -> (1, {seq_len}, {num_classes}), final shape: {output.shape}")
+                                self._swapped_dim_logged = True
                         else:
-                            # Last resort: try to infer from total elements
-                            T = total_elements // num_classes
-                            if T > 0:
-                                output_flat = output.flatten()[:T * num_classes]
-                                output = output_flat.reshape(T, num_classes)
+                            # Fallback: treat as (seq_len, num_classes) directly
+                            seq_len = total_elements // num_classes
+                            if seq_len > 0:
+                                output_flat = output.flatten()[:seq_len * num_classes]
+                                output = output_flat.reshape(seq_len, num_classes)
                             else:
                                 output_flat = output.flatten()[:num_classes]
                                 output = output_flat.reshape(1, num_classes)
+                    else:
+                        # Normal case: [batch, T, C]
+                        batch_size = output_shape[0]
+                        seq_len = output_shape[1]
+                        num_classes = output_shape[2]
+                        
+                        # Calculate expected size
+                        expected_size = batch_size * seq_len * num_classes
+                        
+                        if expected_size > 0 and expected_size <= total_elements:
+                            # Reshape to [batch, seq_len, num_classes]
+                            # Flatten first to ensure we have a 1D array, then reshape
+                            output_flat = output.flatten()[:expected_size]
+                            output = output_flat.reshape(batch_size, seq_len, num_classes)
+                            output = output[0]  # Remove batch dimension -> [seq_len, num_classes]
+                        else:
+                            # Fallback: calculate from buffer size
+                            actual_seq_len = total_elements // (batch_size * num_classes)
+                            if actual_seq_len > 0:
+                                expected_size = batch_size * actual_seq_len * num_classes
+                                output_flat = output.flatten()[:expected_size]
+                                output = output_flat.reshape(batch_size, actual_seq_len, num_classes)
+                                output = output[0]  # Remove batch dimension -> [T, C]
+                            else:
+                                # Last resort: try to infer from total elements
+                                T = total_elements // num_classes
+                                if T > 0:
+                                    output_flat = output.flatten()[:T * num_classes]
+                                    output = output_flat.reshape(T, num_classes)
+                                else:
+                                    output_flat = output.flatten()[:num_classes]
+                                    output = output_flat.reshape(1, num_classes)
                 elif len(output_shape) == 2:
                     # [T, C]
                     expected_size = output_shape[0] * output_shape[1]
@@ -729,20 +892,35 @@ class PlateRecognizer:
                             output_flat = output.flatten()[:output_shape[1]]
                             output = output_flat.reshape(1, output_shape[1])
                 else:
-                    # Flatten and reshape to [T, C] assuming C = alphabet size
-                    T = total_elements // len(self.alphabet)
-                    if T > 0:
-                        output_flat = output.flatten()[:T * len(self.alphabet)]
-                        output = output_flat.reshape(T, len(self.alphabet))
+                    # Fallback: Flatten and reshape to [T, C]
+                    # Try to infer num_classes from output_shape if available, otherwise use a reasonable default
+                    # PaddleOCR models output 6625 classes (blank + 6623 chars + 1 padding)
+                    if len(output_shape) > 0 and output_shape[-1] > 0:
+                        num_classes = output_shape[-1]
                     else:
-                        output_flat = output.flatten()[:len(self.alphabet)]
-                        output = output_flat.reshape(1, len(self.alphabet))
+                        # Default to model's expected output size (6625 for PaddleOCR)
+                        # This is larger than alphabet_size (6623) to account for blank and padding tokens
+                        num_classes = max(self.alphabet_size + 2, 6625)  # blank + chars + padding
+                    
+                    T = total_elements // num_classes
+                    if T > 0:
+                        output_flat = output.flatten()[:T * num_classes]
+                        output = output_flat.reshape(T, num_classes)
+                    else:
+                        output_flat = output.flatten()[:num_classes]
+                        output = output_flat.reshape(1, num_classes)
                 
                 # Apply softmax to get probabilities (if output is logits)
                 # Many models output logits, so we apply softmax
                 # If your model already outputs probabilities, you can skip this
                 exp_output = np.exp(output - np.max(output, axis=1, keepdims=True))
                 probs = exp_output / (np.sum(exp_output, axis=1, keepdims=True) + 1e-8)
+                
+                # Debug: Log output shape occasionally
+                import random
+                if random.random() < 0.01:  # 1% chance
+                    print(f"[OCR] Output shape after processing: {probs.shape}, max prob: {np.max(probs):.4f}, "
+                          f"non-blank predictions: {np.sum(np.argmax(probs, axis=1) != 0)}/{probs.shape[0]}")
                 
                 return probs.astype(np.float32)
         finally:
@@ -776,29 +954,71 @@ class PlateRecognizer:
         decoded_probs = []
         prev_idx = self.blank_idx
         
+        # PaddleOCR model outputs indices 0-6624 where:
+        # - Index 0 = blank token (skip)
+        # - Index 1 = first character in dictionary (alphabet_list[0])
+        # - Index 2 = second character (alphabet_list[1]), etc.
+        # - Index 6624 = last class (might be padding/end token)
+        
         for idx, prob in zip(char_indices, probs):
-            # Skip blank tokens
+            # Skip blank tokens (index 0)
             if idx == self.blank_idx:
                 prev_idx = idx
                 continue
             
             # Skip duplicate consecutive characters (CTC collapse)
             if idx != prev_idx:
-                if idx < len(self.alphabet):
-                    decoded_chars.append(self.alphabet[idx])
+                # Map index to alphabet character
+                # Index 1 -> alphabet_list[0], index 2 -> alphabet_list[1], etc.
+                if idx > 0 and idx <= self.alphabet_size:
+                    decoded_chars.append(self.alphabet_list[idx - 1])
                     decoded_probs.append(prob)
+                # If index is beyond alphabet size, it might be a special token
+                # For PaddleOCR models with 6625 classes, index 6624 might be padding
+                # Log occasionally for debugging
+                elif idx > self.alphabet_size:
+                    import random
+                    if random.random() < 0.01:  # 1% chance
+                        print(f"[OCR] Warning: Model output index {idx} exceeds alphabet size {self.alphabet_size} (max valid: {self.alphabet_size})")
             
             prev_idx = idx
         
         text = ''.join(decoded_chars)
         
-        # Average confidence of decoded characters
+        # Filter to only English letters, numbers, and common symbols
+        # This removes Chinese characters and other non-English text
+        import re
+        # Allow: A-Z, a-z, 0-9, space, period, hyphen, underscore
+        filtered_text = re.sub(r'[^A-Za-z0-9 .\-_]', '', text)
+        
+        # Calculate confidence for multi-class CTC models
+        # With 6625 classes, raw probabilities are naturally very low (e.g., 0.0004)
+        # Use a confidence metric that accounts for the large number of classes
         if len(decoded_probs) > 0:
-            confidence = float(np.mean(decoded_probs))
+            # Method 1: Scale by expected random probability
+            # For 6625 classes, random chance = 1/6625 ≈ 0.00015
+            # If our average prob is 0.0004, that's about 2.67x better than random
+            random_prob = 1.0 / 6625  # Expected probability for random guess
+            avg_prob = float(np.mean(decoded_probs))
+            
+            # Calculate how much better than random (ratio)
+            # Then normalize to 0-1 range: ratio of 1.0 = random, ratio of 10 = very confident
+            ratio = avg_prob / random_prob if random_prob > 0 else 0.0
+            # Normalize: ratio of 1 = 0.0 confidence, ratio of 10+ = 1.0 confidence
+            # Use a sigmoid-like function: confidence = 1 - exp(-ratio/5)
+            confidence = float(1.0 - np.exp(-ratio / 5.0))
+            
+            # Penalize confidence if we filtered out many characters (indicates wrong predictions)
+            if len(filtered_text) < len(text) * 0.5:  # If we filtered out more than 50%
+                confidence *= 0.5  # Reduce confidence significantly
+            
+            # Ensure confidence is in valid range
+            confidence = max(0.0, min(1.0, confidence))
         else:
             confidence = 0.0
         
-        return text, confidence
+        # Return filtered text (only English/numbers)
+        return filtered_text, confidence
     
     def recognize(self, image: np.ndarray) -> Dict[str, any]:
         """
@@ -812,7 +1032,58 @@ class PlateRecognizer:
         """
         preprocessed = self.preprocess(image)
         logits = self.infer(preprocessed)
+        
+        # Debug: Check if model is producing any non-blank outputs
+        if logits.shape[0] > 0:
+            # Get max probability indices for each timestep
+            max_indices = np.argmax(logits, axis=1)
+            max_probs = np.max(logits, axis=1)
+            # Count non-blank predictions
+            non_blank_count = np.sum(max_indices != self.blank_idx)
+            # Check if any predictions have reasonable confidence
+            high_conf_count = np.sum(max_probs > 0.1)
+            
+            # Only log if we're getting unexpected results (all blanks or very low confidence)
+            if non_blank_count == 0 or high_conf_count == 0:
+                # This is likely a model issue - log once per 100 calls to avoid spam
+                import random
+                if random.random() < 0.01:  # 1% chance to log
+                    print(f"[OCR] Debug: logits shape={logits.shape}, non-blank={non_blank_count}/{len(max_indices)}, "
+                          f"high-conf={high_conf_count}/{len(max_indices)}, "
+                          f"max_prob={np.max(max_probs):.4f}, sample_indices={max_indices[:10].tolist()}")
+        
         text, conf = self.ctc_decode(logits)
+        
+        # Additional filtering: reject results that are too short or have very low confidence
+        # For trailer IDs, we expect at least 2 characters
+        MIN_TEXT_LENGTH = 2
+        MIN_CONFIDENCE = 0.15  # Reject very low confidence predictions
+        
+        # Reject obviously wrong results:
+        # - Single characters (unless they're numbers with high confidence)
+        # - Very short text with low confidence
+        # - Text that's mostly special characters
+        text_stripped = text.strip()
+        if len(text_stripped) == 0:
+            return {'text': '', 'conf': 0.0}
+        
+        # Allow single characters only if they're digits with decent confidence
+        if len(text_stripped) == 1:
+            if text_stripped.isdigit() and conf >= 0.25:
+                # Single digit with good confidence - might be part of a number
+                pass  # Allow it
+            else:
+                # Single non-digit or low confidence - reject
+                return {'text': '', 'conf': 0.0}
+        
+        # Reject if confidence is too low
+        if conf < MIN_CONFIDENCE:
+            return {'text': '', 'conf': 0.0}
+        
+        # Reject if text is too short (unless it's a number)
+        if len(text_stripped) < MIN_TEXT_LENGTH:
+            if not text_stripped.isdigit():
+                return {'text': '', 'conf': 0.0}
         
         return {
             'text': text.strip(),

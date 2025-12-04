@@ -5,7 +5,7 @@ End-to-end processing pipeline:
 1. Camera ingestion (RTSP/USB)
 2. Detection (YOLO TensorRT)
 3. Tracking (ByteTrack)
-4. OCR (CRNN/PP-OCR TensorRT)
+4. OCR (TrOCR/PaddleOCR/CRNN TensorRT)
 5. Homography projection (image -> world)
 6. Spot resolution (GeoJSON polygons)
 7. Logging, publishing, metrics
@@ -102,13 +102,83 @@ class TrailerVisionApp:
         else:
             print(f"Warning: Detector engine not found: {detector_path}")
         
-        # Initialize OCR
-        ocr_path = "models/ocr_crnn.engine"
-        alphabet_path = "app/ocr/alphabet.txt"
-        if os.path.exists(ocr_path) and os.path.exists(alphabet_path):
-            self.ocr = PlateRecognizer(ocr_path, alphabet_path)
+        # Initialize OCR - Try TrOCR first (recommended), then PaddleOCR English-only, then multilingual, then CRNN
+        # Priority: TrOCR > PaddleOCR English-only > Multilingual > Legacy CRNN
+        self.ocr = None
+        
+        # Try TrOCR (transformer-based, best accuracy for printed text)
+        # Check for full TrOCR model first, then encoder-only
+        trocr_engine_paths = [
+            "models/trocr_full.engine",  # Full encoder-decoder model (preferred)
+            "models/trocr.engine",        # Encoder-only or full model
+        ]
+        
+        trocr_loaded = False
+        for trocr_path in trocr_engine_paths:
+            if os.path.exists(trocr_path):
+                try:
+                    from app.ocr.trocr_recognizer import TrOCRRecognizer
+                    # Try to find tokenizer in standard locations
+                    tokenizer_paths = [
+                        "models/trocr_base_printed",
+                        "models/trocr-base-printed",
+                    ]
+                    model_dir = None
+                    for path in tokenizer_paths:
+                        if os.path.exists(path):
+                            model_dir = path
+                            break
+                    
+                    self.ocr = TrOCRRecognizer(trocr_path, model_dir=model_dir)
+                    print(f"✓ Using TrOCR model: {trocr_path} (recommended for printed text)")
+                    trocr_loaded = True
+                    break
+                except ImportError:
+                    print("TrOCR not available (transformers not installed), trying other OCR models...")
+                    break
+                except Exception as e:
+                    print(f"TrOCR initialization failed ({trocr_path}): {e}, trying other OCR models...")
+                    continue
+        
+        if not trocr_loaded:
+            # TrOCR not loaded, continue to fallback models
+            pass
+        
+        # Fallback to PaddleOCR models if TrOCR not available
+        if self.ocr is None:
+            ocr_path = None
+            alphabet_path = None
+            input_size = (320, 48)
+            
+            # Try PaddleOCR English-only (best for English/number text)
+            if os.path.exists("models/paddleocr_rec_english.engine") and os.path.exists("app/ocr/ppocr_keys_en.txt"):
+                ocr_path = "models/paddleocr_rec_english.engine"
+                alphabet_path = "app/ocr/ppocr_keys_en.txt"
+                print("Using PaddleOCR English-only model (fallback)")
+            # Fallback to PaddleOCR multilingual
+            elif os.path.exists("models/paddleocr_rec.engine") and os.path.exists("app/ocr/ppocr_keys_v1.txt"):
+                ocr_path = "models/paddleocr_rec.engine"
+                alphabet_path = "app/ocr/ppocr_keys_v1.txt"
+                print("Using PaddleOCR multilingual model (fallback)")
+            # Fallback to legacy CRNN engine
+            elif os.path.exists("models/ocr_crnn.engine") and os.path.exists("app/ocr/alphabet.txt"):
+                ocr_path = "models/ocr_crnn.engine"
+                alphabet_path = "app/ocr/alphabet.txt"
+                input_size = None  # CRNN uses default size
+                print("Using legacy CRNN model (fallback)")
+            
+            if ocr_path and alphabet_path:
+                if "paddleocr" in ocr_path.lower():
+                    self.ocr = PlateRecognizer(ocr_path, alphabet_path, input_size=input_size)
+                else:
+                    self.ocr = PlateRecognizer(ocr_path, alphabet_path)
+                print(f"Loaded OCR engine: {ocr_path} with alphabet: {alphabet_path}")
         else:
-            print(f"Warning: OCR engine not found: {ocr_path}")
+            print(f"Warning: No OCR engine found. Tried:")
+            print(f"  - models/trocr.engine (TrOCR)")
+            print(f"  - models/paddleocr_rec_english.engine (English-only)")
+            print(f"  - models/paddleocr_rec.engine (multilingual)")
+            print(f"  - models/ocr_crnn.engine (legacy)")
         
         # Initialize spot resolver
         spots_path = "config/spots.geojson"

@@ -586,9 +586,38 @@ class TrtEngineYOLO:
                 elif output.shape[1] == 6:
                     # Already in [x1, y1, x2, y2, conf, cls] format
                     detections = output
+                elif output.shape[1] == 5:
+                    # Single-class YOLOv8 format: [N, 5] where 5 = 4 bbox + 1 class score
+                    # This is for models trained with nc=1 (single class detection)
+                    
+                    boxes = output[:, :4]  # [x, y, w, h] in center format
+                    class_scores = output[:, 4]  # [1 class]
+                    
+                    # All detections are class 0 (the single class)
+                    class_ids = np.zeros(len(output), dtype=np.float32)
+                    
+                    # YOLOv8 scores might not be normalized - check and normalize if needed
+                    if class_scores.max() > 1.0:
+                        # Scores are not in [0, 1] range, apply sigmoid to normalize
+                        class_scores = 1 / (1 + np.exp(-class_scores))  # Sigmoid normalization
+                    
+                    # Convert center format (x_center, y_center, w, h) to corner format (x1, y1, x2, y2)
+                    x_center, y_center, w, h = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+                    x1 = x_center - w / 2
+                    y1 = y_center - h / 2
+                    x2 = x_center + w / 2
+                    y2 = y_center + h / 2
+                    
+                    # Combine into [x1, y1, x2, y2, conf, cls]
+                    detections = np.column_stack([x1, y1, x2, y2, class_scores, class_ids])
                 else:
-                    # Unknown format
-                    detections = output[:, :6] if output.shape[1] >= 6 else output
+                    # Unknown format - try to handle gracefully
+                    if output.shape[1] >= 6:
+                        detections = output[:, :6]
+                    else:
+                        # Pad with zeros for missing columns (class id)
+                        padding = np.zeros((output.shape[0], 6 - output.shape[1]))
+                        detections = np.hstack([output, padding])
                 
                 # Debug: Show confidence range before filtering
                 if len(detections) > 0:

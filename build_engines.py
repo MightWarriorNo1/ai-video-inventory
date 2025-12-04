@@ -78,6 +78,18 @@ def build_engine(onnx_path: str, engine_path: str, precision: str = "fp16", work
     config = builder.create_builder_config()
     config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_gb << 30)  # Convert GB to bytes
     
+    # Disable CUDNN tactics to avoid pooling/convolution issues with dynamic shapes
+    # This is a workaround for "Cask" errors in TensorRT 10.x
+    try:
+        tactic_sources = config.get_tactic_sources()
+        # Remove CUDNN from tactic sources if available
+        if hasattr(trt, 'TacticSource'):
+            # TensorRT 10.x - disable CUDNN
+            config.set_tactic_sources(tactic_sources & ~(1 << int(trt.TacticSource.CUDNN)))
+            print(f"\n✓ CUDNN tactics disabled (workaround for Cask errors)")
+    except Exception as e:
+        print(f"\n⚠ Could not disable CUDNN tactics: {e}")
+    
     # Set precision
     if precision.lower() == "fp16":
         if builder.platform_has_fast_fp16:
@@ -194,7 +206,33 @@ def build_ocr_engine(onnx_path: str, engine_path: str, precision: str = "fp16"):
         engine_path=engine_path,
         precision=precision,
         workspace_gb=2,
-        min_shapes={"x": (1, 3, 48, 1)},
+        min_shapes={"x": (1, 1, 32, 1)},      # Changed: 1 channel, height 32
+        opt_shapes={"x": (1, 1, 32, 320)},    # Changed: 1 channel, height 32
+        max_shapes={"x": (1, 1, 32, 320)}    # Changed: 1 channel, height 32
+    )
+
+
+def build_paddleocr_det_engine(onnx_path: str, engine_path: str, precision: str = "fp16"):
+    """Build PaddleOCR text detection engine."""
+    return build_engine(
+        onnx_path=onnx_path,
+        engine_path=engine_path,
+        precision=precision,
+        workspace_gb=4,
+        min_shapes={"x": (1, 3, 640, 640)},   # PaddleOCR det typically uses 640x640
+        opt_shapes={"x": (1, 3, 640, 640)},
+        max_shapes={"x": (1, 3, 640, 640)}
+    )
+
+
+def build_paddleocr_rec_engine(onnx_path: str, engine_path: str, precision: str = "fp16"):
+    """Build PaddleOCR text recognition engine with dynamic width support."""
+    return build_engine(
+        onnx_path=onnx_path,
+        engine_path=engine_path,
+        precision=precision,
+        workspace_gb=2,
+        min_shapes={"x": (1, 3, 48, 1)},      # PaddleOCR rec: 3 channels, height 48, dynamic width
         opt_shapes={"x": (1, 3, 48, 320)},
         max_shapes={"x": (1, 3, 48, 320)}
     )
@@ -202,8 +240,10 @@ def build_ocr_engine(onnx_path: str, engine_path: str, precision: str = "fp16"):
 
 def main():
     parser = argparse.ArgumentParser(description="Build TensorRT engines from ONNX models")
-    parser.add_argument("--detector-onnx", type=str, help="Path to detector ONNX model")
-    parser.add_argument("--ocr-onnx", type=str, help="Path to OCR ONNX model")
+    parser.add_argument("--detector-onnx", type=str, help="Path to YOLO detector ONNX model")
+    parser.add_argument("--ocr-onnx", type=str, help="Path to OCR ONNX model (legacy CRNN)")
+    parser.add_argument("--paddleocr-det-onnx", type=str, help="Path to PaddleOCR detection ONNX model")
+    parser.add_argument("--paddleocr-rec-onnx", type=str, help="Path to PaddleOCR recognition ONNX model")
     parser.add_argument("--output-dir", type=str, default="models", help="Output directory for engines")
     parser.add_argument("--precision", type=str, default="fp16", choices=["fp16", "fp32"], 
                        help="Precision: fp16 (faster) or fp32 (more accurate)")
@@ -215,27 +255,45 @@ def main():
     
     args = parser.parse_args()
     
-    if not args.detector_onnx and not args.ocr_onnx:
-        parser.error("At least one of --detector-onnx or --ocr-onnx must be provided")
+    if not any([args.detector_onnx, args.ocr_onnx, args.paddleocr_det_onnx, args.paddleocr_rec_onnx]):
+        parser.error("At least one ONNX model must be provided")
     
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # Build detector engine
+    # Build YOLO detector engine (legacy)
     if args.detector_onnx:
         detector_engine = os.path.join(args.output_dir, "trailer_detector.engine")
         try:
             build_detector_engine(args.detector_onnx, detector_engine, args.precision)
         except Exception as e:
-            print(f"\n✗ Failed to build detector engine: {e}")
+            print(f"\n✗ Failed to build YOLO detector engine: {e}")
             sys.exit(1)
     
-    # Build OCR engine
+    # Build OCR engine (legacy CRNN)
     if args.ocr_onnx:
         ocr_engine = os.path.join(args.output_dir, "ocr_crnn.engine")
         try:
             build_ocr_engine(args.ocr_onnx, ocr_engine, args.precision)
         except Exception as e:
             print(f"\n✗ Failed to build OCR engine: {e}")
+            sys.exit(1)
+    
+    # Build PaddleOCR text detection engine
+    if args.paddleocr_det_onnx:
+        paddleocr_det_engine = os.path.join(args.output_dir, "paddleocr_det.engine")
+        try:
+            build_paddleocr_det_engine(args.paddleocr_det_onnx, paddleocr_det_engine, args.precision)
+        except Exception as e:
+            print(f"\n✗ Failed to build PaddleOCR detection engine: {e}")
+            sys.exit(1)
+    
+    # Build PaddleOCR text recognition engine
+    if args.paddleocr_rec_onnx:
+        paddleocr_rec_engine = os.path.join(args.output_dir, "paddleocr_rec.engine")
+        try:
+            build_paddleocr_rec_engine(args.paddleocr_rec_onnx, paddleocr_rec_engine, args.precision)
+        except Exception as e:
+            print(f"\n✗ Failed to build PaddleOCR recognition engine: {e}")
             sys.exit(1)
     
     print("\n✓ All engines built successfully!")
