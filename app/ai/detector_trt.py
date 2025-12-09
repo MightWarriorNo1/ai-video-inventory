@@ -369,6 +369,25 @@ class TrtEngineYOLO:
                 raise RuntimeError(f"Failed to activate CUDA context. Error: {ctx_err}, {e2}")
         
         try:
+            # Synchronize CUDA context before inference to avoid conflicts with PyTorch/EasyOCR
+            # This is critical when EasyOCR or other PyTorch-based libraries have used the GPU
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    # Synchronize PyTorch CUDA operations before TensorRT inference
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
+            except:
+                pass  # Ignore if torch not available
+            
+            # Synchronize PyCUDA context
+            try:
+                current_ctx = self.cuda.Context.get_current()
+                if current_ctx is not None:
+                    current_ctx.synchronize()
+            except:
+                pass
+            
             # Context is now active, proceed with inference
             with self._inference_lock:
                 if len(self.inputs) == 0:
@@ -469,20 +488,44 @@ class TrtEngineYOLO:
                     
                     # Execute inference
                     try:
+                        # Ensure stream is synchronized before execution
+                        inference_stream.synchronize()
+                        
                         self.context.execute_async_v3(stream_handle=inference_stream.handle)
                     except RuntimeError as e:
                         error_str = str(e).lower()
-                        if "invalid resource handle" in error_str or "cuda" in error_str or "cutensor" in error_str:
-                            # CUDA context issue - this often happens when engine was built on different device
-                            # Re-set addresses and retry once
+                        # Check for "Cask" error or other CUDA/TensorRT errors
+                        if "cask" in error_str or "invalid resource handle" in error_str or "cuda" in error_str or "cutensor" in error_str:
+                            # CUDA context issue - try to recover by re-synchronizing
                             try:
+                                import torch
+                                import time
+                                
+                                # Synchronize PyTorch CUDA operations
+                                if torch.cuda.is_available():
+                                    torch.cuda.synchronize()
+                                    torch.cuda.empty_cache()
+                                
+                                # Synchronize PyCUDA context
+                                current_ctx = self.cuda.Context.get_current()
+                                if current_ctx is not None:
+                                    current_ctx.synchronize()
+                                
+                                # Small delay to let context stabilize
+                                time.sleep(0.001)
+                                
+                                # Re-synchronize stream
+                                inference_stream.synchronize()
+                                
+                                # Re-set tensor addresses (they might have been invalidated)
                                 self.context.set_tensor_address(self.input_names[0], int(input_tensor['device']))
                                 if len(self.output_names) > 0:
                                     self.context.set_tensor_address(self.output_names[0], int(self.outputs[0]['device']))
-                                # Retry once
+                                
+                                # Retry inference
                                 self.context.execute_async_v3(stream_handle=inference_stream.handle)
                             except Exception as e2:
-                                raise RuntimeError(f"CUDA inference failed after retry. This may indicate the engine was built on a different device. Original error: {e}, Retry error: {e2}")
+                                raise RuntimeError(f"TensorRT inference failed after CUDA sync retry. Original error: {e}, Retry error: {e2}")
                         else:
                             raise
                 elif hasattr(self.context, 'execute_async_v2'):

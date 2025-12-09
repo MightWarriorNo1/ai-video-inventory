@@ -22,6 +22,15 @@ from pathlib import Path
 from typing import Dict, Optional
 import signal
 import threading
+import gc
+import time
+
+# Try to import torch for GPU memory management
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
 
 # Load environment variables
 from dotenv import load_dotenv
@@ -74,12 +83,27 @@ class TrailerVisionApp:
         self.trackers = {}
         self.homographies = {}
         
+        # Check if OCR is oLmOCR (needs GPU memory cleanup)
+        self.is_olmocr = False  # Will be set after OCR initialization
+        
+        # Frame storage for camera feed display (thread-safe)
+        import threading
+        self.frame_lock = threading.Lock()
+        self.latest_frames = {}  # camera_id -> latest frame
+        
         # Metrics tracking
         self.camera_metrics = {}
         
         # Frame storage for video streaming (thread-safe)
         self.latest_frames = {}
         self.frame_lock = threading.Lock()
+        
+        # OCR optimization: Cache results per track_id to avoid re-processing
+        self.ocr_cache = {}  # (camera_id, track_id) -> {'text': str, 'conf': float, 'frame': int, 'last_updated': int}
+        self.ocr_cache_max_age = 30  # Re-run OCR every 30 frames if no good result
+        self.ocr_min_confidence = 0.5  # Only cache results with confidence >= this
+        self.ocr_run_every_n_frames = 10  # Run OCR every N frames for existing tracks (if not cached)
+        self.ocr_cache_max_size = 100  # Maximum cache entries to prevent memory leaks
         
         self._initialize_components()
     
@@ -102,49 +126,80 @@ class TrailerVisionApp:
         else:
             print(f"Warning: Detector engine not found: {detector_path}")
         
-        # Initialize OCR - Try TrOCR first (recommended), then PaddleOCR English-only, then multilingual, then CRNN
-        # Priority: TrOCR > PaddleOCR English-only > Multilingual > Legacy CRNN
+        # Initialize OCR - Priority: oLmOCR > EasyOCR > TrOCR > PaddleOCR English-only > Multilingual > Legacy CRNN
+        # oLmOCR (Qwen3-VL/Qwen2.5-VL) is recommended for best accuracy, especially for vertical text and complex layouts
         self.ocr = None
         
-        # Try TrOCR (transformer-based, best accuracy for printed text)
-        # Check for full TrOCR model first, then encoder-only
-        trocr_engine_paths = [
-            "models/trocr_full.engine",  # Full encoder-decoder model (preferred)
-            "models/trocr.engine",        # Encoder-only or full model
-        ]
+        # Try oLmOCR first (best accuracy for vertical text, complex layouts, and multi-language support)
+        try:
+            from app.ocr.olmocr_recognizer import OlmOCRRecognizer
+            # POWER OPTIMIZATION: Use Qwen2.5-VL-3B-Instruct instead of 4B to reduce power consumption
+            # The 4B model causes "Over-current" throttling on Jetson Orin NX
+            # 3B model: ~30-40% less power, ~20-30% faster, still excellent accuracy
+            # For edge devices with limited memory, consider Qwen2.5-VL-3B-Instruct
+            # OPTIMIZATION: Enable fast preprocessing for better speed
+            # Set fast_preprocessing=True for 2-3x faster preprocessing (slightly less enhancement)
+            ocr_model = globals_cfg.get('ocr_model', 'Qwen/Qwen2.5-VL-3B-Instruct')  # Default to 3B for power efficiency
+            self.ocr = OlmOCRRecognizer(
+                model_name=ocr_model,
+                use_gpu=True,
+                fast_preprocessing=globals_cfg.get('ocr_fast_preprocessing', False)  # Enable via config
+            )
+            self.is_olmocr = True  # Mark as oLmOCR for GPU memory cleanup
+            print(f"✓ Using oLmOCR (Qwen3-VL-4B-Instruct) - recommended for high accuracy, especially vertical text")
+        except ImportError:
+            print("oLmOCR not available (pip3 install transformers torch qwen-vl-utils), trying EasyOCR...")
+        except Exception as e:
+            print(f"oLmOCR initialization failed: {e}, trying EasyOCR...")
         
-        trocr_loaded = False
-        for trocr_path in trocr_engine_paths:
-            if os.path.exists(trocr_path):
-                try:
-                    from app.ocr.trocr_recognizer import TrOCRRecognizer
-                    # Try to find tokenizer in standard locations
-                    tokenizer_paths = [
-                        "models/trocr_base_printed",
-                        "models/trocr-base-printed",
-                    ]
-                    model_dir = None
-                    for path in tokenizer_paths:
-                        if os.path.exists(path):
-                            model_dir = path
-                            break
-                    
-                    self.ocr = TrOCRRecognizer(trocr_path, model_dir=model_dir)
-                    print(f"✓ Using TrOCR model: {trocr_path} (recommended for printed text)")
-                    trocr_loaded = True
-                    break
-                except ImportError:
-                    print("TrOCR not available (transformers not installed), trying other OCR models...")
-                    break
-                except Exception as e:
-                    print(f"TrOCR initialization failed ({trocr_path}): {e}, trying other OCR models...")
-                    continue
+        # Try EasyOCR if oLmOCR failed (self.ocr is still None)
+        if self.ocr is None:
+            try:
+                from app.ocr.easyocr_recognizer import EasyOCRRecognizer
+                self.ocr = EasyOCRRecognizer(languages=['en'], gpu=True)
+                print(f"✓ Using EasyOCR (fallback - good accuracy for printed text)")
+            except ImportError:
+                print("EasyOCR not available (pip3 install easyocr), trying TrOCR...")
+            except Exception as e:
+                print(f"EasyOCR initialization failed: {e}, trying TrOCR...")
         
-        if not trocr_loaded:
-            # TrOCR not loaded, continue to fallback models
-            pass
+        # Only try TrOCR if oLmOCR and EasyOCR failed (self.ocr is still None)
+        if self.ocr is None:
+            # Try TrOCR (transformer-based, good accuracy for printed text)
+            # Check for full TrOCR model first, then encoder-only
+            trocr_engine_paths = [
+                "models/trocr_full.engine",  # Full encoder-decoder model (preferred)
+                "models/trocr.engine",        # Encoder-only or full model
+            ]
+            
+            trocr_loaded = False
+            for trocr_path in trocr_engine_paths:
+                if os.path.exists(trocr_path):
+                    try:
+                        from app.ocr.trocr_recognizer import TrOCRRecognizer
+                        # Try to find tokenizer in standard locations
+                        tokenizer_paths = [
+                            "models/trocr_base_printed",
+                            "models/trocr-base-printed",
+                        ]
+                        model_dir = None
+                        for path in tokenizer_paths:
+                            if os.path.exists(path):
+                                model_dir = path
+                                break
+                        
+                        self.ocr = TrOCRRecognizer(trocr_path, model_dir=model_dir)
+                        print(f"✓ Using TrOCR model: {trocr_path} (fallback - oLmOCR/EasyOCR not available)")
+                        trocr_loaded = True
+                        break
+                    except ImportError:
+                        print("TrOCR not available (transformers not installed), trying other OCR models...")
+                        break
+                    except Exception as e:
+                        print(f"TrOCR initialization failed ({trocr_path}): {e}, trying other OCR models...")
+                        continue
         
-        # Fallback to PaddleOCR models if TrOCR not available
+        # Fallback to PaddleOCR models if oLmOCR, EasyOCR, and TrOCR not available
         if self.ocr is None:
             ocr_path = None
             alphabet_path = None
@@ -173,8 +228,10 @@ class TrailerVisionApp:
                 else:
                     self.ocr = PlateRecognizer(ocr_path, alphabet_path)
                 print(f"Loaded OCR engine: {ocr_path} with alphabet: {alphabet_path}")
-        else:
+        if self.ocr is None:
             print(f"Warning: No OCR engine found. Tried:")
+            print(f"  - oLmOCR (recommended - install: pip3 install transformers torch qwen-vl-utils)")
+            print(f"  - EasyOCR (fallback - install: pip3 install easyocr)")
             print(f"  - models/trocr.engine (TrOCR)")
             print(f"  - models/paddleocr_rec_english.engine (English-only)")
             print(f"  - models/paddleocr_rec.engine (multilingual)")
@@ -209,20 +266,40 @@ class TrailerVisionApp:
         
         # Initialize metrics server
         metrics_port = int(os.getenv('METRICS_PORT', '8080'))
-        self.metrics_server = MetricsServer(port=metrics_port, csv_logger=self.csv_logger)
+        self.metrics_server = MetricsServer(
+            port=metrics_port, 
+            csv_logger=self.csv_logger,
+            frame_storage=self  # Pass self for camera feed display
+        )
         self.metrics_server.start()
         
         # Initialize image preprocessor
+        # IMPORTANT: Disable rotation for oLmOCR and EasyOCR because they handle rotation internally.
+        # Pre-rotating images causes double rotation issues.
         preproc_cfg = globals_cfg.get('preprocessing', {})
+        ocr_type = str(type(self.ocr)) if self.ocr is not None else ""
+        is_olmocr = 'OlmOCRRecognizer' in ocr_type
+        is_easyocr = 'EasyOCRRecognizer' in ocr_type
+        # Disable rotation for oLmOCR and EasyOCR (both handle rotation internally)
+        enable_rotation = not (is_olmocr or is_easyocr)
+        
         self.preprocessor = ImagePreprocessor(
             enable_yolo_preprocessing=preproc_cfg.get('enable_yolo', True),
             enable_ocr_preprocessing=preproc_cfg.get('enable_ocr', True),
             yolo_strategy=preproc_cfg.get('yolo_strategy', 'enhanced'),
-            ocr_strategy=preproc_cfg.get('ocr_strategy', 'multi')
+            ocr_strategy=preproc_cfg.get('ocr_strategy', 'multi'),
+            enable_rotation=enable_rotation
         )
         print(f"[TrailerVisionApp] Image preprocessing enabled:")
         print(f"  YOLO: {self.preprocessor.enable_yolo_preprocessing} ({self.preprocessor.yolo_strategy})")
         print(f"  OCR: {self.preprocessor.enable_ocr_preprocessing} ({self.preprocessor.ocr_strategy})")
+        if is_olmocr:
+            rotation_msg = "Disabled (oLmOCR handles rotation internally)"
+        elif is_easyocr:
+            rotation_msg = "Disabled (EasyOCR handles rotation internally)"
+        else:
+            rotation_msg = "Enabled"
+        print(f"  Rotation: {rotation_msg}")
         
         # Load homographies for each camera
         for camera in self.config.get('cameras', []):
@@ -270,6 +347,7 @@ class TrailerVisionApp:
         
         try:
             self.video_processor = VideoProcessor(
+                preprocessor=self.preprocessor,
                 detector=self.detector,
                 ocr=self.ocr,
                 tracker_factory=create_tracker,
@@ -316,6 +394,44 @@ class TrailerVisionApp:
         
         return (float(x_world), float(y_world))
     
+    def _cleanup_gpu_memory(self, force: bool = False):
+        """
+        Clean up GPU memory after OCR operations to prevent accumulation.
+        This is critical when processing multiple frames in sequence.
+        
+        Args:
+            force: If True, always cleanup. If False, cleanup only periodically.
+        """
+        if not TORCH_AVAILABLE or not self.is_olmocr:
+            return
+        
+        # OPTIMIZATION: Only cleanup periodically to reduce overhead
+        if not force:
+            if not hasattr(self, '_ocr_call_count'):
+                self._ocr_call_count = 0
+            self._ocr_call_count += 1
+            # Only cleanup every 5 OCR operations to reduce overhead
+            if self._ocr_call_count % 5 != 0:
+                return
+        
+        if torch.cuda.is_available():
+            try:
+                # Wait for all GPU operations to complete
+                torch.cuda.synchronize()
+                # Clear CUDA cache
+                torch.cuda.empty_cache()
+                # Force Python garbage collection (less frequently)
+                if force or (hasattr(self, '_ocr_call_count') and self._ocr_call_count % 10 == 0):
+                    gc.collect()
+                # Clear cache again after GC
+                torch.cuda.empty_cache()
+                gc.collect()
+                # Clear cache again after GC
+                torch.cuda.empty_cache()
+            except Exception:
+                # Silently fail - don't interrupt frame processing
+                pass
+    
     def _process_frame(self, camera_id: str, frame: np.ndarray, frame_count: int) -> None:
         """
         Process a single frame for a camera.
@@ -344,32 +460,131 @@ class TrailerVisionApp:
         # Run detector every N frames
         detections = []
         if self.detector and frame_count % detect_every_n == 0:
-            detections = self.detector.detect(processed_frame)
+            all_detections = self.detector.detect(processed_frame)
+            
+            # OPTIMIZATION: Filter to only trailer class (class 0) before tracking
+            # This ensures OCR only runs on confirmed trailers, not false positives
+            # Your YOLO model is single-class (trailer_back = class 0)
+            trailer_class_id = 0  # Trailer class ID from your YOLO model
+            for det in all_detections:
+                # Check if detection is a trailer (class 0)
+                if det.get('cls', -1) == trailer_class_id:
+                    detections.append(det)
+                # Optional: Log filtered detections for debugging
+                # elif frame_count % 100 == 0:
+                #     print(f"[TrailerVisionApp] Filtered non-trailer detection: cls={det.get('cls', -1)}, conf={det.get('conf', 0.0):.2f}")
         
-        # Update tracker
+        # Update tracker (now only contains trailer detections)
         tracks = tracker.update(detections, frame)
         
-        # Process each track
+        # Process each track (all should be trailers now)
         for track in tracks:
             track_id = track['track_id']
             bbox = track['bbox']
             x1, y1, x2, y2 = bbox
             
-            # Crop region for OCR
+            # OPTIMIZATION: Double-check this is a trailer before OCR (safety check)
+            # Since we filter detections before tracking, all tracks should be trailers
+            # This is a safety check in case tracker preserves class info
+            track_cls = track.get('cls', -1)
+            trailer_class_id = 0  # Trailer class ID
+            
+            # Skip OCR if this is explicitly not a trailer (safety check)
+            # Note: If tracker doesn't preserve 'cls', this check is skipped (track_cls = -1)
+            if track_cls != -1 and track_cls != trailer_class_id:
+                if frame_count % 50 == 0:  # Log occasionally
+                    print(f"[TrailerVisionApp] Skipping OCR for non-trailer track {track_id}: cls={track_cls}")
+                continue  # Skip this track - not a trailer
+            
+            # Refine bounding box to rear face (focus on back side only)
+            # This prevents OCR from detecting text on the sides of trailers
+            orig_width = x2 - x1
+            orig_height = y2 - y1
+            orig_aspect = orig_width / orig_height if orig_height > 0 else 1.0
+            
+            # If aspect ratio suggests side view (wide), extract center portion for rear face
+            # For wide detections (side view), the rear face is typically in the center
+            if orig_aspect > 1.5:  # Wide detection (side view)
+                center_x = (x1 + x2) / 2.0
+                rear_width_ratio = 0.65  # Use 65% of width for rear face (centered)
+                rear_width = int(orig_width * rear_width_ratio)
+                rear_x1 = int(center_x - rear_width / 2)
+                rear_x2 = int(center_x + rear_width / 2)
+                # Keep full height
+                rear_y1 = y1
+                rear_y2 = y2
+                
+                # Clip to frame bounds
+                h, w = frame.shape[:2]
+                rear_x1 = max(0, min(rear_x1, w - 1))
+                rear_x2 = max(rear_x1 + 1, min(rear_x2, w - 1))
+                rear_y1 = max(0, min(rear_y1, h - 1))
+                rear_y2 = max(rear_y1 + 1, min(rear_y2, h - 1))
+                
+                # Use refined coordinates for OCR (rear face only)
+                x1, y1, x2, y2 = rear_x1, rear_y1, rear_x2, rear_y2
+            # For narrow/tall detections (front/back view), use original bbox (already focused)
+            
+            # Crop region for OCR (now focused on rear face)
             crop = frame[y1:y2, x1:x2]
             if crop.size == 0:
                 continue
             
-            # Run OCR with preprocessing
+            # OPTIMIZATION: Check OCR cache first
+            cache_key = (camera_id, track_id)
+            should_run_ocr = True
             text = ""
             conf_ocr = 0.0
-            ocr_method = "none"
-            if self.ocr:
+            ocr_method = "cached"
+            
+            if cache_key in self.ocr_cache:
+                cached_result = self.ocr_cache[cache_key]
+                cache_age = frame_count - cached_result['last_updated']
+                
+                # Use cached result if:
+                # 1. It has good confidence (>= min_confidence)
+                # 2. It's not too old (within max_age frames)
+                # 3. Or we have a valid text result
+                if (cached_result['conf'] >= self.ocr_min_confidence and 
+                    cache_age < self.ocr_cache_max_age) or cached_result['text']:
+                    text = cached_result['text']
+                    conf_ocr = cached_result['conf']
+                    should_run_ocr = False
+                # Re-run OCR if cache is stale or low confidence
+                elif cache_age >= self.ocr_cache_max_age:
+                    should_run_ocr = True
+                # For existing tracks, only run OCR periodically
+                elif frame_count % self.ocr_run_every_n_frames != 0:
+                    should_run_ocr = False
+                    text = cached_result['text']  # Use cached even if low confidence
+                    conf_ocr = cached_result['conf']
+            
+            # OPTIMIZATION: Skip OCR on very small crops (likely false positives)
+            crop_area = (x2 - x1) * (y2 - y1)
+            min_crop_area = 1000  # Minimum pixels for OCR (e.g., 32x32 = 1024)
+            if crop_area < min_crop_area:
+                should_run_ocr = False
+                if cache_key not in self.ocr_cache:
+                    text = ""
+                    conf_ocr = 0.0
+            
+            # Run OCR with preprocessing (only if needed)
+            if self.ocr and should_run_ocr:
+                # OPTIMIZATION: Resize large crops before OCR to speed up processing
+                # Large images take much longer to process
+                h_crop, w_crop = crop.shape[:2]
+                max_dimension = 640  # Maximum dimension for OCR (balance speed vs accuracy)
+                if max(h_crop, w_crop) > max_dimension:
+                    scale = max_dimension / max(h_crop, w_crop)
+                    new_w = int(w_crop * scale)
+                    new_h = int(h_crop * scale)
+                    crop = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                
                 if self.preprocessor and self.preprocessor.enable_ocr_preprocessing:
                     # Get multiple preprocessed versions
                     preprocessed_crops = self.preprocessor.preprocess_for_ocr(crop)
                     
-                    # Try OCR on each preprocessed version
+                    # OPTIMIZATION: Try OCR on each preprocessed version with early exit
                     ocr_results = []
                     for prep in preprocessed_crops:
                         try:
@@ -380,6 +595,9 @@ class TrailerVisionApp:
                                     'conf': result.get('conf', 0.0),
                                     'method': prep['method']
                                 })
+                                # OPTIMIZATION: Early exit if we get high confidence result
+                                if result.get('conf', 0.0) >= 0.85:
+                                    break
                         except Exception as e:
                             if frame_count % 50 == 0:  # Log occasionally
                                 print(f"[TrailerVisionApp] OCR error with {prep['method']}: {e}")
@@ -390,7 +608,6 @@ class TrailerVisionApp:
                         text = best_result['text']
                         conf_ocr = best_result['conf']
                         ocr_method = best_result['method']
-                        # Note: best_result may also include 'is_rotated' flag if needed
                     else:
                         # Fallback: try original crop if all preprocessing failed
                         try:
@@ -401,12 +618,41 @@ class TrailerVisionApp:
                         except Exception as e:
                             if frame_count % 50 == 0:
                                 print(f"[TrailerVisionApp] OCR fallback failed: {e}")
+                            text = ""
+                            conf_ocr = 0.0
+                            ocr_method = 'error'
                 else:
                     # Original OCR without preprocessing
-                    ocr_result = self.ocr.recognize(crop)
-                    text = ocr_result['text']
-                    conf_ocr = ocr_result['conf']
-                    ocr_method = 'original'
+                    try:
+                        ocr_result = self.ocr.recognize(crop)
+                        text = ocr_result['text']
+                        conf_ocr = ocr_result['conf']
+                        ocr_method = 'original'
+                    except Exception as e:
+                        if frame_count % 50 == 0:
+                            print(f"[TrailerVisionApp] OCR error: {e}")
+                        text = ""
+                        conf_ocr = 0.0
+                        ocr_method = 'error'
+                
+                # OPTIMIZATION: Cache OCR result (only cleanup GPU memory once after all OCR attempts)
+                self.ocr_cache[cache_key] = {
+                    'text': text,
+                    'conf': conf_ocr,
+                    'frame': frame_count,
+                    'last_updated': frame_count
+                }
+                
+                # OPTIMIZATION: Cleanup old cache entries to prevent memory leaks
+                if len(self.ocr_cache) > self.ocr_cache_max_size:
+                    # Remove oldest entries (by last_updated)
+                    sorted_cache = sorted(self.ocr_cache.items(), key=lambda x: x[1]['last_updated'])
+                    entries_to_remove = len(self.ocr_cache) - self.ocr_cache_max_size
+                    for key, _ in sorted_cache[:entries_to_remove]:
+                        del self.ocr_cache[key]
+                
+                # Clean GPU memory after OCR (only once, not after each preprocessing attempt)
+                self._cleanup_gpu_memory()
             
             # Project center to world coordinates
             center_x = (x1 + x2) / 2.0
@@ -533,26 +779,119 @@ class TrailerVisionApp:
         print("Starting Trailer Vision Edge application...")
         self.running = True
         
-        # Process each camera in a separate thread (or sequentially for simplicity)
+        # CAMERA FEED PROCESSING - Only for display, no full processing
+        # Enable camera feeds for dashboard display (demo stage)
+        # Full processing is disabled, but we need to stream camera feeds for dashboard
+        print("Camera feed display enabled (demo stage).")
+        print("Full processing disabled - only displaying camera feeds.")
+        
+        # Process each camera in a separate thread for display only
         import threading
         
         threads = []
         for camera in self.config.get('cameras', []):
             thread = threading.Thread(
-                target=self._process_camera,
+                target=self._process_camera_display_only,
                 args=(camera,),
                 daemon=True
             )
             thread.start()
             threads.append(thread)
         
-        # Wait for threads (or handle signals)
+        # Keep application running for video processing and camera display
         try:
             for thread in threads:
                 thread.join()
         except KeyboardInterrupt:
             print("\nShutting down...")
             self.stop()
+    
+    def _process_camera_display_only(self, camera: Dict):
+        """
+        Process camera feed for display only (no full processing).
+        This just captures frames and makes them available for streaming.
+        
+        Args:
+            camera: Camera configuration dict
+        """
+        camera_id = camera['id']
+        rtsp_url = camera['rtsp_url']
+        width = camera.get('width', 1920)
+        height = camera.get('height', 1080)
+        fps_cap = camera.get('fps_cap', 30)
+        
+        globals_cfg = self.config.get('globals', {})
+        use_gstreamer = globals_cfg.get('use_gstreamer', False)
+        
+        print(f"Opening camera stream for display: {camera_id}: {rtsp_url}")
+        cap = open_stream(rtsp_url, width, height, fps_cap, use_gstreamer)
+        
+        if cap is None:
+            print(f"Failed to open stream for {camera_id}")
+            # Still register camera in metrics so dashboard shows it (even if stream failed)
+            if self.metrics_server:
+                self.metrics_server.update_camera_metrics(
+                    camera_id,
+                    fps_ema=0.0,
+                    frames_processed_count=0,
+                    last_publish=datetime.utcnow(),
+                    queue_depth=0
+                )
+            return
+        
+        # Store the camera capture for streaming
+        if not hasattr(self, 'camera_captures'):
+            self.camera_captures = {}
+        self.camera_captures[camera_id] = cap
+        
+        # Register camera in metrics immediately so dashboard shows it
+        if self.metrics_server:
+            self.metrics_server.update_camera_metrics(
+                camera_id,
+                fps_ema=0.0,  # Will update when frames start coming
+                frames_processed_count=0,
+                last_publish=datetime.utcnow(),
+                queue_depth=0
+            )
+        
+        frame_count = 0
+        
+        try:
+            for ret, frame in frame_generator(cap):
+                if not ret or frame is None:
+                    break
+                
+                if not self.running:
+                    break
+                
+                # Store latest frame for streaming (no processing)
+                with self.frame_lock:
+                    self.latest_frames[camera_id] = frame.copy()
+                
+                frame_count += 1
+                
+                # Update camera metrics periodically for dashboard display (every 30 frames = ~1 second)
+                if frame_count % 30 == 0 and self.metrics_server:
+                    self.metrics_server.update_camera_metrics(
+                        camera_id,
+                        fps_ema=30.0,  # Display only, estimate 30 FPS
+                        frames_processed_count=frame_count,
+                        last_publish=datetime.utcnow(),
+                        queue_depth=0
+                    )
+                
+                # Small delay to prevent excessive CPU usage
+                time.sleep(0.033)  # ~30 FPS
+                
+        except KeyboardInterrupt:
+            print(f"Interrupted display stream for {camera_id}")
+        except Exception as e:
+            print(f"Error displaying {camera_id}: {e}")
+        finally:
+            if camera_id in self.camera_captures:
+                del self.camera_captures[camera_id]
+            cap.release()
+            print(f"Closed display stream for {camera_id}")
     
     def stop(self):
         """Stop the application and cleanup."""

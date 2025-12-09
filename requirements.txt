@@ -1,6 +1,7 @@
-opencv-python>=4.8.0
+opencv-python>=4.8.0,<4.10.0
 numpy>=1.21.0,<2.0.0
 pyyaml>=6.0
+easyocr>=1.7.0
 flask>=2.3.0
 prometheus-client>=0.18.0
 azure-servicebus>=7.11.0
@@ -18,3 +19,9 @@ requests>=2.31.0
 # TensorRT and CUDA (install separately on Jetson with JetPack)
 # nvidia-tensorrt>=8.0.0
 # pycuda>=2021.1
+# oLmOCR (Qwen2.5-VL) - Optional, for vertical text recognition
+# transformers>=4.49.0
+# torch>=2.0.0
+# torchvision>=0.15.0
+# qwen-vl-utils>=0.0.8
+# Pillow>=9.0.0

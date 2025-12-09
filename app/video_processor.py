@@ -10,6 +10,14 @@ import re
 from typing import Dict, List, Optional, Generator, Tuple
 from datetime import datetime
 import threading
+import gc
+
+# Try to import torch for GPU memory management
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
 
 
 class VideoProcessor:
@@ -17,7 +25,7 @@ class VideoProcessor:
     Video processor for testing uploaded video files.
     """
     
-    def __init__(self, detector, ocr, tracker_factory, spot_resolver, homography=None):
+    def __init__(self, detector, ocr, tracker_factory, spot_resolver, homography=None, preprocessor=None):
         """
         Initialize video processor.
         
@@ -27,12 +35,17 @@ class VideoProcessor:
             tracker_factory: Function that returns a new tracker instance
             spot_resolver: Spot resolver instance
             homography: Optional homography matrix for world projection
+            preprocessor: Optional ImagePreprocessor instance for OCR preprocessing
         """
         self.detector = detector
         self.ocr = ocr
         self.tracker_factory = tracker_factory
         self.spot_resolver = spot_resolver
         self.homography = homography
+        self.preprocessor = preprocessor
+        
+        # Check if OCR is oLmOCR (needs GPU memory cleanup)
+        self.is_olmocr = ocr is not None and 'OlmOCRRecognizer' in type(ocr).__name__
         
         # Processing state
         self.processing = False
@@ -58,6 +71,28 @@ class VideoProcessor:
         self.track_ocr_results = {}  # track_key -> list of {text, conf, frame}
         
         # Position clustering: group nearby positions (within 5m) as the same physical location
+    
+    def _cleanup_gpu_memory(self):
+        """
+        Clean up GPU memory after OCR operations to prevent accumulation.
+        This is critical when processing multiple frames in sequence.
+        """
+        if not TORCH_AVAILABLE or not self.is_olmocr:
+            return
+        
+        if torch.cuda.is_available():
+            try:
+                # Wait for all GPU operations to complete
+                torch.cuda.synchronize()
+                # Clear CUDA cache
+                torch.cuda.empty_cache()
+                # Force Python garbage collection
+                gc.collect()
+                # Clear cache again after GC
+                torch.cuda.empty_cache()
+            except Exception:
+                # Silently fail - don't interrupt video processing
+                pass
         # This handles slight movement and position variance
         # Increased tolerance to better handle trailers parked close together
         self.position_clusters = {}  # cluster_id -> {center_x, center_y, count, positions: [(x, y), ...]}
@@ -89,6 +124,11 @@ class VideoProcessor:
             self.unique_tracks = {}  # (track_id, spot) -> latest_event
             self.unique_track_keys = set()  # Set of unique (track_id, spot) tuples for counting
             self.last_nearest_trailer = None  # Reset persistent display
+            # Reset position clusters for new video processing
+            self.position_clusters = {}  # cluster_id -> {center_x, center_y, count, positions: [(x, y), ...]}
+            self.next_cluster_id = 1
+            # Reset OCR results tracking
+            self.track_ocr_results = {}  # track_key -> list of {text, conf, frame}
             self.stats = {
                 'frames_processed': 0,
                 'detections': 0,
@@ -457,7 +497,7 @@ class VideoProcessor:
                                     
                                     cv2.rectangle(processed_frame, (rx1, ry1), (rx2, ry2), color, 2)  # Thicker for visibility
                             
-                            # Run OCR on multiple regions with multiple preprocessing strategies
+                            # Run OCR on multiple regions with preprocessing pipeline
                             # This ensures we capture text that appears in different locations on the trailer
                             if not self.ocr:
                                 if frame_count % 50 == 0:  # Log occasionally
@@ -494,426 +534,75 @@ class VideoProcessor:
                                         if std_dev < 10:  # Very low contrast - likely no text
                                             continue
                                         
-                                        # Convert to grayscale once for all strategies
-                                        if len(crop.shape) == 3:
-                                            crop_gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-                                        else:
-                                            crop_gray = crop
-                                        
-                                        # Helper function to try OCR with all orientations
-                                        def try_ocr_all_orientations(image, base_method_name, region_name):
-                                            """Try OCR on image in all 4 orientations (0°, 90°, 180°, 270°)."""
-                                            results = []
+                                        # Use ImagePreprocessor if available, otherwise fallback to manual preprocessing
+                                        if self.preprocessor and self.preprocessor.enable_ocr_preprocessing:
+                                            # Get multiple preprocessed versions using ImagePreprocessor
+                                            preprocessed_crops = self.preprocessor.preprocess_for_ocr(crop)
                                             
-                                            # Orientation 0: Original (horizontal text)
+                                            # Try OCR on each preprocessed version
+                                            for prep in preprocessed_crops:
+                                                try:
+                                                    result = self.ocr.recognize(prep['image'])
+                                                    if result.get('text', '').strip():
+                                                        all_ocr_results.append({
+                                                            'text': result.get('text', ''),
+                                                            'conf': result.get('conf', 0.0),
+                                                            'method': f'{region_name}-{prep["method"]}',
+                                                            'region': region_name
+                                                        })
+                                                    # Clean GPU memory after each OCR call
+                                                    self._cleanup_gpu_memory()
+                                                except Exception as e:
+                                                    if frame_count % 50 == 0:
+                                                        print(f"[VideoProcessor] OCR error with {prep['method']}: {e}")
+                                                    # Clean GPU memory even on error
+                                                    self._cleanup_gpu_memory()
+                                        else:
+                                            # Fallback: Try original crop without preprocessing
                                             try:
-                                                result = self.ocr.recognize(image)
+                                                result = self.ocr.recognize(crop)
                                                 if result.get('text', '').strip():
-                                                    results.append({
+                                                    all_ocr_results.append({
                                                         'text': result.get('text', ''),
                                                         'conf': result.get('conf', 0.0),
-                                                        'method': f'{region_name}-{base_method_name}',
-                                                        'region': region_name,
-                                                        'orientation': 0
+                                                        'method': f'{region_name}-original',
+                                                        'region': region_name
                                                     })
+                                                # Clean GPU memory after OCR call
+                                                self._cleanup_gpu_memory()
                                             except Exception as e:
-                                                pass
-                                            
-                                            # Orientation 1: Rotate 90° clockwise (vertical text → horizontal)
-                                            try:
-                                                rotated_90cw = cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
-                                                result = self.ocr.recognize(rotated_90cw)
-                                                if result.get('text', '').strip():
-                                                    results.append({
-                                                        'text': result.get('text', ''),
-                                                        'conf': result.get('conf', 0.0),
-                                                        'method': f'{region_name}-{base_method_name}-rot90cw',
-                                                        'region': region_name,
-                                                        'orientation': 90
-                                                    })
-                                            except Exception as e:
-                                                pass
-                                            
-                                            # Orientation 2: Rotate 180° (upside down text)
-                                            try:
-                                                rotated_180 = cv2.rotate(image, cv2.ROTATE_180)
-                                                result = self.ocr.recognize(rotated_180)
-                                                if result.get('text', '').strip():
-                                                    results.append({
-                                                        'text': result.get('text', ''),
-                                                        'conf': result.get('conf', 0.0),
-                                                        'method': f'{region_name}-{base_method_name}-rot180',
-                                                        'region': region_name,
-                                                        'orientation': 180
-                                                    })
-                                            except Exception as e:
-                                                pass
-                                            
-                                            # Orientation 3: Rotate 90° counter-clockwise (vertical text → horizontal, alternative)
-                                            try:
-                                                rotated_90ccw = cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
-                                                result = self.ocr.recognize(rotated_90ccw)
-                                                if result.get('text', '').strip():
-                                                    results.append({
-                                                        'text': result.get('text', ''),
-                                                        'conf': result.get('conf', 0.0),
-                                                        'method': f'{region_name}-{base_method_name}-rot90ccw',
-                                                        'region': region_name,
-                                                        'orientation': 270
-                                                    })
-                                            except Exception as e:
-                                                pass
-                                            
-                                            return results
-                                        
-                                        # Strategy 0: Original with minimal processing (baseline) - try all orientations
-                                        try:
-                                            h_crop, w_crop = crop.shape[:2]
-                                            
-                                            # Enhanced preprocessing for better OCR accuracy
-                                            # 1. Upscale small images (text needs to be readable)
-                                            # 2. Apply sharpening to enhance text edges
-                                            # 3. Improve contrast
-                                            
-                                            crop_processed = crop.copy()
-                                            
-                                            # Upscale if too small (preserve aspect ratio)
-                                            min_text_height = 80  # Increased for better quality
-                                            min_text_width = 120
-                                            scale_h = max(1.0, min_text_height / h_crop) if h_crop < min_text_height else 1.0
-                                            scale_w = max(1.0, min_text_width / w_crop) if w_crop < min_text_width else 1.0
-                                            scale = max(scale_h, scale_w)
-                                            
-                                            if scale > 1.0:
-                                                # Use high-quality upscaling
-                                                new_w = int(w_crop * scale)
-                                                new_h = int(h_crop * scale)
-                                                crop_processed = cv2.resize(crop_processed, (new_w, new_h), 
-                                                                          interpolation=cv2.INTER_CUBIC)
-                                            
-                                            # Apply unsharp masking to sharpen text (helps OCR accuracy)
-                                            if len(crop_processed.shape) == 3:
-                                                # Convert to grayscale for sharpening, then back to BGR
-                                                gray = cv2.cvtColor(crop_processed, cv2.COLOR_BGR2GRAY)
-                                            else:
-                                                gray = crop_processed
-                                            
-                                            # Unsharp mask: sharpen = original + (original - blurred) * amount
-                                            blurred = cv2.GaussianBlur(gray, (0, 0), 2.0)
-                                            sharpened = cv2.addWeighted(gray, 1.5, blurred, -0.5, 0)
-                                            
-                                            # Convert back to BGR if needed
-                                            if len(crop.shape) == 3:
-                                                crop_processed = cv2.cvtColor(sharpened, cv2.COLOR_GRAY2BGR)
-                                            else:
-                                                crop_processed = sharpened
-                                            
-                                            # Enhance contrast slightly (helps with faded text)
-                                            # Apply CLAHE (Contrast Limited Adaptive Histogram Equalization)
-                                            if len(crop_processed.shape) == 3:
-                                                lab = cv2.cvtColor(crop_processed, cv2.COLOR_BGR2LAB)
-                                                l, a, b = cv2.split(lab)
-                                                clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-                                                l = clahe.apply(l)
-                                                crop_processed = cv2.merge([l, a, b])
-                                                crop_processed = cv2.cvtColor(crop_processed, cv2.COLOR_LAB2BGR)
-                                            else:
-                                                clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-                                                crop_processed = clahe.apply(crop_processed)
-                                            
-                                            # Try all orientations for processed image
-                                            orientation_results = try_ocr_all_orientations(crop_processed, 'original', region_name)
-                                            all_ocr_results.extend(orientation_results)
-                                        except Exception as e:
-                                            if frame_count % 50 == 0:
-                                                print(f"[VideoProcessor] OCR strategy 0 ({region_name}) failed: {e}")
+                                                if frame_count % 50 == 0:
+                                                    print(f"[VideoProcessor] OCR fallback failed: {e}")
+                                                # Clean GPU memory even on error
+                                                self._cleanup_gpu_memory()
                                     
-                                    # Strategy 0b: Morphological preprocessing (character separation)
-                                    # This helps separate touching characters and remove small noise
-                                    try:
-                                        h_crop, w_crop = crop_gray.shape
-                                        
-                                        # Aggressive upscaling for small text
-                                        min_text_height = 60
-                                        if h_crop < min_text_height:
-                                            scale = max(3.0, min_text_height / h_crop)
-                                            crop_up = cv2.resize(crop_gray, None, fx=scale, fy=scale,
-                                                               interpolation=cv2.INTER_CUBIC)
-                                        elif w_crop < 100:
-                                            scale = max(2.0, 100 / w_crop)
-                                            crop_up = cv2.resize(crop_gray, None, fx=scale, fy=scale,
-                                                               interpolation=cv2.INTER_CUBIC)
+                                    # Final GPU memory cleanup after all OCR attempts for this track
+                                    self._cleanup_gpu_memory()
+                                    
+                                    # Select best OCR result using preprocessor's selection method
+                                    if all_ocr_results:
+                                        if self.preprocessor:
+                                            # Use preprocessor's intelligent result selection
+                                            best_result = self.preprocessor.select_best_ocr_result(all_ocr_results)
+                                            text = best_result['text']
+                                            conf_ocr = best_result['conf']
+                                            ocr_method = best_result.get('method', 'unknown')
                                         else:
-                                            crop_up = crop_gray
+                                            # Fallback: simple selection by confidence
+                                            best_result = max(all_ocr_results, key=lambda x: x.get('conf', 0.0))
+                                            text = best_result.get('text', '')
+                                            conf_ocr = best_result.get('conf', 0.0)
+                                            ocr_method = best_result.get('method', 'unknown')
                                         
-                                        # Apply bilateral filter to reduce noise while keeping edges sharp
-                                        crop_smooth = cv2.bilateralFilter(crop_up, 9, 40, 40)
-                                        
-                                        # Apply Otsu's threshold
-                                        _, crop_thresh = cv2.threshold(crop_smooth, 0, 255,
-                                                                      cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-                                        
-                                        # Morphological opening to remove small noise
-                                        kernel_small = np.ones((2, 2), np.uint8)
-                                        crop_morph = cv2.morphologyEx(crop_thresh, cv2.MORPH_OPEN, kernel_small)
-                                        
-                                        # Morphological closing to fill small holes in characters
-                                        kernel_med = np.ones((2, 3), np.uint8)
-                                        crop_morph = cv2.morphologyEx(crop_morph, cv2.MORPH_CLOSE, kernel_med)
-                                        
-                                        # Try both normal and inverted, with all orientations
-                                        crop_morph_bgr = cv2.cvtColor(crop_morph, cv2.COLOR_GRAY2BGR)
-                                        orientation_results = try_ocr_all_orientations(crop_morph_bgr, 'morphological', region_name)
-                                        all_ocr_results.extend(orientation_results)
-                                        
-                                        # Inverted version with all orientations
-                                        crop_morph_inv = cv2.bitwise_not(crop_morph)
-                                        crop_morph_inv_bgr = cv2.cvtColor(crop_morph_inv, cv2.COLOR_GRAY2BGR)
-                                        orientation_results_inv = try_ocr_all_orientations(crop_morph_inv_bgr, 'morphological-inv', region_name)
-                                        all_ocr_results.extend(orientation_results_inv)
-                                    except Exception as e:
-                                        print(f"[VideoProcessor] OCR strategy 0b ({region_name}) failed: {e}")
+                                        if frame_count % 10 == 0:
+                                            print(f"[VideoProcessor] Frame {frame_count}, Track {track_id}: Best OCR '{text}' (conf: {conf_ocr:.3f}, method: {ocr_method})")
+                                    else:
+                                        text = ""
+                                        conf_ocr = 0.0
+                                        ocr_method = "none"
                                     
-                                    # Strategy 1: CLAHE + Border removal (for low-contrast text)
-                                    try:
-                                        h_crop, w_crop = crop_gray.shape
-                                        
-                                        # Aggressive upscaling for small text
-                                        min_text_height = 60
-                                        if h_crop < min_text_height:
-                                            scale = max(3.0, min_text_height / h_crop)
-                                            crop_up = cv2.resize(crop_gray, None, fx=scale, fy=scale, 
-                                                               interpolation=cv2.INTER_CUBIC)
-                                        elif w_crop < 100:
-                                            scale = max(2.0, 100 / w_crop)
-                                            crop_up = cv2.resize(crop_gray, None, fx=scale, fy=scale, 
-                                                               interpolation=cv2.INTER_CUBIC)
-                                        else:
-                                            crop_up = crop_gray
-                                        
-                                        # Remove 10% border to eliminate edge noise
-                                        h_up, w_up = crop_up.shape
-                                        border_h = max(1, int(h_up * 0.1))
-                                        border_w = max(1, int(w_up * 0.1))
-                                        if h_up > border_h*2 and w_up > border_w*2:
-                                            crop_up = crop_up[border_h:-border_h, border_w:-border_w]
-                                        
-                                        # Denoise slightly
-                                        crop_smooth = cv2.GaussianBlur(crop_up, (3, 3), 0)
-                                        
-                                        # Apply CLAHE for local contrast enhancement
-                                        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
-                                        crop_clahe = clahe.apply(crop_smooth)
-                                        
-                                        # Sharpen slightly
-                                        kernel_sharp = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
-                                        crop_clahe = cv2.filter2D(crop_clahe, -1, kernel_sharp)
-                                        
-                                        crop_clahe_bgr = cv2.cvtColor(crop_clahe, cv2.COLOR_GRAY2BGR)
-                                        orientation_results = try_ocr_all_orientations(crop_clahe_bgr, 'clahe-sharp', region_name)
-                                        all_ocr_results.extend(orientation_results)
-                                    except Exception as e:
-                                        print(f"[VideoProcessor] OCR strategy 1 ({region_name}) failed: {e}")
-                                    
-                                    # Strategy 2: Adaptive thresholding (best for varying lighting)
-                                    # Handles shadows and uneven illumination
-                                    try:
-                                        h_crop, w_crop = crop_gray.shape
-                                        
-                                        # Aggressive upscaling for small text
-                                        min_text_height = 60
-                                        if h_crop < min_text_height:
-                                            scale = max(3.0, min_text_height / h_crop)
-                                            crop_up = cv2.resize(crop_gray, None, fx=scale, fy=scale,
-                                                               interpolation=cv2.INTER_CUBIC)
-                                        elif w_crop < 100:
-                                            scale = max(2.0, 100 / w_crop)
-                                            crop_up = cv2.resize(crop_gray, None, fx=scale, fy=scale,
-                                                               interpolation=cv2.INTER_CUBIC)
-                                        else:
-                                            crop_up = crop_gray
-                                        
-                                        # Remove border noise (5% on each side)
-                                        h_up, w_up = crop_up.shape
-                                        border = int(min(h_up, w_up) * 0.05)
-                                        if border > 0 and h_up > border*2 and w_up > border*2:
-                                            crop_up = crop_up[border:-border, border:-border]
-                                        
-                                        # Denoise with bilateral filter
-                                        crop_denoised = cv2.bilateralFilter(crop_up, 9, 50, 50)
-                                        
-                                        # Adaptive Gaussian thresholding - better for varying lighting
-                                        crop_adaptive = cv2.adaptiveThreshold(
-                                            crop_denoised, 255,
-                                            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                            cv2.THRESH_BINARY, 11, 2
-                                        )
-                                        
-                                        # Apply morphological operations to clean up
-                                        kernel = np.ones((2, 2), np.uint8)
-                                        crop_adaptive = cv2.morphologyEx(crop_adaptive, cv2.MORPH_CLOSE, kernel)
-                                        
-                                        crop_adaptive_bgr = cv2.cvtColor(crop_adaptive, cv2.COLOR_GRAY2BGR)
-                                        orientation_results = try_ocr_all_orientations(crop_adaptive_bgr, 'adaptive', region_name)
-                                        all_ocr_results.extend(orientation_results)
-                                        
-                                        # Inverted adaptive threshold with all orientations
-                                        crop_adaptive_inv = cv2.bitwise_not(crop_adaptive)
-                                        crop_adaptive_inv_bgr = cv2.cvtColor(crop_adaptive_inv, cv2.COLOR_GRAY2BGR)
-                                        orientation_results_inv = try_ocr_all_orientations(crop_adaptive_inv_bgr, 'adaptive-inv', region_name)
-                                        all_ocr_results.extend(orientation_results_inv)
-                                    except Exception as e:
-                                        print(f"[VideoProcessor] OCR strategy 2 ({region_name}) failed: {e}")
-                                    
-                                    # Strategy 3: High-contrast enhancement with dilation
-                                    # Good for faded or low-contrast text
-                                    try:
-                                        h_crop, w_crop = crop_gray.shape
-                                        
-                                        # Aggressive upscaling for small text
-                                        min_text_height = 60
-                                        if h_crop < min_text_height:
-                                            scale = max(3.0, min_text_height / h_crop)
-                                            crop_up = cv2.resize(crop_gray, None, fx=scale, fy=scale,
-                                                               interpolation=cv2.INTER_CUBIC)
-                                        elif w_crop < 100:
-                                            scale = max(2.0, 100 / w_crop)
-                                            crop_up = cv2.resize(crop_gray, None, fx=scale, fy=scale,
-                                                               interpolation=cv2.INTER_CUBIC)
-                                        else:
-                                            crop_up = crop_gray
-                                        
-                                        # Increase contrast dramatically
-                                        crop_contrast = cv2.convertScaleAbs(crop_up, alpha=1.5, beta=0)
-                                        
-                                        # Apply CLAHE for local contrast enhancement
-                                        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-                                        crop_clahe = clahe.apply(crop_contrast)
-                                        
-                                        # Threshold
-                                        _, crop_high = cv2.threshold(crop_clahe, 0, 255,
-                                                                    cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-                                        
-                                        # Dilate slightly to thicken thin characters
-                                        kernel_dilate = np.ones((2, 2), np.uint8)
-                                        crop_high = cv2.dilate(crop_high, kernel_dilate, iterations=1)
-                                        
-                                        crop_high_bgr = cv2.cvtColor(crop_high, cv2.COLOR_GRAY2BGR)
-                                        orientation_results = try_ocr_all_orientations(crop_high_bgr, 'high-contrast', region_name)
-                                        all_ocr_results.extend(orientation_results)
-                                        
-                                        # Inverted version with all orientations
-                                        crop_high_inv = cv2.bitwise_not(crop_high)
-                                        crop_high_inv_bgr = cv2.cvtColor(crop_high_inv, cv2.COLOR_GRAY2BGR)
-                                        orientation_results_inv = try_ocr_all_orientations(crop_high_inv_bgr, 'high-contrast-inv', region_name)
-                                        all_ocr_results.extend(orientation_results_inv)
-                                    except Exception as e:
-                                        print(f"[VideoProcessor] OCR strategy 3 ({region_name}) failed: {e}")
-                                    
-                                    # Combine results from all regions intelligently
-                                    # Group by region to find the best result per region, then combine unique texts
-                                    
-                                    # Log all OCR attempts for debugging (every frame for nearest trailer)
-                                    if is_nearest and frame_count % 5 == 0:  # Log every 5 frames
-                                        print(f"[VideoProcessor] Frame {frame_count}, Track {track_id}: {len(all_ocr_results)} OCR attempts from all regions")
-                                        for i, result in enumerate(all_ocr_results):
-                                            print(f"  {i+1}. {result['method']}: '{result['text']}' (conf: {result['conf']:.3f})")
-                                    
-                                    # Find best result per region with relaxed filtering to capture more results
-                                    region_best = {}  # region_name -> best result for that region
-                                    MIN_TEXT_LENGTH = 1  # Allow single characters (will be filtered by scoring)
-                                    MIN_CONFIDENCE = 0.005  # Very low threshold (0.5%) to see what OCR detects
-                                    
-                                    for result in all_ocr_results:
-                                        # Filter out only completely empty results
-                                        if not result['text']:
-                                            continue
-                                        # Very permissive filtering to see what we're getting
-                                        if len(result['text']) < MIN_TEXT_LENGTH:
-                                            continue
-                                        if result['conf'] < MIN_CONFIDENCE:
-                                            continue
-                                        
-                                        # Check for alphanumeric content
-                                        has_letter = any(c.isalpha() for c in result['text'])
-                                        has_digit = any(c.isdigit() for c in result['text'])
-                                        has_both = has_letter and has_digit
-                                        has_alphanumeric = has_letter or has_digit
-                                        
-                                        # Skip results with no alphanumeric characters
-                                        if not has_alphanumeric:
-                                            continue
-                                        
-                                        # Enhanced scoring system
-                                        score = result['conf']
-                                        
-                                        # Trailer IDs usually have both letters and numbers
-                                        if has_both:
-                                            score += 0.2  # Strong bonus
-                                        elif has_digit:
-                                            score += 0.1  # Numbers are important
-                                        elif has_letter and len(result['text']) >= 4:
-                                            score += 0.05  # Some trailers have only letters
-                                        
-                                        # Length bonus (trailers typically have 3-12 character IDs)
-                                        text_len = len(result['text'])
-                                        if 3 <= text_len <= 12:
-                                            score += 0.15
-                                        elif text_len >= 4:
-                                            score += 0.08
-                                        
-                                        # Store score for comparison
-                                        result['score'] = score
-                                        
-                                        # Update best for this region
-                                        region_name = result['region']
-                                        if region_name not in region_best or score > region_best[region_name]['score']:
-                                            region_best[region_name] = result
-                                    
-                                    # Combine unique texts from different regions
-                                    # If we found different text in different regions, combine them
-                                    unique_texts = {}  # text -> result
-                                    
-                                    for region_name, result in region_best.items():
-                                        text_found = result['text'].strip()  # Strip whitespace
-                                        if not text_found:  # Skip empty after stripping
-                                            continue
-                                        
-                                        if text_found not in unique_texts:
-                                            unique_texts[text_found] = result
-                                        else:
-                                            # Keep the one with higher score
-                                            if result['score'] > unique_texts[text_found]['score']:
-                                                unique_texts[text_found] = result
-                                    
-                                    # Combine all unique texts (e.g., "RZ/IMVZ" from top + "399" from bottom)
-                                    if unique_texts:
-                                        # Sort by score to prioritize best results
-                                        sorted_results = sorted(unique_texts.values(), key=lambda x: x['score'], reverse=True)
-                                        
-                                        # Only combine if we have valid results
-                                        valid_texts = []
-                                        combined_conf = 0.0
-                                        combined_methods = []
-                                        
-                                        for result in sorted_results:
-                                            text_item = result['text'].strip()
-                                            if text_item and len(text_item) >= 1:  # Accept single chars for now
-                                                valid_texts.append(text_item)
-                                                combined_conf = max(combined_conf, result['conf'])
-                                                combined_methods.append(result['method'])
-                                        
-                                        # Join valid texts only
-                                        if valid_texts:
-                                            text = ' | '.join(valid_texts)
-                                            conf_ocr = combined_conf
-                                            
-                                            print(f"[VideoProcessor] Frame {frame_count}, Track {track_id}: COMBINED OCR '{text}' from {len(valid_texts)} regions")
-                                            print(f"  Methods: {', '.join(combined_methods)}")
-                                            print(f"  Confidence: {conf_ocr:.3f}")
-                                    
-                                    # Accept OCR results if we have text (scoring already filtered quality)
-                                    if text and len(text) >= 1:  # Accept even single chars now since we're combining regions
+                                    # Accept OCR results if we have text
+                                    if text and len(text.strip()) >= 1:
                                         with self.lock:
                                             self.stats['ocr_results'] += 1
                                             # Store OCR result in list (collect ALL results per track)
@@ -1088,16 +777,7 @@ class VideoProcessor:
                 
                 # Note: Green boxes are already drawn for all tracks in the loop above (lines 244-273)
                 # No need to draw persistent boxes here - all active tracks are already displayed
-                    
-                    # Draw size text
-                    cv2.putText(processed_frame, size_text, (text_x, size_y),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                    
-                    # Draw OCR text in red if available
-                    if text:
-                        ocr_conf_percent = conf_ocr * 100.0
-                        ocr_text = f"TEXT: {text}"
-                        ocr_conf_text = f"Conf: {ocr_conf_percent:.1f}%"
+                # (Removed orphaned drawing code that referenced undefined variables)
                         
                         # Position text below the bounding box
                         text_y_pos = min(y2 + 30, h - 30)
