@@ -31,7 +31,7 @@ class VideoProcessor:
         Initialize video processor.
         
         Args:
-            detector: Detection model instance
+            detector: Detection model instance (should be YOLOv8Detector for YOLOv8m COCO truck detection)
             ocr: OCR model instance
             tracker_factory: Function that returns a new tracker instance
             spot_resolver: Spot resolver instance
@@ -44,6 +44,15 @@ class VideoProcessor:
         self.spot_resolver = spot_resolver
         self.homography = homography
         self.preprocessor = preprocessor
+        
+        # Log detector type for verification
+        if self.detector is not None:
+            detector_type = type(self.detector).__name__
+            print(f"[VideoProcessor] Using detector: {detector_type}")
+            if hasattr(self.detector, 'model_name'):
+                print(f"[VideoProcessor] Detector model: {self.detector.model_name}")
+            if hasattr(self.detector, 'target_class'):
+                print(f"[VideoProcessor] Detector target class: {self.detector.target_class} (truck)")
         
         # Check if OCR is oLmOCR (needs GPU memory cleanup)
         self.is_olmocr = ocr is not None and 'OlmOCRRecognizer' in type(ocr).__name__

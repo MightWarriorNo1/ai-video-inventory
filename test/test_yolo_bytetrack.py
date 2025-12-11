@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
-Test YOLO Detection and ByteTrack Tracking on Single Image
+Test YOLOv8 Detection and ByteTrack Tracking on Single Image
 
-This script tests YOLO object detection and ByteTrack tracking on a single image.
+This script tests YOLOv8m (COCO pre-trained) truck detection and ByteTrack tracking on a single image.
 It visualizes the detection results with bounding boxes and track IDs.
+
+Uses YOLOv8m pre-trained on COCO dataset, filtered to only detect trucks (class 7).
 
 Usage:
     python test/test_yolo_bytetrack.py <image_path> [--output <output_path>] [--conf <confidence>]
     
 Example:
-    python test/test_yolo_bytetrack.py img_00675.jpg --output result.jpg --conf 0.20
+    python test/test_yolo_bytetrack.py img_00675.jpg --output result.jpg --conf 0.25
 """
 
 import sys
@@ -22,25 +24,7 @@ from pathlib import Path
 # Add parent directory to path to import app modules
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-# Initialize CUDA context before importing detector (required for TensorRT)
-try:
-    import pycuda.driver as cuda
-    import pycuda.autoinit
-    # Store primary context for detector to use
-    device = cuda.Device(0)
-    primary_ctx = device.retrieve_primary_context()
-    if primary_ctx is not None:
-        primary_ctx.push()
-        # Make it available to detector module if needed
-        import sys
-        sys.modules[__name__]._cuda_primary_context = primary_ctx
-    print("✓ CUDA context initialized")
-except ImportError:
-    print("⚠ Warning: PyCUDA not available - TensorRT may not work")
-except Exception as e:
-    print(f"⚠ Warning: CUDA initialization issue: {e}")
-
-from app.ai.detector_trt import TrtEngineYOLO
+from app.ai.detector_yolov8 import YOLOv8Detector
 from app.ai.tracker_bytetrack import ByteTrackWrapper
 from app.image_preprocessing import ImagePreprocessor
 
@@ -129,34 +113,9 @@ def test_yolo_bytetrack(image_path, output_path=None, conf_threshold=0.20, use_p
     print("YOLO + ByteTrack Test on Single Image")
     print("=" * 60)
     
-    # Ensure CUDA context is active (critical for TensorRT)
-    try:
-        import pycuda.driver as cuda
-        current_ctx = cuda.Context.get_current()
-        if current_ctx is None:
-            # Try to activate primary context
-            device = cuda.Device(0)
-            primary_ctx = device.retrieve_primary_context()
-            if primary_ctx is not None:
-                primary_ctx.push()
-                print("✓ CUDA context activated")
-            else:
-                print("⚠ Warning: Could not get CUDA primary context")
-        else:
-            print("✓ CUDA context already active")
-    except Exception as e:
-        print(f"⚠ Warning: CUDA context check failed: {e}")
-    
     # Check if image exists
     if not os.path.exists(image_path):
         print(f"✗ Error: Image not found: {image_path}")
-        return False
-    
-    # Check if detector engine exists
-    detector_path = "models/trailer_detector.engine"
-    if not os.path.exists(detector_path):
-        print(f"✗ Error: Detector engine not found: {detector_path}")
-        print(f"  Please ensure the YOLO TensorRT engine is built and placed in models/")
         return False
     
     # Load image
@@ -182,59 +141,30 @@ def test_yolo_bytetrack(image_path, output_path=None, conf_threshold=0.20, use_p
         print(f"\n[2/5] Skipping image preprocessing")
     
     # Initialize YOLO detector
-    print(f"\n[3/5] Initializing YOLO detector...")
+    print(f"\n[3/5] Initializing YOLOv8 detector...")
     try:
-        # Ensure CUDA context is active before creating detector (critical!)
-        # The detector creates execution context in __init__, which requires active CUDA context
-        try:
-            import pycuda.driver as cuda
-            current_ctx = cuda.Context.get_current()
-            if current_ctx is None:
-                device = cuda.Device(0)
-                primary_ctx = device.retrieve_primary_context()
-                if primary_ctx is not None:
-                    primary_ctx.push()
-                    print("  ✓ CUDA context activated for detector initialization")
-        except Exception as ctx_err:
-            print(f"  ⚠ Warning: Could not ensure CUDA context: {ctx_err}")
-        
-        detector = TrtEngineYOLO(
-            detector_path,
-            conf_threshold=conf_threshold
+        detector = YOLOv8Detector(
+            model_name="yolov8m.pt",  # YOLOv8m pre-trained on COCO
+            conf_threshold=conf_threshold,
+            target_class=7,  # COCO class 7 = truck
+            device=None  # Auto-detect device (CUDA if available, else CPU)
         )
-        print(f"  ✓ YOLO detector initialized")
-        print(f"    - Engine: {detector_path}")
+        print(f"  ✓ YOLOv8 detector initialized")
+        print(f"    - Model: yolov8m.pt (COCO pre-trained)")
+        print(f"    - Target class: 7 (truck)")
         print(f"    - Confidence threshold: {conf_threshold}")
     except Exception as e:
         print(f"✗ Error initializing detector: {e}")
         print(f"\n  Troubleshooting tips:")
-        print(f"    1. Ensure CUDA/TensorRT are properly installed")
-        print(f"    2. Check if engine was built on this device (warning above)")
-        print(f"    3. Try running: python test/test_engine.py")
+        print(f"    1. Ensure ultralytics is installed: pip install ultralytics")
+        print(f"    2. The model will download automatically on first use")
         import traceback
         traceback.print_exc()
         return False
     
     # Run YOLO detection
-    print(f"\n[4/5] Running YOLO detection...")
+    print(f"\n[4/5] Running YOLOv8 detection...")
     try:
-        # Synchronize CUDA operations before inference (helps avoid "Cask" errors)
-        try:
-            import torch
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
-        except:
-            pass  # Ignore if torch not available
-        
-        try:
-            import pycuda.driver as cuda
-            current_ctx = cuda.Context.get_current()
-            if current_ctx is not None:
-                current_ctx.synchronize()
-        except:
-            pass  # Ignore if CUDA sync fails
-        
         # Try detection with preprocessing
         detections = detector.detect(preprocessed_image)
         print(f"  ✓ Detection completed")
@@ -318,9 +248,11 @@ def test_yolo_bytetrack(image_path, output_path=None, conf_threshold=0.20, use_p
             print(f"\n  [Debug Mode] Checking for detections below threshold...")
             # Create a temporary detector with lower threshold to see all detections
             try:
-                low_conf_detector = TrtEngineYOLO(
-                    detector_path,
-                    conf_threshold=0.05  # Very low threshold to see all detections
+                low_conf_detector = YOLOv8Detector(
+                    model_name="yolov8m.pt",
+                    conf_threshold=0.05,  # Very low threshold to see all detections
+                    target_class=7,  # Truck
+                    device=None
                 )
                 all_detections = low_conf_detector.detect(preprocessed_image)
                 print(f"    - Found {len(all_detections)} total detections (confidence >= 0.05)")
@@ -341,8 +273,8 @@ def test_yolo_bytetrack(image_path, output_path=None, conf_threshold=0.20, use_p
             print(f"\n  ⚠ WARNING: No detections found!")
             print(f"    This could be due to:")
             print(f"    1. Confidence threshold too high (current: {conf_threshold})")
-            print(f"    2. No objects in image matching the model classes")
-            print(f"    3. TensorRT execution error (check error messages above)")
+            print(f"    2. No trucks in image (YOLOv8 only detects trucks, class 7)")
+            print(f"    3. Model loading/inference error (check error messages above)")
             print(f"\n    Try running with:")
             print(f"    - Lower confidence: python test/test_yolo_bytetrack.py {image_path} --conf 0.10")
             print(f"    - Debug mode: python test/test_yolo_bytetrack.py {image_path} --show-all")

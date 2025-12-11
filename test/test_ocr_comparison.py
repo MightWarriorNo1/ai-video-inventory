@@ -39,9 +39,9 @@ def test_easyocr(image_path: str, use_detection: bool = False, force_cpu: bool =
         if force_cpu:
             print("Using CPU mode (forced)")
         elif use_detection:
-            # When using YOLO (TensorRT), there can be CUDA context conflicts
+            # When using YOLOv8, it uses PyTorch which handles CUDA automatically
             # Try GPU first, but we'll fall back to CPU if needed
-            print("Using GPU mode (will fallback to CPU if CUDA conflicts occur)")
+            print("Using GPU mode (YOLOv8 uses PyTorch which handles CUDA automatically)")
         
         ocr = EasyOCRRecognizer(languages=['en'], gpu=use_gpu)
         
@@ -57,85 +57,21 @@ def test_easyocr(image_path: str, use_detection: bool = False, force_cpu: bool =
         if use_detection:
             detections = []
             try:
-                from app.ai.detector_trt import TrtEngineYOLO
-                detector_path = "models/trailer_detector.engine"
-                if os.path.exists(detector_path):
-                    print("Using YOLO detection to crop trailer regions...")
-                    
-                    # Ensure CUDA context is properly initialized before TensorRT
-                    # This is important when EasyOCR has already used the GPU
-                    try:
-                        import pycuda.driver as cuda
-                        import pycuda.autoinit
-                        import torch
-                        
-                        # Synchronize PyTorch CUDA operations (from EasyOCR)
-                        if torch.cuda.is_available():
-                            torch.cuda.synchronize()
-                            torch.cuda.empty_cache()
-                        
-                        # Ensure PyCUDA context is active
-                        current_ctx = cuda.Context.get_current()
-                        if current_ctx is None:
-                            # Try to get/create primary context
-                            try:
-                                device = cuda.Device(0)
-                                primary_ctx = device.retain_primary_context()
-                                if primary_ctx is not None:
-                                    primary_ctx.push()
-                            except:
-                                pass
-                    except Exception as ctx_init_err:
-                        print(f"[Warning] CUDA context initialization warning: {ctx_init_err}")
-                    
-                    try:
-                        detector = TrtEngineYOLO(detector_path, conf_threshold=0.35)
-                        detections = detector.detect(image)
-                        
-                        # After TensorRT inference, synchronize CUDA context for PyTorch/EasyOCR
-                        # This is critical to avoid CUDA context conflicts
-                        try:
-                            import pycuda.driver as cuda
-                            import torch
-                            import time
-                            
-                            # Step 1: Synchronize PyCUDA context (from TensorRT)
-                            try:
-                                current_ctx = cuda.Context.get_current()
-                                if current_ctx is not None:
-                                    current_ctx.synchronize()  # Synchronize current PyCUDA context
-                                else:
-                                    # Try to get primary context
-                                    try:
-                                        device = cuda.Device(0)
-                                        primary_ctx = device.retain_primary_context()
-                                        if primary_ctx is not None:
-                                            primary_ctx.synchronize()
-                                    except:
-                                        pass
-                            except:
-                                pass
-                            
-                            # Step 2: Reset PyTorch CUDA state
-                            if torch.cuda.is_available():
-                                device_id = 0
-                                if torch.cuda.current_device() != device_id:
-                                    torch.cuda.set_device(device_id)
-                                torch.cuda.synchronize(device_id)
-                                torch.cuda.empty_cache()
-                                
-                                # Small delay to ensure context is fully synchronized
-                                time.sleep(0.001)  # 1ms delay
-                                
-                                # Final synchronization check
-                                torch.cuda.synchronize(device_id)
-                        except Exception as sync_error:
-                            print(f"[Warning] CUDA sync after TensorRT failed: {sync_error}")
-                            pass  # Continue anyway - EasyOCR will try to sync again
-                    except Exception as det_error:
-                        print(f"YOLO detection failed: {det_error}")
-                        print("Falling back to full image OCR...")
-                        detections = []
+                from app.ai.detector_yolov8 import YOLOv8Detector
+                print("Using YOLOv8 detection to crop truck regions...")
+                
+                try:
+                    detector = YOLOv8Detector(
+                        model_name="yolov8m.pt",  # YOLOv8m pre-trained on COCO
+                        conf_threshold=0.25,
+                        target_class=7,  # COCO class 7 = truck
+                        device=None  # Auto-detect device
+                    )
+                    detections = detector.detect(image)
+                except Exception as det_error:
+                    print(f"YOLOv8 detection failed: {det_error}")
+                    print("Falling back to full image OCR...")
+                    detections = []
                     
                     if detections:
                         print(f"Found {len(detections)} trailer detection(s)")
@@ -209,10 +145,8 @@ def test_easyocr(image_path: str, use_detection: bool = False, force_cpu: bool =
                             }
                     else:
                         print("No detections found, testing on full image...")
-                else:
-                    print(f"YOLO detector not found at {detector_path}, testing on full image...")
             except Exception as e:
-                print(f"YOLO detection initialization failed: {e}")
+                print(f"YOLOv8 detection initialization failed: {e}")
                 print("Falling back to full image OCR...")
             
             # If no detections were found, fall through to full image processing
