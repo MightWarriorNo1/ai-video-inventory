@@ -7,6 +7,7 @@ Processes uploaded video files using the same pipeline as live camera feeds.
 import cv2
 import numpy as np
 import re
+import os
 from typing import Dict, List, Optional, Generator, Tuple
 from datetime import datetime
 import threading
@@ -70,7 +71,21 @@ class VideoProcessor:
         # Store OCR results per unique track - collect ALL results, then consolidate
         self.track_ocr_results = {}  # track_key -> list of {text, conf, frame}
         
+        # Two-stage processing: Save cropped trailers for batch OCR
+        self.save_crops = True  # Enable crop saving mode
+        self.crops_dir = None  # Will be set per video
+        self.saved_crops = []  # List of saved crop metadata: [{crop_path, frame_count, track_id, bbox, ...}]
+        self.crop_counter = 0  # Counter for unique crop filenames
+        self.crop_deduplication = {}  # track_key -> crop_path (ONE crop per unique physical trailer)
+        
         # Position clustering: group nearby positions (within 5m) as the same physical location
+        # This handles slight movement and position variance
+        # Increased tolerance to better handle trailers parked close together
+        self.position_clusters = {}  # cluster_id -> {center_x, center_y, count, positions: [(x, y), ...]}
+        self.next_cluster_id = 1
+    
+        # Last detected nearest trailer (for persistent display)
+        self.last_nearest_trailer = None  # {bbox, track_id, conf, text, ocr_conf}
     
     def _cleanup_gpu_memory(self):
         """
@@ -93,13 +108,6 @@ class VideoProcessor:
             except Exception:
                 # Silently fail - don't interrupt video processing
                 pass
-        # This handles slight movement and position variance
-        # Increased tolerance to better handle trailers parked close together
-        self.position_clusters = {}  # cluster_id -> {center_x, center_y, count, positions: [(x, y), ...]}
-        self.next_cluster_id = 1
-    
-        # Last detected nearest trailer (for persistent display)
-        self.last_nearest_trailer = None  # {bbox, track_id, conf, text, ocr_conf}
     
     def process_video(self, video_path: str, camera_id: str = "test-video", 
                      detect_every_n: int = 5) -> Generator[Tuple[int, np.ndarray, List[Dict]], None, None]:
@@ -129,11 +137,24 @@ class VideoProcessor:
             self.next_cluster_id = 1
             # Reset OCR results tracking
             self.track_ocr_results = {}  # track_key -> list of {text, conf, frame}
+            
+            # Two-stage processing: Initialize crop saving
+            import os
+            from pathlib import Path
+            video_name = Path(video_path).stem
+            self.crops_dir = Path("out/crops") / camera_id / video_name
+            self.crops_dir.mkdir(parents=True, exist_ok=True)
+            self.saved_crops = []
+            self.crop_counter = 0
+            self.crop_deduplication = {}  # track_key -> crop_path (ONE crop per unique physical trailer)
+            print(f"[VideoProcessor] Crop directory: {self.crops_dir}")
+            
             self.stats = {
                 'frames_processed': 0,
                 'detections': 0,
                 'tracks': 0,
-                'ocr_results': 0
+                'ocr_results': 0,
+                'crops_saved': 0
             }
         
         try:
@@ -166,7 +187,17 @@ class VideoProcessor:
                 detections = []
                 try:
                     if self.detector and frame_count % detect_every_n == 0:
-                        detections = self.detector.detect(frame)
+                        all_detections = self.detector.detect(frame)
+                        
+                        # Filter out very low confidence detections before tracking
+                        # This prevents false positive tracks from low-quality detections
+                        MIN_DETECTION_CONFIDENCE = 0.10  # Minimum confidence to create a track
+                        detections = [d for d in all_detections if d.get('conf', 0.0) >= MIN_DETECTION_CONFIDENCE]
+                        
+                        filtered_low_conf = len(all_detections) - len(detections)
+                        if filtered_low_conf > 0:
+                            print(f"[VideoProcessor] Frame {frame_count}: Filtered {filtered_low_conf} low-confidence detections (< {MIN_DETECTION_CONFIDENCE})")
+                        
                         with self.lock:
                             self.stats['detections'] += len(detections)
                         if len(detections) > 0:
@@ -189,7 +220,7 @@ class VideoProcessor:
                     MIN_TRAILER_WIDTH = 80    # Reduced from 150 - allow smaller detections
                     MIN_TRAILER_HEIGHT = 30   # Reduced from 50 - allow shorter detections
                     MIN_AREA = 2400           # Reduced from 10000 (80*30 = 2400)
-                    MIN_ASPECT_RATIO = 0.5    # More lenient - allow both wide and tall
+                    MIN_ASPECT_RATIO = 0.15   # More lenient - allow very tall/narrow trailers (was 0.5)
                     MAX_ASPECT_RATIO = 10.0   # More lenient - allow very wide or tall
                     
                     filtered_tracks = []
@@ -219,6 +250,10 @@ class VideoProcessor:
                         print(f"[VideoProcessor] Frame {frame_count}: {len(filtered_tracks)}/{len(tracks)} tracks passed filter ({filtered_count} filtered out)")
                     
                     tracks = filtered_tracks
+                    
+                    # Additional deduplication: Merge tracks with very high IoU (likely same trailer)
+                    # This helps catch cases where ByteTrack creates duplicate tracks for the same trailer
+                    tracks = self._deduplicate_overlapping_tracks(tracks, frame_count)
                     
                     # Count unique tracks (track_id + spot combination) - don't count per frame
                     # We'll count unique tracks when events are created
@@ -257,50 +292,47 @@ class VideoProcessor:
                         if x2 <= x1 or y2 <= y1:
                             continue
                         
-                        # Refine bounding box to rear face (focus on back side only)
-                        # Rear face is typically in the center portion for wide detections
-                        orig_width = x2 - x1
-                        orig_height = y2 - y1
-                        orig_aspect = orig_width / orig_height if orig_height > 0 else 1.0
-                        
-                        # Store original bbox for OCR (we'll use refined bbox for display)
+                        # Store original bbox (which is the full YOLO detection)
+                        # This is the HIGH QUALITY bbox from YOLO that captures the whole trailer backside
                         orig_x1, orig_y1, orig_x2, orig_y2 = x1, y1, x2, y2
                         
-                        # If aspect ratio suggests side view (wide), extract center portion for rear face
-                        if orig_aspect > 1.5:  # Wide detection (side view)
-                            center_x = (x1 + x2) / 2.0
-                            rear_width_ratio = 0.65  # Use 65% of width for rear face (centered)
-                            rear_width = int(orig_width * rear_width_ratio)
-                            rear_x1 = int(center_x - rear_width / 2)
-                            rear_x2 = int(center_x + rear_width / 2)
-                            # Keep full height
-                            rear_y1 = y1
-                            rear_y2 = y2
-                            
-                            # Clip to frame bounds
-                            h, w = processed_frame.shape[:2]
-                            rear_x1 = max(0, min(rear_x1, w - 1))
-                            rear_x2 = max(rear_x1 + 1, min(rear_x2, w - 1))
-                            rear_y1 = max(0, min(rear_y1, h - 1))
-                            rear_y2 = max(rear_y1 + 1, min(rear_y2, h - 1))
-                            
-                            # Use refined coordinates for display (rear face)
-                            x1, y1, x2, y2 = rear_x1, rear_y1, rear_x2, rear_y2
-                        # For narrow/tall detections (front/back view), use original bbox
+                        # For DISPLAY: Clip bbox to frame boundaries (to prevent drawing errors)
+                        # But for CROPS: Use original bbox to preserve full quality
+                        frame_height, frame_width = frame.shape[:2]
+                        display_x1 = max(0, min(x1, frame_width - 1))
+                        display_y1 = max(0, min(y1, frame_height - 1))
+                        display_x2 = max(display_x1 + 1, min(x2, frame_width))
+                        display_y2 = max(display_y1 + 1, min(y2, frame_height))
                         
-                        # Calculate trailer dimensions (using refined bbox)
-                        width = x2 - x1
-                        height = y2 - y1
+                        # Re-validate display bbox after clipping
+                        if display_x2 <= display_x1 or display_y2 <= display_y1:
+                            continue
                         
-                        # Draw green bounding box for ALL trailers (rear face)
+                        # For CROPS: Use original YOLO bbox (full quality, captures whole trailer)
+                        # Only clip crop bbox if it's completely outside frame (to prevent errors)
+                        crop_x1 = max(0, orig_x1)  # Only clip negative values
+                        crop_y1 = max(0, orig_y1)  # Only clip negative values
+                        crop_x2 = min(orig_x2, frame_width)  # Only clip if exceeds frame
+                        crop_y2 = min(orig_y2, frame_height)  # Only clip if exceeds frame
+                        
+                        # Validate crop bbox
+                        if crop_x2 <= crop_x1 or crop_y2 <= crop_y1:
+                            continue
+                        
+                        # Calculate trailer dimensions (using original bbox for accuracy)
+                        width = orig_x2 - orig_x1
+                        height = orig_y2 - orig_y1
+                        
+                        # Draw green bounding box for ALL trailers (full YOLO detection)
                         is_nearest = (track_id == nearest_track_id)
                         
                         # Draw bounding box in green for detected trailer rear face (thicker for better visibility)
-                        cv2.rectangle(processed_frame, (x1, y1), (x2, y2), (0, 255, 0), 3)
+                        # Use display bbox (clipped) for drawing to prevent drawing errors
+                        cv2.rectangle(processed_frame, (display_x1, display_y1), (display_x2, display_y2), (0, 255, 0), 3)
                             
                         # Draw semi-transparent green overlay on the bounding box (for all trailers)
                         overlay = processed_frame.copy()
-                        cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 255, 0), -1)
+                        cv2.rectangle(overlay, (display_x1, display_y1), (display_x2, display_y2), (0, 255, 0), -1)
                         cv2.addWeighted(overlay, 0.1, processed_frame, 0.9, 0, processed_frame)
                         
                         # Draw detection confidence and track ID above the box
@@ -312,8 +344,8 @@ class VideoProcessor:
                         text_size = cv2.getTextSize(conf_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
                         
                         # Draw black background for text
-                        text_x = x1
-                        text_y = max(y1 - 10, 20)
+                        text_x = display_x1
+                        text_y = max(display_y1 - 10, 20)
                         cv2.rectangle(processed_frame, 
                                      (text_x - 2, text_y - text_size[1] - 2), 
                                      (text_x + text_size[0] + 2, text_y + 2),
@@ -341,11 +373,12 @@ class VideoProcessor:
                         
                         # Project to world coordinates and resolve spot FIRST (before OCR)
                         # We need spot to identify unique physical trailers
+                        # Use original bbox center for more accurate world coordinates
                         world_coords = None
                         if self.homography is not None:
                             try:
-                                center_x = (x1 + x2) / 2.0
-                                center_y = (y1 + y2) / 2.0
+                                center_x = (orig_x1 + orig_x2) / 2.0
+                                center_y = (orig_y1 + orig_y2) / 2.0
                                 point = np.array([[center_x, center_y]], dtype=np.float32)
                                 point = np.array([point])
                                 projected = cv2.perspectiveTransform(point, self.homography)
@@ -371,10 +404,10 @@ class VideoProcessor:
                         if spot != "unknown" and world_coords:
                             x_world, y_world = world_coords
                             
-                            # Find or create position cluster (5m tolerance for grouping nearby positions)
-                            # Increased from 3m to better handle trailers parked close together
+                            # Find or create position cluster (tolerance for grouping nearby positions)
+                            # Use 5m tolerance to group detections of the same trailer while keeping different trailers separate
                             cluster_id = None
-                            CLUSTER_TOLERANCE = 5.0  # 5 meters
+                            CLUSTER_TOLERANCE = 5.0  # 5 meters - balance between grouping same trailer and separating different trailers
                             
                             for cid, cluster in self.position_clusters.items():
                                 # Check if this position is within tolerance of cluster center
@@ -402,279 +435,258 @@ class VideoProcessor:
                                     'positions': [(x_world, y_world)]
                                 }
                             
-                            # Use spot + cluster_id as unique identifier
-                            track_key = f"{spot}_cluster_{cluster_id}"
+                            # Use spot + cluster_id + track_id as unique identifier
+                            # Including track_id helps distinguish different trailers in the same spot/cluster
+                            # Clusters are merged incrementally (every 30 frames), so cluster_id
+                            # should already reflect merged clusters by the time we save crops
+                            # track_id helps prevent different trailers from sharing the same crop
+                            track_key = f"{spot}_cluster_{cluster_id}_track_{track_id}"
                         elif spot != "unknown":
-                            # Use spot only if position unavailable
-                            track_key = spot
+                            # Use spot + track_id if position unavailable
+                            track_key = f"{spot}_track_{track_id}"
                         else:
                             # Fallback to track_id if spot is unknown
                             track_key = f"track_{track_id}"
                         
-                        # Set OCR cache key to match track_key
-                        ocr_cache_key = track_key
+                        # TWO-STAGE APPROACH: Save cropped trailers for batch OCR (no inline OCR)
+                        # Stage 1: Save crops during video processing (fast)
+                        # Stage 2: Run OCR on saved crops after video processing (batch)
                         
-                        # Check if we've already run OCR for this unique trailer
-                        # We'll collect ALL OCR results per track, then consolidate at the end
                         text = ""
                         conf_ocr = 0.0
-                        ocr_already_done = False
                         
-                        # Check if we've already run OCR for this track in this frame
-                        # (to avoid running OCR multiple times for the same track in the same frame)
-                        with self.lock:
-                            if ocr_cache_key in self.track_ocr_results:
-                                # Check if we've already run OCR for this track in this frame
-                                ocr_results_list = self.track_ocr_results[ocr_cache_key]
-                                if isinstance(ocr_results_list, list) and len(ocr_results_list) > 0:
-                                    # Check if we already have a result for this frame
-                                    frame_results = [r for r in ocr_results_list if r.get('frame') == frame_count]
-                                    if frame_results:
-                                        ocr_already_done = True
-                                        # Use the most recent result for this frame
-                                        text = frame_results[-1]['text']
-                                        conf_ocr = frame_results[-1]['conf']
+                        # Crop the trailer region using ORIGINAL YOLO bbox (full quality)
+                        # This ensures we capture the complete trailer backside with maximum quality
+                        # Only minimal clipping applied to prevent out-of-bounds errors
+                        crop = frame[crop_y1:crop_y2, crop_x1:crop_x2]
+                        if crop.size == 0:
+                            continue
                         
-                        if not ocr_already_done:
-                            # Multi-region OCR: Trailer text can appear in different locations
-                            # (top - company name/ID, middle - branding, bottom - license plate/numbers)
-                            # We'll scan multiple horizontal bands and combine results
-                            # Use refined rear face bbox for OCR (where text actually appears)
-                            h, w = frame.shape[:2]
+                        # OPTIMIZATION: Deduplication - save ONLY ONE crop per unique physical trailer
+                        # We crop tracks (after ByteTrack), not detections
+                        # Example: 103 detections → 4 unique trailers → 4 crops (one per unique trailer)
+                        # Uses track_key (spot + cluster) for deduplication, not track_id (which can change)
+                        import hashlib
+                        # Use original bbox for hash to maintain consistency
+                        bbox_hash = hashlib.md5(f"{orig_x1}_{orig_y1}_{orig_x2}_{orig_y2}_{width}_{height}".encode()).hexdigest()[:8]
+                        
+                        # Check if we've already saved a crop for this track_key (unique physical trailer)
+                        # track_key is stable (spot + cluster), unlike track_id which can change
+                        # This ensures we only save ONE crop per unique physical trailer
+                        # 
+                        # Important: Before saving, check if this cluster was merged into another.
+                        # If merged, use the merged cluster's track_key to avoid saving duplicate crops.
+                        should_save_crop = True
+                        
+                        # Resolve to final merged track_key (if cluster was merged)
+                        # This ensures we only save one crop per final merged cluster
+                        # However, we still want to preserve track_id to distinguish different trailers
+                        final_track_key = track_key
+                        if "_cluster_" in track_key:
+                            # Check if this cluster_id still exists (hasn't been merged)
+                            if cluster_id not in self.position_clusters:
+                                # Cluster was merged - find the merged cluster's track_key
+                                # But preserve track_id to distinguish different trailers
+                                merged_base_key = self._resolve_final_track_key(spot, cluster_id)
+                                # Extract track_id from original track_key and append to merged key
+                                if "_track_" in track_key:
+                                    track_id_part = track_key.split("_track_")[-1]
+                                    final_track_key = f"{merged_base_key.split('_track_')[0]}_track_{track_id_part}"
+                                else:
+                                    final_track_key = merged_base_key
+                        
+                        # CRITICAL: Deduplicate crops by cluster_id (not track_id) to ensure one crop per physical trailer
+                        # ByteTrack creates different track_ids for the same trailer, so we use cluster_id for deduplication
+                        cluster_key = None
+                        if cluster_id is not None:
+                            cluster_key = f"{spot}_cluster_{cluster_id}"  # Base key without track_id
+                        
+                        # Check if we already have a crop for this cluster (regardless of track_id)
+                        # We'll check later if we should replace it with a better crop
+                        if cluster_key and cluster_key in self.crop_deduplication:
+                            # Crop exists - we'll check if this one is better later
+                            pass
+                        
+                        if cluster_key:
+                            # Only save crops for "stable" clusters (seen multiple times)
+                            # This prevents saving crops for one-off detections that create new clusters
+                            # A cluster is considered stable if it has been seen at least 2 times
+                            # Lowered from 3 to 2 to ensure all valid clusters (count >= 2) get crops
+                            MIN_CLUSTER_COUNT_FOR_CROP = 2
                             
-                            # Use refined rear face dimensions for OCR regions
-                            bbox_width = x2 - x1
-                            bbox_height = y2 - y1
-                            
-                            # Define multiple crop regions to scan (within rear face area)
-                            crop_regions = []
-                            
-                            # Region 1: Full rear face (90% with 5% margins)
-                            full_x1 = int(x1 + bbox_width * 0.05)
-                            full_x2 = int(x2 - bbox_width * 0.05)
-                            full_y1 = int(y1 + bbox_height * 0.05)
-                            full_y2 = int(y2 - bbox_height * 0.05)
-                            crop_regions.append(('full', full_x1, full_y1, full_x2, full_y2))
-                            
-                            # Region 2: Top third of rear face (where company names often appear)
-                            top_x1 = int(x1 + bbox_width * 0.05)
-                            top_x2 = int(x2 - bbox_width * 0.05)
-                            top_y1 = int(y1 + bbox_height * 0.05)
-                            top_y2 = int(y1 + bbox_height * 0.40)  # Top 35% of rear face
-                            crop_regions.append(('top', top_x1, top_y1, top_x2, top_y2))
-                            
-                            # Region 3: Bottom third of rear face (where numbers/license plates often appear)
-                            bot_x1 = int(x1 + bbox_width * 0.05)
-                            bot_x2 = int(x2 - bbox_width * 0.05)
-                            bot_y1 = int(y1 + bbox_height * 0.60)  # Bottom 40% of rear face
-                            bot_y2 = int(y2 - bbox_height * 0.05)
-                            crop_regions.append(('bottom', bot_x1, bot_y1, bot_x2, bot_y2))
-                            
-                            # Debug: print crop regions for nearest trailer
-                            if is_nearest and frame_count % 10 == 0:
-                                print(f"[VideoProcessor] Frame {frame_count}, Track {track_id}: Crop regions defined")
-                                print(f"  Bbox: ({x1}, {y1}) to ({x2}, {y2}), size: {bbox_width}x{bbox_height}")
-                                for rname, rx1, ry1, rx2, ry2 in crop_regions:
-                                    print(f"  Region '{rname}': ({rx1}, {ry1}) to ({rx2}, {ry2})")
-                            
-                            # Draw OCR region indicators for nearest trailer (ALWAYS draw for debugging)
-                            if is_nearest:
-                                # Draw all crop regions in different colors for debugging
-                                for region_name, rx1, ry1, rx2, ry2 in crop_regions:
-                                    # Ensure coordinates are within bounds
-                                    rx1 = max(0, min(rx1, w - 1))
-                                    ry1 = max(0, min(ry1, h - 1))
-                                    rx2 = max(rx1 + 1, min(rx2, w))
-                                    ry2 = max(ry1 + 1, min(ry2, h))
-                                    
-                                    # Color coding: full=yellow, top=cyan, bottom=magenta
-                                    if region_name == 'full':
-                                        color = (0, 255, 255)  # Yellow
-                                    elif region_name == 'top':
-                                        color = (255, 255, 0)  # Cyan
-                                    else:
-                                        color = (255, 0, 255)  # Magenta
-                                    
-                                    cv2.rectangle(processed_frame, (rx1, ry1), (rx2, ry2), color, 2)  # Thicker for visibility
-                            
-                            # Run OCR on multiple regions with preprocessing pipeline
-                            # This ensures we capture text that appears in different locations on the trailer
-                            if not self.ocr:
-                                if frame_count % 50 == 0:  # Log occasionally
-                                    print(f"[VideoProcessor] WARNING: OCR engine is not initialized!")
+                            # Check stability using the ORIGINAL cluster_id (the one that was just updated)
+                            # This is the cluster that actually exists and has the current count
+                            if cluster_id in self.position_clusters:
+                                cluster_info = self.position_clusters[cluster_id]
+                                cluster_count = cluster_info.get('count', 0)
+                                if cluster_count < MIN_CLUSTER_COUNT_FOR_CROP:
+                                    # Cluster not stable yet - skip saving crop
+                                    should_save_crop = False
+                                    # Always log stability skips (not just every 30 frames) for debugging
+                                    print(f"[VideoProcessor] Frame {frame_count}: Skipping crop for {track_key} (track_id={track_id}, cluster_id={cluster_id}) - cluster not stable yet (count={cluster_count} < {MIN_CLUSTER_COUNT_FOR_CROP})")
                             else:
-                                # Run OCR for this unique trailer (by spot)
-                                if frame_count % 10 == 0:
-                                    print(f"[VideoProcessor] Frame {frame_count}, Track {track_id}: Starting OCR on {len(crop_regions)} regions (spot: {spot})")
-                                try:
-                                    all_ocr_results = []  # Store results from all regions and strategies
-                                    
-                                    # Process each crop region
-                                    for region_name, rx1, ry1, rx2, ry2 in crop_regions:
-                                        # Ensure coordinates are within bounds
-                                        rx1 = max(0, min(rx1, w - 1))
-                                        ry1 = max(0, min(ry1, h - 1))
-                                        rx2 = max(rx1 + 1, min(rx2, w))
-                                        ry2 = max(ry1 + 1, min(ry2, h))
-                                        
-                                        crop = frame[ry1:ry2, rx1:rx2]
-                                        
-                                        # Skip if crop is too small to contain readable text
-                                        # Text needs to be at least 20px tall and 40px wide to be readable
-                                        if crop.size == 0 or crop.shape[0] < 20 or crop.shape[1] < 40:
-                                            continue
-                                        
-                                        # Check if crop has sufficient contrast (text needs contrast to be readable)
-                                        if len(crop.shape) == 3:
-                                            crop_gray_check = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-                                        else:
-                                            crop_gray_check = crop
-                                        std_dev = np.std(crop_gray_check)
-                                        # Skip if image is too uniform (no text/features)
-                                        if std_dev < 10:  # Very low contrast - likely no text
-                                            continue
-                                        
-                                        # Use ImagePreprocessor if available, otherwise fallback to manual preprocessing
-                                        if self.preprocessor and self.preprocessor.enable_ocr_preprocessing:
-                                            # Get multiple preprocessed versions using ImagePreprocessor
-                                            preprocessed_crops = self.preprocessor.preprocess_for_ocr(crop)
-                                            
-                                            # Try OCR on each preprocessed version
-                                            for prep in preprocessed_crops:
-                                                try:
-                                                    result = self.ocr.recognize(prep['image'])
-                                                    if result.get('text', '').strip():
-                                                        all_ocr_results.append({
-                                                            'text': result.get('text', ''),
-                                                            'conf': result.get('conf', 0.0),
-                                                            'method': f'{region_name}-{prep["method"]}',
-                                                            'region': region_name
-                                                        })
-                                                    # Clean GPU memory after each OCR call
-                                                    self._cleanup_gpu_memory()
-                                                except Exception as e:
-                                                    if frame_count % 50 == 0:
-                                                        print(f"[VideoProcessor] OCR error with {prep['method']}: {e}")
-                                                    # Clean GPU memory even on error
-                                                    self._cleanup_gpu_memory()
-                                        else:
-                                            # Fallback: Try original crop without preprocessing
-                                            try:
-                                                result = self.ocr.recognize(crop)
-                                                if result.get('text', '').strip():
-                                                    all_ocr_results.append({
-                                                        'text': result.get('text', ''),
-                                                        'conf': result.get('conf', 0.0),
-                                                        'method': f'{region_name}-original',
-                                                        'region': region_name
-                                                    })
-                                                # Clean GPU memory after OCR call
-                                                self._cleanup_gpu_memory()
-                                            except Exception as e:
-                                                if frame_count % 50 == 0:
-                                                    print(f"[VideoProcessor] OCR fallback failed: {e}")
-                                                # Clean GPU memory even on error
-                                                self._cleanup_gpu_memory()
-                                    
-                                    # Final GPU memory cleanup after all OCR attempts for this track
-                                    self._cleanup_gpu_memory()
-                                    
-                                    # Select best OCR result using preprocessor's selection method
-                                    if all_ocr_results:
-                                        if self.preprocessor:
-                                            # Use preprocessor's intelligent result selection
-                                            best_result = self.preprocessor.select_best_ocr_result(all_ocr_results)
-                                            text = best_result['text']
-                                            conf_ocr = best_result['conf']
-                                            ocr_method = best_result.get('method', 'unknown')
-                                        else:
-                                            # Fallback: simple selection by confidence
-                                            best_result = max(all_ocr_results, key=lambda x: x.get('conf', 0.0))
-                                            text = best_result.get('text', '')
-                                            conf_ocr = best_result.get('conf', 0.0)
-                                            ocr_method = best_result.get('method', 'unknown')
-                                        
-                                        if frame_count % 10 == 0:
-                                            print(f"[VideoProcessor] Frame {frame_count}, Track {track_id}: Best OCR '{text}' (conf: {conf_ocr:.3f}, method: {ocr_method})")
-                                    else:
-                                        text = ""
-                                        conf_ocr = 0.0
-                                        ocr_method = "none"
-                                    
-                                    # Accept OCR results if we have text
-                                    if text and len(text.strip()) >= 1:
-                                        with self.lock:
-                                            self.stats['ocr_results'] += 1
-                                            # Store OCR result in list (collect ALL results per track)
-                                            if ocr_cache_key not in self.track_ocr_results:
-                                                self.track_ocr_results[ocr_cache_key] = []
-                                            self.track_ocr_results[ocr_cache_key].append({
-                                                'text': text,
-                                                'conf': conf_ocr,
-                                                'frame': frame_count
-                                            })
-                                        print(f"[VideoProcessor] Frame {frame_count}, Track {track_id}: OCR ACCEPTED '{text}' (conf: {conf_ocr:.3f}) for {ocr_cache_key}")
-                                    else:
-                                        if frame_count % 10 == 0:
-                                            print(f"[VideoProcessor] Frame {frame_count}, Track {track_id}: No valid OCR result (all attempts failed)")
-                                        text = ""
-                                        conf_ocr = 0.0
-                                        # Store empty result to avoid re-running OCR (use same key as cache check)
-                                        with self.lock:
-                                            if ocr_cache_key not in self.track_ocr_results:
-                                                self.track_ocr_results[ocr_cache_key] = []
-                                            self.track_ocr_results[ocr_cache_key].append({
-                                                'text': '',
-                                                'conf': 0.0,
-                                                'frame': frame_count
-                                            })
-                                except Exception as e:
-                                    print(f"[VideoProcessor] Error in OCR at frame {frame_count}, track {track_id}: {e}")
-                                    import traceback
-                                    traceback.print_exc()
-                                    # Store empty result to avoid re-running OCR (use same key as cache check)
-                                    with self.lock:
-                                        if ocr_cache_key not in self.track_ocr_results:
-                                            self.track_ocr_results[ocr_cache_key] = []
-                                        self.track_ocr_results[ocr_cache_key].append({
-                                            'text': '',
-                                            'conf': 0.0,
-                                            'frame': frame_count
-                                        })
-                                
-                                # Note: OCR text will be drawn below for all tracks
+                                # Cluster doesn't exist (was merged) - skip saving
+                                should_save_crop = False
+                                if frame_count % 30 == 0:
+                                    print(f"[VideoProcessor] Frame {frame_count}: Skipping crop for {track_key} (track_id={track_id}, cluster_id={cluster_id}) - cluster was merged")
+                        else:
+                            # No cluster_id means no world_coords or spot unknown - skip saving
+                            should_save_crop = False
+                            if frame_count % 30 == 0:
+                                print(f"[VideoProcessor] Frame {frame_count}: Skipping crop for {track_key} (track_id={track_id}) - no cluster_id (missing world_coords or spot)")
                         
-                        # Draw OCR text in red for ALL tracks (whether OCR was just run or done earlier)
-                        if text:
-                            ocr_conf_percent = conf_ocr * 100.0
-                            ocr_text = f"TEXT: {text}"
-                            ocr_conf_text = f"Conf: {ocr_conf_percent:.1f}%"
+                        # Filter out narrow/partial crops - only save full backside crops
+                        # Minimum requirements for a good crop (full trailer backside)
+                        MIN_CROP_WIDTH = 200   # Minimum width for full backside (was allowing 80-100px narrow slices)
+                        MIN_CROP_HEIGHT = 150  # Minimum height for full backside
+                        MIN_CROP_AREA = 30000  # Minimum area (200*150 = 30000)
+                        
+                        if should_save_crop:
+                            # Check crop size requirements
+                            if width < MIN_CROP_WIDTH or height < MIN_CROP_HEIGHT or (width * height) < MIN_CROP_AREA:
+                                should_save_crop = False
+                                if frame_count % 30 == 0:
+                                    print(f"[VideoProcessor] Frame {frame_count}: Skipping crop for {track_key} (track_id={track_id}) - crop too small ({width}x{height}, area={width*height}) - need at least {MIN_CROP_WIDTH}x{MIN_CROP_HEIGHT} (area={MIN_CROP_AREA})")
                             
-                            # Position text below the bounding box
-                            h, w = processed_frame.shape[:2]
-                            text_y = min(y2 + 30, h - 30)
+                            # Check if crop is significantly clipped (partial trailer near edge)
+                            # Calculate how much of the original bbox is visible in the crop
+                            original_width = orig_x2 - orig_x1
+                            original_height = orig_y2 - orig_y1
+                            original_area = original_width * original_height
                             
-                            # Draw OCR text with black background for better visibility
-                            ocr_text_size = cv2.getTextSize(ocr_text, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
-                            cv2.rectangle(processed_frame,
-                                         (x1 - 2, text_y - ocr_text_size[1] - 2),
-                                         (x1 + ocr_text_size[0] + 2, text_y + 2),
-                                         (0, 0, 0), -1)
+                            crop_width = crop_x2 - crop_x1
+                            crop_height = crop_y2 - crop_y1
+                            crop_area = crop_width * crop_height
                             
-                            # Draw OCR text in red
-                            cv2.putText(processed_frame, ocr_text, (x1, text_y),
-                                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-                            
-                            # Draw confidence below OCR text
-                            conf_y = text_y + 20
-                            ocr_conf_size = cv2.getTextSize(ocr_conf_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
-                            cv2.rectangle(processed_frame,
-                                         (x1 - 2, conf_y - ocr_conf_size[1] - 2),
-                                         (x1 + ocr_conf_size[0] + 2, conf_y + 2),
-                                         (0, 0, 0), -1)
-                            
-                            cv2.putText(processed_frame, ocr_conf_text, (x1, conf_y),
-                                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                            if original_area > 0:
+                                visible_ratio = crop_area / original_area
+                                # Require at least 90% of the original bbox to be visible (not clipped)
+                                # Increased from 85% to 90% to be more strict about partial crops
+                                # This ensures we only save full backside crops, not partial ones
+                                MIN_VISIBLE_RATIO = 0.90
+                                
+                                # Also check if dimensions are significantly reduced (indicates clipping)
+                                width_ratio = crop_width / original_width if original_width > 0 else 1.0
+                                height_ratio = crop_height / original_height if original_height > 0 else 1.0
+                                
+                                # Check aspect ratio - trailer backsides should be roughly square or taller than wide
+                                # Very wide crops (aspect ratio > 1.8) are likely placards or partial views
+                                aspect_ratio = crop_width / crop_height if crop_height > 0 else 0
+                                MAX_ASPECT_RATIO = 1.8  # Reject crops wider than 1.8:1 (trailer backsides are typically < 1.5:1)
+                                
+                                if visible_ratio < MIN_VISIBLE_RATIO or width_ratio < MIN_VISIBLE_RATIO or height_ratio < MIN_VISIBLE_RATIO:
+                                    should_save_crop = False
+                                    if frame_count % 30 == 0:
+                                        print(f"[VideoProcessor] Frame {frame_count}: Skipping crop for {track_key} (track_id={track_id}) - crop is partially clipped (visible={visible_ratio:.1%}, width={width_ratio:.1%}, height={height_ratio:.1%}, original={original_width}x{original_height}, crop={crop_width}x{crop_height})")
+                                elif aspect_ratio > MAX_ASPECT_RATIO:
+                                    should_save_crop = False
+                                    if frame_count % 30 == 0:
+                                        print(f"[VideoProcessor] Frame {frame_count}: Skipping crop for {track_key} (track_id={track_id}) - crop is too wide (aspect={aspect_ratio:.2f} > {MAX_ASPECT_RATIO}, size={crop_width}x{crop_height}) - likely placard or partial view")
+                        
+                        if should_save_crop and cluster_key:
+                            # Use cluster_key (without track_id) for deduplication
+                            # This ensures only one crop per physical trailer (cluster)
+                            track_key = cluster_key
+                        
+                        # Save crop if it's a new unique trailer and save_crops is enabled
+                        if should_save_crop and self.save_crops:
+                            try:
+                                # CRITICAL: Don't save if crop already exists for this cluster (unless significantly better)
+                                # This prevents multiple crops for the same trailer
+                                if cluster_key and cluster_key in self.crop_deduplication:
+                                    # Find existing crop metadata
+                                    existing_crop = None
+                                    for crop_meta in self.saved_crops:
+                                        if crop_meta.get('track_key') == cluster_key:
+                                            existing_crop = crop_meta
+                                            break
+                                    
+                                    if existing_crop:
+                                        existing_area = existing_crop.get('width', 0) * existing_crop.get('height', 0)
+                                        existing_conf = existing_crop.get('det_conf', 0.0)
+                                        current_area = width * height
+                                        
+                                        # Only replace if current crop is significantly better (larger area or much higher confidence)
+                                        # Prefer larger area (full backside) over slightly higher confidence
+                                        replace_existing = False
+                                        if current_area > existing_area * 1.2:  # 20% larger
+                                            replace_existing = True
+                                        elif current_area >= existing_area * 0.9 and det_conf > existing_conf + 0.15:  # Similar size but much higher confidence
+                                            replace_existing = True
+                                        
+                                        if replace_existing:
+                                            # Remove old crop file
+                                            old_crop_path = self.crop_deduplication[cluster_key]
+                                            if os.path.exists(old_crop_path):
+                                                try:
+                                                    os.remove(old_crop_path)
+                                                    print(f"[VideoProcessor] Frame {frame_count}: Replacing crop for {cluster_key} with better quality crop (existing: {existing_area}px²@{existing_conf:.2f}, current: {current_area}px²@{det_conf:.2f})")
+                                                except Exception as e:
+                                                    print(f"[VideoProcessor] Error removing old crop {old_crop_path}: {e}")
+                                            
+                                            # Remove old metadata
+                                            self.saved_crops = [c for c in self.saved_crops if c.get('track_key') != cluster_key]
+                                            # Remove from crop_deduplication (will be re-added below)
+                                            del self.crop_deduplication[cluster_key]
+                                        else:
+                                            # Crop already exists and new one isn't better - skip saving
+                                            should_save_crop = False
+                                            if frame_count % 30 == 0:
+                                                print(f"[VideoProcessor] Frame {frame_count}: Skipping crop for {cluster_key} - crop already exists (existing: {existing_area}px²@{existing_conf:.2f}, current: {current_area}px²@{det_conf:.2f})")
+                                
+                                if not should_save_crop:
+                                    # Skip saving - crop already exists or not better
+                                    continue
+                                
+                                self.crop_counter += 1
+                                crop_filename = f"crop_{frame_count:06d}_track{track_id:03d}_{bbox_hash}.jpg"
+                                crop_path = self.crops_dir / crop_filename
+                                
+                                # Save crop image
+                                cv2.imwrite(str(crop_path), crop)
+                                
+                                # Save metadata
+                                crop_metadata = {
+                                    'crop_path': str(crop_path),
+                                    'crop_filename': crop_filename,
+                                    'frame_count': frame_count,
+                                    'track_id': track_id,
+                                    'bbox': [crop_x1, crop_y1, crop_x2, crop_y2],  # Actual crop coordinates
+                                    'bbox_original': [orig_x1, orig_y1, orig_x2, orig_y2],  # Original YOLO bbox
+                                    'bbox_display': [display_x1, display_y1, display_x2, display_y2],  # Display bbox (clipped)
+                                    'det_conf': det_conf,
+                                    'width': width,
+                                    'height': height,
+                                    'area': width * height,  # Store area for comparison
+                                    'spot': spot,
+                                    'world_coords': world_coords,
+                                    'track_key': cluster_key,  # Use cluster_key (without track_id) for deduplication
+                                    'bbox_hash': bbox_hash,
+                                    'timestamp': datetime.utcnow().isoformat(),
+                                    'camera_id': camera_id
+                                }
+                                
+                                self.saved_crops.append(crop_metadata)
+                                # Store by cluster_key (spot + cluster_id) to ensure only ONE crop per physical trailer
+                                # This deduplicates crops even when ByteTrack creates different track_ids
+                                self.crop_deduplication[cluster_key] = str(crop_path)
+                                
+                                with self.lock:
+                                    self.stats['crops_saved'] += 1
+                                
+                                if frame_count % 30 == 0 or len(self.saved_crops) <= 10:
+                                    print(f"[VideoProcessor] Frame {frame_count}: Saved crop for {cluster_key} (track_id={track_id}, size={width}x{height}, area={width*height}, conf={det_conf:.2f}) -> {crop_filename} (total unique trailers: {len(self.crop_deduplication)})")
+                                    
+                            except Exception as e:
+                                print(f"[VideoProcessor] Error saving crop at frame {frame_count}: {e}")
+                        
+                        # TWO-STAGE APPROACH: Skip OCR during video processing (will be done in batch later)
+                        # Set empty OCR results for now - OCR will be done in Stage 2 (batch processing)
+                        text = ""
+                        conf_ocr = 0.0
+                        
+                        # Note: OCR text drawing is skipped during Stage 1 (no OCR results yet)
+                        # OCR results will be added in Stage 2 and can be matched back to detections
                         
                         # Create event with trailer size information
                         event = {
@@ -694,27 +706,9 @@ class VideoProcessor:
                             'method': method
                         }
                         
-                        # Get OCR result for this track (if available)
-                        # During processing, we use the most recent result
-                        # After consolidation, we use the consolidated result
-                        with self.lock:
-                            if ocr_cache_key in self.track_ocr_results:
-                                ocr_data = self.track_ocr_results[ocr_cache_key]
-                                
-                                # Check if it's a list (during processing) or dict (after consolidation)
-                                if isinstance(ocr_data, list) and len(ocr_data) > 0:
-                                    # During processing: use most recent non-empty result
-                                    non_empty_results = [r for r in ocr_data if r.get('text', '').strip()]
-                                    if non_empty_results:
-                                        latest_result = non_empty_results[-1]
-                                        text = latest_result['text']
-                                        conf_ocr = latest_result['conf']
-                                        if frame_count % 30 == 0:  # Log occasionally
-                                            print(f"[VideoProcessor] Frame {frame_count}, Track {track_id}: Using OCR for {ocr_cache_key}: '{text}' (conf: {conf_ocr:.3f})")
-                                elif isinstance(ocr_data, dict):
-                                    # After consolidation: use consolidated result
-                                    text = ocr_data.get('text', '')
-                                    conf_ocr = ocr_data.get('conf', 0.0)
+                        # TWO-STAGE: OCR results will be empty during Stage 1
+                        # OCR will be processed in Stage 2 (batch) and matched back using metadata
+                        # For now, text and conf_ocr remain empty (set above)
                         
                         with self.lock:
                             # Check if this is a new unique physical trailer (by spot)
@@ -737,17 +731,8 @@ class VideoProcessor:
                             if is_new_unique_track:
                                 # New unique physical trailer - always add
                                 should_add_event = True
-                            elif text and text.strip():  # OCR result available
-                                # Check if OCR text has changed from existing event
-                                if existing_event:
-                                    existing_text = existing_event.get('text', '').strip()
-                                    new_text = text.strip()
-                                    if existing_text != new_text:
-                                        # OCR text changed - update
-                                        should_add_event = True
-                                else:
-                                    # No existing event but we have text - add it
-                                    should_add_event = True
+                            # Note: OCR text checking is skipped in Stage 1 (no OCR results yet)
+                            # In Stage 2, OCR results can be matched back and events updated
                             
                             # Update unique tracks dictionary (keep latest event for each unique physical trailer)
                             # This always happens to keep the latest event
@@ -775,40 +760,22 @@ class VideoProcessor:
                         import traceback
                         traceback.print_exc()
                 
-                # Note: Green boxes are already drawn for all tracks in the loop above (lines 244-273)
-                # No need to draw persistent boxes here - all active tracks are already displayed
-                # (Removed orphaned drawing code that referenced undefined variables)
-                        
-                        # Position text below the bounding box
-                        text_y_pos = min(y2 + 30, h - 30)
-                        
-                        # Draw OCR text with black background
-                        ocr_text_size = cv2.getTextSize(ocr_text, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
-                        cv2.rectangle(processed_frame,
-                                     (x1 - 2, text_y_pos - ocr_text_size[1] - 2),
-                                     (x1 + ocr_text_size[0] + 2, text_y_pos + 2),
-                                     (0, 0, 0), -1)
-                        
-                        # Draw OCR text in red
-                        cv2.putText(processed_frame, ocr_text, (x1, text_y_pos),
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-                        
-                        # Draw confidence below OCR text
-                        conf_y = text_y_pos + 20
-                        ocr_conf_size = cv2.getTextSize(ocr_conf_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
-                        cv2.rectangle(processed_frame,
-                                     (x1 - 2, conf_y - ocr_conf_size[1] - 2),
-                                     (x1 + ocr_conf_size[0] + 2, conf_y + 2),
-                                     (0, 0, 0), -1)
-                        
-                        cv2.putText(processed_frame, ocr_conf_text, (x1, conf_y),
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                # Note: Green boxes are already drawn for all tracks in the loop above
+                # OCR text drawing is skipped during Stage 1 (no OCR results yet)
                 
                 # Store processed frame (always store, even if no detections)
                 # Store BEFORE yielding to ensure it's available immediately
                 with self.lock:
                     self.processed_frames[frame_count] = processed_frame.copy()
                     self.stats['frames_processed'] = frame_count + 1
+                
+                # Merge clusters periodically during processing (not just at the end)
+                # This ensures crop deduplication uses merged cluster IDs, matching final unique trailer count
+                # Merge every 30 frames to keep clusters up-to-date as we process
+                if frame_count > 0 and frame_count % 30 == 0:
+                    # Merge clusters incrementally so track_key uses final merged cluster IDs
+                    # This ensures we save crops based on merged clusters, matching final unique trailer count
+                    self._merge_nearby_clusters()
                 
                 # Print progress every 30 frames
                 if frame_count % 30 == 0:
@@ -828,6 +795,20 @@ class VideoProcessor:
             print(f"[VideoProcessor] Post-processing: Merging clusters and consolidating OCR...")
             self._merge_nearby_clusters()
             self._consolidate_ocr_results()
+            
+            # Clean up duplicate crops after merging (keep only crops for final merged clusters)
+            if self.save_crops:
+                self._cleanup_merged_crops()
+            
+            # Save crop metadata to JSON file for batch OCR processing
+            if self.save_crops and len(self.saved_crops) > 0:
+                import json
+                metadata_path = self.crops_dir / "crops_metadata.json"
+                with open(metadata_path, 'w') as f:
+                    json.dump(self.saved_crops, f, indent=2)
+                print(f"[VideoProcessor] Saved {len(self.saved_crops)} crop metadata to {metadata_path}")
+                print(f"[VideoProcessor] Crops directory: {self.crops_dir}")
+                print(f"[VideoProcessor] Ready for batch OCR processing")
             
             with self.lock:
                 final_stats = self.stats.copy()
@@ -851,6 +832,636 @@ class VideoProcessor:
                     self.processing = False
                     self.stop_flag = False
     
+    def _resolve_final_track_key(self, spot: str, cluster_id: int) -> str:
+        """
+        Resolve the final merged track_key base (without track_id) for a given spot and cluster_id.
+        If clusters have been merged, returns the base track_key with the final merged cluster ID.
+        Otherwise, returns the base track_key.
+        Note: This returns only the base (spot_cluster_id), track_id should be appended separately.
+        """
+        base_key = f"{spot}_cluster_{cluster_id}"
+        
+        # First, check if this cluster_id still exists in position_clusters
+        # If it exists, it hasn't been merged, so return the base track_key
+        if cluster_id in self.position_clusters:
+            return base_key
+        
+        # Cluster was merged (doesn't exist in position_clusters anymore)
+        # Find which cluster it merged into by checking unique_tracks or crop_deduplication
+        # Look for track_keys with the same spot that exist in position_clusters
+        # (these are the final merged clusters)
+        for existing_track_key in self.crop_deduplication.keys():
+            if existing_track_key.startswith(f"{spot}_cluster_"):
+                # Extract cluster_id from track_key (format: spot_cluster_id_track_trackid or spot_cluster_id)
+                parts = existing_track_key.split("_cluster_")
+                if len(parts) >= 2:
+                    try:
+                        # Extract cluster_id (may be followed by _track_)
+                        cluster_part = parts[1].split("_track_")[0]
+                        existing_cluster_id = int(cluster_part)
+                        # Check if this cluster_id still exists (it's the final merged cluster)
+                        if existing_cluster_id in self.position_clusters:
+                            # Return base key (without track_id part)
+                            return f"{spot}_cluster_{existing_cluster_id}"
+                    except ValueError:
+                        pass
+        
+        # Also check unique_tracks
+        for existing_track_key in self.unique_tracks.keys():
+            if existing_track_key.startswith(f"{spot}_cluster_"):
+                parts = existing_track_key.split("_cluster_")
+                if len(parts) >= 2:
+                    try:
+                        # Extract cluster_id (may be followed by _track_)
+                        cluster_part = parts[1].split("_track_")[0]
+                        existing_cluster_id = int(cluster_part)
+                        if existing_cluster_id in self.position_clusters:
+                            # Return base key (without track_id part)
+                            return f"{spot}_cluster_{existing_cluster_id}"
+                    except ValueError:
+                        pass
+        
+        # Fallback: return base track_key (cluster might not have been merged yet)
+        return base_key
+    
+    def _cleanup_merged_crops(self):
+        """
+        Remove duplicate crops after cluster merging.
+        Keep only the best crop for each final merged cluster, delete crops for clusters that were merged.
+        Also filter out crops that are too small (narrow/partial detections).
+        """
+        if not self.save_crops or len(self.saved_crops) == 0:
+            return
+        
+        with self.lock:
+            # Get all final cluster IDs (clusters that still exist after merging)
+            final_cluster_ids = set(self.position_clusters.keys())
+            
+            # Minimum crop size requirements (same as during processing)
+            MIN_CROP_WIDTH = 200
+            MIN_CROP_HEIGHT = 150
+            MIN_CROP_AREA = 30000
+            
+            # Build map of merged clusters (old_id -> final_id) using final_merge_map from _merge_nearby_clusters
+            # This helps us find crops from clusters that were merged
+            merged_cluster_map = {}  # old_cluster_id -> final_cluster_id
+            
+            # Use the final_merge_map stored by _merge_nearby_clusters if available
+            if hasattr(self, 'final_merge_map') and self.final_merge_map:
+                # Use the stored merge map to find final clusters
+                for crop_metadata in self.saved_crops:
+                    track_key = crop_metadata.get('track_key', '')
+                    if '_cluster_' in track_key:
+                        parts = track_key.split('_cluster_')
+                        if len(parts) >= 2:
+                            try:
+                                old_cluster_id = int(parts[1])
+                                spot = parts[0]
+                                
+                                # Check if this cluster was merged
+                                if old_cluster_id in self.final_merge_map:
+                                    # Cluster was merged - get final cluster ID
+                                    final_cluster_id = self.final_merge_map[old_cluster_id]
+                                    # Only use if final cluster still exists
+                                    if final_cluster_id in final_cluster_ids:
+                                        merged_cluster_map[old_cluster_id] = final_cluster_id
+                                    else:
+                                        # Final cluster was also merged or filtered - skip this crop
+                                        continue
+                                elif old_cluster_id in final_cluster_ids:
+                                    # Cluster wasn't merged and still exists
+                                    merged_cluster_map[old_cluster_id] = old_cluster_id
+                            except ValueError:
+                                pass
+            else:
+                # Fallback: build map from saved crops (less accurate but works if merge map not available)
+                for crop_metadata in self.saved_crops:
+                    track_key = crop_metadata.get('track_key', '')
+                    if '_cluster_' in track_key:
+                        parts = track_key.split('_cluster_')
+                        if len(parts) >= 2:
+                            try:
+                                old_cluster_id = int(parts[1])
+                                spot = parts[0]
+                                
+                                # If cluster still exists, it's the final cluster
+                                if old_cluster_id in final_cluster_ids:
+                                    merged_cluster_map[old_cluster_id] = old_cluster_id
+                                else:
+                                    # Cluster was merged - try to find final cluster by spot
+                                    for final_cid in final_cluster_ids:
+                                        final_key = f"{spot}_cluster_{final_cid}"
+                                        if final_key in self.crop_deduplication:
+                                            merged_cluster_map[old_cluster_id] = final_cid
+                                            break
+                            except ValueError:
+                                pass
+            
+            # Group crops by FINAL cluster (after merging)
+            crops_by_cluster = {}  # final_cluster_key -> [crop_metadata]
+            
+            for crop_metadata in self.saved_crops:
+                track_key = crop_metadata.get('track_key', '')
+                if '_cluster_' in track_key:
+                    # Extract cluster_id from track_key (format: spot_cluster_id)
+                    parts = track_key.split('_cluster_')
+                    if len(parts) >= 2:
+                        try:
+                            # Extract cluster_id (no track_id in new format)
+                            cluster_id = int(parts[1])
+                            spot = parts[0]
+                            
+                            # Map to final cluster_id (if merged)
+                            final_cluster_id = merged_cluster_map.get(cluster_id, cluster_id)
+                            
+                            # Only keep crops for final merged clusters
+                            if final_cluster_id in final_cluster_ids:
+                                final_cluster_key = f"{spot}_cluster_{final_cluster_id}"
+                                # Filter out small/partial crops
+                                width = crop_metadata.get('width', 0)
+                                height = crop_metadata.get('height', 0)
+                                area = width * height
+                                
+                                # Check if crop is significantly clipped (partial trailer near edge)
+                                bbox_original = crop_metadata.get('bbox_original', [])
+                                bbox_crop = crop_metadata.get('bbox', [])
+                                
+                                is_valid = True
+                                if len(bbox_original) == 4 and len(bbox_crop) == 4:
+                                    orig_x1, orig_y1, orig_x2, orig_y2 = bbox_original
+                                    crop_x1, crop_y1, crop_x2, crop_y2 = bbox_crop
+                                    original_area = (orig_x2 - orig_x1) * (orig_y2 - orig_y1)
+                                    crop_area = (crop_x2 - crop_x1) * (crop_y2 - crop_y1)
+                                    
+                                    if original_area > 0:
+                                        visible_ratio = crop_area / original_area
+                                        original_width = orig_x2 - orig_x1
+                                        original_height = orig_y2 - orig_y1
+                                        crop_width = crop_x2 - crop_x1
+                                        crop_height = crop_y2 - crop_y1
+                                        
+                                        width_ratio = crop_width / original_width if original_width > 0 else 1.0
+                                        height_ratio = crop_height / original_height if original_height > 0 else 1.0
+                                        
+                                        # Require at least 90% of the original bbox to be visible (area, width, and height)
+                                        # Increased from 85% to 90% to be more strict about partial crops
+                                        MIN_VISIBLE_RATIO = 0.90
+                                        if visible_ratio < MIN_VISIBLE_RATIO or width_ratio < MIN_VISIBLE_RATIO or height_ratio < MIN_VISIBLE_RATIO:
+                                            is_valid = False
+                                
+                                if is_valid and width >= MIN_CROP_WIDTH and height >= MIN_CROP_HEIGHT and area >= MIN_CROP_AREA:
+                                    if final_cluster_key not in crops_by_cluster:
+                                        crops_by_cluster[final_cluster_key] = []
+                                    # Update track_key to final merged cluster
+                                    crop_metadata['track_key'] = final_cluster_key
+                                    crops_by_cluster[final_cluster_key].append(crop_metadata)
+                        except ValueError:
+                            # Invalid track_key format - skip it
+                            pass
+            
+            # For each cluster, keep only the best crop (largest area, highest confidence)
+            crops_to_keep = []
+            crops_to_remove = []
+            
+            for cluster_key, cluster_crops in crops_by_cluster.items():
+                if len(cluster_crops) == 0:
+                    continue
+                
+                # Find best crop: prioritize area (full backside), then confidence
+                best_crop = max(cluster_crops, key=lambda c: (
+                    c.get('area', c.get('width', 0) * c.get('height', 0)),  # Primary: area
+                    c.get('det_conf', 0.0)  # Secondary: confidence
+                ))
+                
+                crops_to_keep.append(best_crop)
+                
+                # Mark others for removal
+                for crop in cluster_crops:
+                    if crop != best_crop:
+                        crops_to_remove.append(crop)
+            
+            # Delete crop files for removed crops
+            for crop_metadata in crops_to_remove:
+                crop_path = crop_metadata.get('crop_path')
+                if crop_path and os.path.exists(crop_path):
+                    try:
+                        os.remove(crop_path)
+                        print(f"[VideoProcessor] Removed duplicate/small crop: {crop_path}")
+                    except Exception as e:
+                        print(f"[VideoProcessor] Error removing crop {crop_path}: {e}")
+                
+                # Remove from crop_deduplication
+                track_key = crop_metadata.get('track_key', '')
+                if track_key in self.crop_deduplication:
+                    del self.crop_deduplication[track_key]
+            
+            # Update saved_crops to only include kept crops
+            self.saved_crops = crops_to_keep
+            
+            # Update crop_deduplication to only include kept crops
+            self.crop_deduplication = {
+                c.get('track_key'): c.get('crop_path')
+                for c in crops_to_keep
+                if c.get('track_key') and c.get('crop_path')
+            }
+            
+            if len(crops_to_remove) > 0:
+                print(f"[VideoProcessor] Cleaned up {len(crops_to_remove)} duplicate/small crops, kept {len(crops_to_keep)} best quality crops (one per unique trailer)")
+            
+            # After cleanup, check if any valid clusters are missing crops
+            # This handles cases where clusters only became valid (count >= 2) after merging
+            clusters_with_crops = set()
+            for crop in crops_to_keep:
+                track_key = crop.get('track_key', '')
+                if '_cluster_' in track_key:
+                    parts = track_key.split('_cluster_')
+                    if len(parts) >= 2:
+                        try:
+                            cluster_id = int(parts[1])
+                            clusters_with_crops.add(cluster_id)
+                        except ValueError:
+                            pass
+            
+            # Find clusters that need crops
+            clusters_needing_crops = []
+            for cid in final_cluster_ids:
+                if cid not in clusters_with_crops:
+                    # Find spot for this cluster
+                    spot = None
+                    for track_key in self.unique_tracks.keys():
+                        if f"_cluster_{cid}" in track_key:
+                            parts = track_key.split("_cluster_")
+                            if len(parts) >= 2:
+                                spot = parts[0]
+                                cluster_part = parts[1].split("_track_")[0] if "_track_" in parts[1] else parts[1]
+                                try:
+                                    if int(cluster_part) == cid:
+                                        break
+                                except ValueError:
+                                    pass
+                    
+                    if spot:
+                        clusters_needing_crops.append((cid, spot))
+            
+            # Try to create crops for missing clusters from unique_tracks events
+            if clusters_needing_crops and len(self.processed_frames) > 0:
+                print(f"[VideoProcessor] Found {len(clusters_needing_crops)} valid clusters without crops, attempting to create crops from stored frames...")
+                for cid, spot in clusters_needing_crops:
+                    cluster_key = f"{spot}_cluster_{cid}"
+                    
+                    # Find the best event for this cluster
+                    # Strategy: First try to find fully visible crops, then fall back to best available
+                    # Prefer: 1) Fully visible (not near edges), 2) Largest area, 3) Highest confidence
+                    best_event_fully_visible = None
+                    best_score_fully_visible = -1
+                    best_event_any = None
+                    best_score_any = -1
+                    
+                    for track_key, event in self.unique_tracks.items():
+                        if f"_cluster_{cid}" in track_key:
+                            parts = track_key.split("_cluster_")
+                            if len(parts) >= 2:
+                                cluster_part = parts[1].split("_track_")[0] if "_track_" in parts[1] else parts[1]
+                                try:
+                                    if int(cluster_part) == cid:
+                                        # Calculate score: area * confidence
+                                        width = event.get('trailer_width', 0)
+                                        height = event.get('trailer_height', 0)
+                                        area = width * height
+                                        conf = event.get('det_conf', 0.0)
+                                        
+                                        # Check if bbox is near frame edges (likely partial)
+                                        frame_num = event.get('frame', 0)
+                                        is_fully_visible = False
+                                        edge_penalty = 1.0
+                                        
+                                        if frame_num in self.processed_frames:
+                                            frame = self.processed_frames[frame_num]
+                                            h, w = frame.shape[:2]
+                                            bbox = event.get('bbox', [])
+                                            if len(bbox) == 4:
+                                                x1, y1, x2, y2 = bbox
+                                                # Use both percentage and absolute thresholds
+                                                EDGE_THRESHOLD_PCT = 0.05
+                                                EDGE_THRESHOLD_PX = 100
+                                                
+                                                # Check if bbox extends beyond frame (definitely partial - reject)
+                                                if x1 < 0 or x2 >= w or y1 < 0 or y2 >= h:
+                                                    continue  # Skip this event entirely
+                                                
+                                                near_left = x1 < max(w * EDGE_THRESHOLD_PCT, EDGE_THRESHOLD_PX)
+                                                near_right = x2 > w - max(w * EDGE_THRESHOLD_PCT, EDGE_THRESHOLD_PX)
+                                                near_top = y1 < max(h * EDGE_THRESHOLD_PCT, EDGE_THRESHOLD_PX)
+                                                near_bottom = y2 > h - max(h * EDGE_THRESHOLD_PCT, EDGE_THRESHOLD_PX)
+                                                edges_near = sum([near_left, near_right, near_top, near_bottom])
+                                                
+                                                # Fully visible if not near any edges
+                                                is_fully_visible = (edges_near == 0)
+                                                
+                                                # Penalize crops near edges (prefer fully visible)
+                                                if edges_near >= 2:
+                                                    edge_penalty = 0.1  # Very heavy penalty for near 2+ edges
+                                                elif edges_near == 1:
+                                                    edge_penalty = 0.5  # Heavy penalty for near 1 edge
+                                                
+                                                score = area * (1.0 + conf) * edge_penalty
+                                            else:
+                                                score = area * (1.0 + conf)
+                                        else:
+                                            score = area * (1.0 + conf)
+                                        
+                                        # Track best fully visible and best overall
+                                        if is_fully_visible and score > best_score_fully_visible:
+                                            best_score_fully_visible = score
+                                            best_event_fully_visible = event
+                                        
+                                        if score > best_score_any:
+                                            best_score_any = score
+                                            best_event_any = event
+                                except ValueError:
+                                    pass
+                    
+                    # Try all events for this cluster, sorted by quality (fully visible first, then by score)
+                    # This ensures we find a valid crop even if the best one fails validation
+                    all_events = []
+                    if best_event_fully_visible:
+                        all_events.append((best_event_fully_visible, True))  # (event, is_fully_visible)
+                    # Add all other events sorted by score
+                    for track_key, event in self.unique_tracks.items():
+                        if f"_cluster_{cid}" in track_key:
+                            parts = track_key.split("_cluster_")
+                            if len(parts) >= 2:
+                                cluster_part = parts[1].split("_track_")[0] if "_track_" in parts[1] else parts[1]
+                                try:
+                                    if int(cluster_part) == cid:
+                                        # Skip if already added as fully visible
+                                        if event != best_event_fully_visible:
+                                            all_events.append((event, False))
+                                except ValueError:
+                                    pass
+                    
+                    # Sort by: 1) fully visible, 2) score (area * confidence)
+                    def event_score(event_tuple):
+                        event, is_vis = event_tuple
+                        width = event.get('trailer_width', 0)
+                        height = event.get('trailer_height', 0)
+                        area = width * height
+                        conf = event.get('det_conf', 0.0)
+                        return (1 if is_vis else 0, area * (1.0 + conf))
+                    
+                    all_events.sort(key=event_score, reverse=True)
+                    
+                    # Try each event until we find one that passes validation
+                    crop_created = False
+                    for event, is_fully_visible in all_events:
+                        if crop_created:
+                            break
+                        
+                        is_fallback = not is_fully_visible
+                        frame_num = event.get('frame', 0)
+                        if frame_num in self.processed_frames:
+                            try:
+                                frame = self.processed_frames[frame_num]
+                                bbox = event.get('bbox', [])
+                                
+                                if len(bbox) == 4:
+                                    x1, y1, x2, y2 = bbox
+                                    width = x2 - x1
+                                    height = y2 - y1
+                                    
+                                    # Check if crop meets minimum requirements
+                                    MIN_CROP_WIDTH = 200
+                                    MIN_CROP_HEIGHT = 150
+                                    MIN_CROP_AREA = 30000
+                                    
+                                    if width >= MIN_CROP_WIDTH and height >= MIN_CROP_HEIGHT and (width * height) >= MIN_CROP_AREA:
+                                        # Crop the frame
+                                        h, w = frame.shape[:2]
+                                        crop_x1 = max(0, int(x1))
+                                        crop_y1 = max(0, int(y1))
+                                        crop_x2 = min(w, int(x2))
+                                        crop_y2 = min(h, int(y2))
+                                        
+                                        # Check if crop is significantly clipped (partial trailer near edge)
+                                        # Calculate how much of the original bbox is visible in the crop
+                                        original_width = x2 - x1
+                                        original_height = y2 - y1
+                                        original_area = original_width * original_height
+                                        
+                                        crop_width = crop_x2 - crop_x1
+                                        crop_height = crop_y2 - crop_y1
+                                        crop_area = crop_width * crop_height
+                                        
+                                        # Check visibility ratio (must be at least 90% to avoid partial crops)
+                                        MIN_VISIBLE_RATIO = 0.90
+                                        is_valid_crop = True
+                                        visible_ratio = 1.0
+                                        width_ratio = 1.0
+                                        height_ratio = 1.0
+                                        
+                                        if original_area > 0:
+                                            visible_ratio = crop_area / original_area
+                                            width_ratio = crop_width / original_width if original_width > 0 else 1.0
+                                            height_ratio = crop_height / original_height if original_height > 0 else 1.0
+                                            
+                                            # Also check if bbox is too close to frame edges (likely partial)
+                                            # Use both percentage (5%) and absolute distance (100px) thresholds
+                                            EDGE_THRESHOLD_PCT = 0.05
+                                            EDGE_THRESHOLD_PX = 100  # Absolute pixel threshold
+                                            
+                                            # Check if bbox extends beyond frame boundaries (definitely partial)
+                                            extends_beyond_left = x1 < 0
+                                            extends_beyond_right = x2 >= w
+                                            extends_beyond_top = y1 < 0
+                                            extends_beyond_bottom = y2 >= h
+                                            
+                                            # Check if bbox is very close to edges
+                                            near_left_edge = x1 < max(w * EDGE_THRESHOLD_PCT, EDGE_THRESHOLD_PX)
+                                            near_right_edge = x2 > w - max(w * EDGE_THRESHOLD_PCT, EDGE_THRESHOLD_PX)
+                                            near_top_edge = y1 < max(h * EDGE_THRESHOLD_PCT, EDGE_THRESHOLD_PX)
+                                            near_bottom_edge = y2 > h - max(h * EDGE_THRESHOLD_PCT, EDGE_THRESHOLD_PX)
+                                            
+                                            # Check aspect ratio - trailer backsides should be roughly square or taller than wide
+                                            # Very wide crops (aspect ratio > 1.8) are likely placards or partial views
+                                            aspect_ratio = crop_width / crop_height if crop_height > 0 else 0
+                                            MAX_ASPECT_RATIO = 1.8  # Reject crops wider than 1.8:1 (trailer backsides are typically < 1.5:1)
+                                            MAX_ASPECT_RATIO_FALLBACK = 2.5  # More lenient for fallback (accept up to 2.5:1 if it's the only option for a valid cluster)
+                                            
+                                            # Always reject these (no exceptions):
+                                            # 1. Bbox extends beyond frame boundaries (definitely partial)
+                                            # 2. Visibility ratio too low (clipped)
+                                            if extends_beyond_left or extends_beyond_right or extends_beyond_top or extends_beyond_bottom:
+                                                is_valid_crop = False
+                                            elif visible_ratio < MIN_VISIBLE_RATIO or width_ratio < MIN_VISIBLE_RATIO or height_ratio < MIN_VISIBLE_RATIO:
+                                                is_valid_crop = False
+                                            # For fallback cases (no fully visible crop available), be more lenient:
+                                            # Accept wider aspect ratios and crops near one edge (if not clipped)
+                                            # This ensures valid clusters (count >= 2) get at least one crop
+                                            elif is_fallback:
+                                                # For fallback, prioritize: not clipped > aspect ratio
+                                                # If crop is not clipped (100% visible), accept even if wide (up to 3.0:1)
+                                                # This handles cases where a trailer is detected but only partially visible
+                                                if visible_ratio >= 0.99 and width_ratio >= 0.99 and height_ratio >= 0.99:
+                                                    # Fully visible (not clipped) - accept even if wide (up to 3.0:1)
+                                                    if aspect_ratio > 3.0:
+                                                        is_valid_crop = False  # Too wide even for fallback
+                                                    # Otherwise accept (it's fully visible, just wide)
+                                                # If clipped, be more strict
+                                                elif aspect_ratio > MAX_ASPECT_RATIO_FALLBACK:
+                                                    is_valid_crop = False  # Too wide and clipped
+                                                # Reject if near 2+ edges AND clipped (definitely partial)
+                                                elif (near_left_edge + near_right_edge + near_top_edge + near_bottom_edge >= 2) and (width_ratio < 0.95 or height_ratio < 0.95):
+                                                    is_valid_crop = False
+                                                # Reject if near horizontal edge AND width is significantly clipped (partial)
+                                                elif (near_left_edge or near_right_edge) and (width_ratio < 0.90):
+                                                    is_valid_crop = False
+                                                # Reject if near vertical edge AND height is significantly clipped (partial)
+                                                elif (near_top_edge or near_bottom_edge) and (height_ratio < 0.90):
+                                                    is_valid_crop = False
+                                                # Otherwise, allow it (better than no crop for a valid cluster)
+                                            # For non-fallback (we have fully visible options), be strict:
+                                            # Reject if aspect ratio too wide
+                                            elif aspect_ratio > MAX_ASPECT_RATIO:
+                                                is_valid_crop = False
+                                            # Reject if near any horizontal edge (trailer backsides should be centered)
+                                            elif near_left_edge or near_right_edge:
+                                                is_valid_crop = False
+                                            # Reject if near multiple edges
+                                            elif (near_left_edge + near_right_edge + near_top_edge + near_bottom_edge >= 2):
+                                                is_valid_crop = False
+                                            # Reject if near edge AND clipped
+                                            elif (near_left_edge or near_right_edge) and (width_ratio < 0.95):
+                                                is_valid_crop = False
+                                            elif (near_top_edge or near_bottom_edge) and (height_ratio < 0.95):
+                                                is_valid_crop = False
+                                        
+                                        if not is_valid_crop:
+                                            aspect_info = f", aspect={aspect_ratio:.2f}" if original_area > 0 else ""
+                                            print(f"[VideoProcessor] Skipping partial crop for {cluster_key} from frame {frame_num} - visible={visible_ratio:.1%}, width={width_ratio:.1%}, height={height_ratio:.1%}{aspect_info}, near_edges={near_left_edge + near_right_edge + near_top_edge + near_bottom_edge}, is_fallback={is_fallback}")
+                                            continue
+                                        
+                                        crop = frame[crop_y1:crop_y2, crop_x1:crop_x2]
+                                        
+                                        if crop.size > 0:
+                                            # Save crop
+                                            import hashlib
+                                            bbox_str = f"{x1}_{y1}_{x2}_{y2}"
+                                            bbox_hash = hashlib.md5(bbox_str.encode()).hexdigest()[:8]
+                                            track_id = event.get('track_id', 0)
+                                            crop_filename = f"crop_{frame_num:06d}_track{track_id:03d}_{bbox_hash}.jpg"
+                                            crop_path = self.crops_dir / crop_filename
+                                            
+                                            cv2.imwrite(str(crop_path), crop)
+                                            
+                                            crop_metadata = {
+                                                'crop_path': str(crop_path),
+                                                'crop_filename': crop_filename,
+                                                'frame_count': frame_num,
+                                                'track_id': track_id,
+                                                'bbox': [crop_x1, crop_y1, crop_x2, crop_y2],
+                                                'bbox_original': [x1, y1, x2, y2],
+                                                'bbox_display': [crop_x1, crop_y1, crop_x2, crop_y2],
+                                                'det_conf': event.get('det_conf', 0.0),
+                                                'width': width,
+                                                'height': height,
+                                                'area': width * height,
+                                                'spot': spot,
+                                                'world_coords': (event.get('x_world'), event.get('y_world')),
+                                                'track_key': cluster_key,
+                                                'bbox_hash': bbox_hash,
+                                                'timestamp': datetime.utcnow().isoformat(),
+                                                'camera_id': event.get('camera_id', 'test-video')
+                                            }
+                                            
+                                            crops_to_keep.append(crop_metadata)
+                                            self.crop_deduplication[cluster_key] = str(crop_path)
+                                            print(f"[VideoProcessor] Created missing crop for {cluster_key} from frame {frame_num} (size={width}x{height}, area={width*height}, conf={event.get('det_conf', 0.0):.2f})")
+                                            crop_created = True
+                            except Exception as e:
+                                print(f"[VideoProcessor] Error creating crop for {cluster_key}: {e}")
+                    
+                    if not crop_created:
+                        print(f"[VideoProcessor] Could not create valid crop for {cluster_key} - all available detections were too partial or invalid")
+                
+                # Update saved_crops with newly created crops
+                self.saved_crops = crops_to_keep
+    
+    def _deduplicate_overlapping_tracks(self, tracks: List[Dict], frame_count: int) -> List[Dict]:
+        """
+        Remove duplicate tracks that have very high IoU overlap (likely same trailer).
+        This helps catch cases where ByteTrack creates multiple tracks for the same physical trailer.
+        
+        Args:
+            tracks: List of track dicts with bbox, track_id, etc.
+            
+        Returns:
+            Deduplicated list of tracks (keeps the track with highest confidence)
+        """
+        if len(tracks) <= 1:
+            return tracks
+        
+        def compute_iou(bbox1, bbox2):
+            """Compute IoU between two bounding boxes [x1, y1, x2, y2]."""
+            x1_1, y1_1, x2_1, y2_1 = bbox1
+            x1_2, y1_2, x2_2, y2_2 = bbox2
+            
+            # Calculate intersection
+            x1_i = max(x1_1, x1_2)
+            y1_i = max(y1_1, y1_2)
+            x2_i = min(x2_1, x2_2)
+            y2_i = min(y2_1, y2_2)
+            
+            if x2_i <= x1_i or y2_i <= y1_i:
+                return 0.0
+            
+            intersection = (x2_i - x1_i) * (y2_i - y1_i)
+            area1 = (x2_1 - x1_1) * (y2_1 - y1_1)
+            area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
+            union = area1 + area2 - intersection
+            
+            if union == 0:
+                return 0.0
+            
+            return intersection / union
+        
+        # IoU threshold for considering tracks as duplicates
+        # Lowered from 0.85 to 0.70 to catch more duplicate tracks
+        # Trailers at different angles or partially occluded may have lower IoU but still be the same trailer
+        IOU_THRESHOLD = 0.70
+        
+        # Track which tracks to keep (by index)
+        keep_indices = set(range(len(tracks)))
+        
+        # Compare all pairs of tracks
+        for i in range(len(tracks)):
+            if i not in keep_indices:
+                continue
+            for j in range(i + 1, len(tracks)):
+                if j not in keep_indices:
+                    continue
+                
+                bbox_i = tracks[i]['bbox']
+                bbox_j = tracks[j]['bbox']
+                iou = compute_iou(bbox_i, bbox_j)
+                
+                if iou > IOU_THRESHOLD:
+                    # Very high overlap - likely same trailer
+                    # Keep the track with higher confidence
+                    conf_i = tracks[i].get('conf', 0.0)
+                    conf_j = tracks[j].get('conf', 0.0)
+                    
+                    if conf_i >= conf_j:
+                        keep_indices.discard(j)  # Remove j, keep i
+                        if frame_count % 30 == 0:
+                            print(f"[VideoProcessor] Frame {frame_count}: Deduplicated overlapping tracks {tracks[i].get('track_id', '?')} and {tracks[j].get('track_id', '?')} (IoU={iou:.2f}), keeping track {tracks[i].get('track_id', '?')}")
+                    else:
+                        keep_indices.discard(i)  # Remove i, keep j
+                        if frame_count % 30 == 0:
+                            print(f"[VideoProcessor] Frame {frame_count}: Deduplicated overlapping tracks {tracks[i].get('track_id', '?')} and {tracks[j].get('track_id', '?')} (IoU={iou:.2f}), keeping track {tracks[j].get('track_id', '?')}")
+        
+        # Return only kept tracks
+        return [tracks[i] for i in sorted(keep_indices)]
+    
     def _merge_nearby_clusters(self):
         """Merge position clusters that are very close together (within 3m) and in the same spot."""
         # This helps reduce overcounting when trailers are parked close together
@@ -861,13 +1472,36 @@ class VideoProcessor:
             clusters_by_spot = {}  # spot -> [cluster_ids]
             for cid in self.position_clusters.keys():
                 # Find which spot this cluster belongs to
+                # Check both unique_tracks (old format with track_id) and crop_deduplication (new format without track_id)
                 spot = None
+                
+                # Check unique_tracks (may have _track_ in key)
                 for track_key in self.unique_tracks.keys():
                     if f"_cluster_{cid}" in track_key:
                         parts = track_key.split("_cluster_")
-                        if len(parts) == 2:
+                        if len(parts) >= 2:
                             spot = parts[0]
-                            break
+                            # Verify cluster_id matches (handle format with or without track_id)
+                            cluster_part = parts[1].split("_track_")[0] if "_track_" in parts[1] else parts[1]
+                            try:
+                                if int(cluster_part) == cid:
+                                    break
+                            except ValueError:
+                                pass
+                
+                # Also check crop_deduplication (new format: spot_cluster_id without track_id)
+                if spot is None:
+                    for cluster_key in self.crop_deduplication.keys():
+                        if f"_cluster_{cid}" in cluster_key:
+                            parts = cluster_key.split("_cluster_")
+                            if len(parts) >= 2:
+                                spot = parts[0]
+                                try:
+                                    cluster_part = parts[1]
+                                    if int(cluster_part) == cid:
+                                        break
+                                except ValueError:
+                                    pass
                 
                 if spot is None:
                     spot = "unknown"
@@ -880,10 +1514,10 @@ class VideoProcessor:
             cluster_ids = list(self.position_clusters.keys())
             
             # Find clusters that should be merged
-            # Be very conservative - only merge clusters that are very close together (within 3m)
-            # and in the same spot. This prevents merging different trailers that happen to be
-            # in the same parking spot but are physically separate.
-            MERGE_DISTANCE_THRESHOLD = 3.0  # 3 meters - very conservative
+            # Be VERY conservative - only merge clusters that are VERY close together (within 3m)
+            # This ensures we only merge duplicate detections of the SAME trailer, not different trailers
+            # Different trailers can be in the same spot but should NOT be merged
+            MERGE_DISTANCE_THRESHOLD = 3.0  # 3 meters - very conservative to prevent merging different trailers
             
             for i, cid1 in enumerate(cluster_ids):
                 for cid2 in cluster_ids[i+1:]:
@@ -894,57 +1528,112 @@ class VideoProcessor:
                                   (cluster1['center_y'] - cluster2['center_y'])**2)
                     
                     # Check if clusters are in the same spot
+                    # Check both unique_tracks and crop_deduplication to find spots
                     spot1 = None
                     spot2 = None
+                    
+                    # Check unique_tracks (may have _track_ in key)
                     for track_key in self.unique_tracks.keys():
                         if f"_cluster_{cid1}" in track_key:
                             parts = track_key.split("_cluster_")
-                            if len(parts) == 2:
-                                spot1 = parts[0]
+                            if len(parts) >= 2:
+                                # Verify cluster_id matches
+                                cluster_part = parts[1].split("_track_")[0] if "_track_" in parts[1] else parts[1]
+                                try:
+                                    if int(cluster_part) == cid1:
+                                        spot1 = parts[0]
+                                except ValueError:
+                                    pass
                         if f"_cluster_{cid2}" in track_key:
                             parts = track_key.split("_cluster_")
-                            if len(parts) == 2:
-                                spot2 = parts[0]
+                            if len(parts) >= 2:
+                                # Verify cluster_id matches
+                                cluster_part = parts[1].split("_track_")[0] if "_track_" in parts[1] else parts[1]
+                                try:
+                                    if int(cluster_part) == cid2:
+                                        spot2 = parts[0]
+                                except ValueError:
+                                    pass
+                    
+                    # Also check crop_deduplication (new format: spot_cluster_id without track_id)
+                    if spot1 is None:
+                        for cluster_key in self.crop_deduplication.keys():
+                            if f"_cluster_{cid1}" in cluster_key:
+                                parts = cluster_key.split("_cluster_")
+                                if len(parts) >= 2:
+                                    try:
+                                        if int(parts[1]) == cid1:
+                                            spot1 = parts[0]
+                                            break
+                                    except ValueError:
+                                        pass
+                    
+                    if spot2 is None:
+                        for cluster_key in self.crop_deduplication.keys():
+                            if f"_cluster_{cid2}" in cluster_key:
+                                parts = cluster_key.split("_cluster_")
+                                if len(parts) >= 2:
+                                    try:
+                                        if int(parts[1]) == cid2:
+                                            spot2 = parts[0]
+                                            break
+                                    except ValueError:
+                                        pass
                     
                     # Only merge if:
-                    # 1. Clusters are in the same spot (or both unknown)
-                    # 2. Distance is within threshold - indicates same physical trailer
-                    # Use larger threshold for same-spot clusters since trailers in the same spot
-                    # are likely the same physical trailer, even if positions vary slightly
+                    # 1. Clusters are VERY close together (within 3m) - indicates same physical trailer
+                    # 2. AND one cluster is small (likely duplicate detection) OR both are in same spot
+                    # This prevents merging different trailers that happen to be in the same spot
                     should_merge = False
-                    if spot1 == spot2 and spot1 != "unknown":  # Same spot (not unknown)
-                        # For same-spot clusters, be conservative to avoid merging different trailers
-                        # Strategy: Only merge if one cluster is very small (sparse detection) OR
-                        # clusters are very close together (same trailer with position variance)
-                        min_count = min(cluster1['count'], cluster2['count'])
-                        max_count = max(cluster1['count'], cluster2['count'])
-                        
-                        # If both clusters have substantial detections (likely different trailers)
-                        if min_count >= 5 and max_count >= 10:
-                            # Allow merging for position variance (6.5m) - handles same trailer at different positions
-                            # This merges clusters 1-2 (6.2m apart) but not clusters 2-3 (8.1m apart)
-                            SAME_SPOT_THRESHOLD = 6.5
-                        elif min_count < 3:
-                            # One cluster is very small (sparse detection) - can merge from further away
-                            # Use adaptive threshold based on the larger cluster's size
-                            if max_count >= 5:
-                                # Small cluster near a medium/large cluster - likely sparse detection (9.5m)
-                                # This merges clusters 3-4 (9.1m apart, count=1 and 9)
-                                SAME_SPOT_THRESHOLD = 9.5
-                            else:
-                                # Both clusters are small - be more conservative (7m)
-                                SAME_SPOT_THRESHOLD = 7.0
-                        else:
-                            # One medium-sized cluster - moderate threshold (4m)
-                            SAME_SPOT_THRESHOLD = 4.0
-                        
-                        if dist <= SAME_SPOT_THRESHOLD:
+                    min_count = min(cluster1['count'], cluster2['count'])
+                    max_count = max(cluster1['count'], cluster2['count'])
+                    
+                    # Primary condition: Must be very close (within 3m) to be considered same trailer
+                    # OR if one cluster is small and in same spot, use larger threshold (likely duplicate)
+                    if spot1 == spot2 and spot1 != "unknown":
+                        # Same spot - more likely to be same trailer if close
+                        # Be more aggressive: trailers in the same spot are likely the same physical trailer
+                        if min_count < 5:  # One cluster is small - likely duplicate detection
+                            # Small clusters in same spot: merge if within 10m (very lenient for duplicates)
+                            # This handles cases where a trailer creates multiple clusters due to tracking issues
+                            if dist <= 10.0:
+                                should_merge = True
+                        elif min_count < 10 and max_count >= 15:
+                            # One medium-sized cluster near a large one in same spot
+                            # Merge if within 8m (more lenient for same spot)
+                            if dist <= 8.0:
+                                should_merge = True
+                        elif max_count >= 15:  # Both substantial clusters in same spot
+                            # For substantial clusters in same spot, use 15m threshold (very aggressive)
+                            # Trailers in the same spot are very likely to be the same physical trailer
+                            # Even if they're far apart, they're probably the same trailer moving
+                            if dist <= 15.0:
+                                should_merge = True
+                                print(f"[VideoProcessor] Merging substantial clusters {cid1} and {cid2} in same spot {spot1} (dist={dist:.2f}m, counts={cluster1['count']}/{cluster2['count']})")
+                        elif dist <= MERGE_DISTANCE_THRESHOLD:
+                            # Both smaller clusters in same spot - use strict 3m threshold
+                            should_merge = True
+                    elif dist <= MERGE_DISTANCE_THRESHOLD:
+                        # Different spots or unknown - use strict 3m threshold
+                        if min_count < 5:  # One cluster is small - likely duplicate detection
                             should_merge = True
                     elif spot1 == spot2 == "unknown":  # Both unknown spots
-                        # For unknown spots, use smaller threshold (5m) to be more conservative
-                        if dist <= 5.0:
+                        # For unknown spots, merge if one is small (likely false positive)
+                        # But still use conservative distance threshold
+                        if min_count < 5:
+                            # Small cluster - merge if within 3m (same as main threshold)
+                            if dist <= 3.0:
+                                should_merge = True
+                        else:
+                            # Both substantial - be very conservative (2.5m)
+                            if dist <= 2.5:
+                                should_merge = True
+                    elif spot1 != spot2 and (min_count < 3):  # Different spots, but one is very small
+                        # Very small cluster in different spot - might be false positive or misclassified
+                        # Only merge if VERY close (2m) - likely same trailer misclassified
+                        if dist <= 2.0:
                             should_merge = True
-                    # Never merge clusters from different known spots, even if close
+                    # Don't merge clusters from different known spots if both are substantial
                     
                     if should_merge:
                         # Mark for merging (merge into the cluster with more points)
@@ -970,6 +1659,9 @@ class VideoProcessor:
                     visited.add(current)
                     current = merge_map[current]
                 final_merge_map[merge_from] = current
+            
+            # Store final_merge_map for use in cleanup
+            self.final_merge_map = final_merge_map
             
             # Now apply merges using the resolved destinations
             # Group merges by destination to process efficiently
@@ -1030,11 +1722,18 @@ class VideoProcessor:
                 # Find all track keys that use the merged cluster
                 for track_key in list(self.unique_tracks.keys()):
                     if f"_cluster_{merge_from}" in track_key:
-                        # Extract spot from track_key (format: "spot_cluster_id")
+                        # Extract spot and track_id from track_key
+                        # Format: "spot_cluster_id" or "spot_cluster_id_track_trackid"
                         parts = track_key.split("_cluster_")
-                        if len(parts) == 2:
+                        if len(parts) >= 2:
                             spot = parts[0]
-                            new_track_key = f"{spot}_cluster_{merge_to}"
+                            # Check if track_id is present
+                            cluster_and_track = parts[1]
+                            if "_track_" in cluster_and_track:
+                                track_id_part = cluster_and_track.split("_track_")[-1]
+                                new_track_key = f"{spot}_cluster_{merge_to}_track_{track_id_part}"
+                            else:
+                                new_track_key = f"{spot}_cluster_{merge_to}"
                             spot_cluster_updates[track_key] = new_track_key
             
             # Apply updates to unique_tracks
@@ -1050,6 +1749,24 @@ class VideoProcessor:
                     else:
                         self.unique_tracks[new_key] = old_event
                     del self.unique_tracks[old_key]
+            
+            # Apply updates to crop_deduplication (CRITICAL for two-stage processing)
+            # When clusters merge, update crop_deduplication to use merged cluster IDs
+            # This ensures we only save one crop per final unique trailer
+            # Also update saved_crops metadata to use merged cluster IDs
+            for old_key, new_key in spot_cluster_updates.items():
+                if old_key in self.crop_deduplication:
+                    # If new_key already has a crop, keep it (first saved wins)
+                    # Otherwise, move the crop path to new_key
+                    if new_key not in self.crop_deduplication:
+                        self.crop_deduplication[new_key] = self.crop_deduplication[old_key]
+                    # Remove old_key entry (merged into new_key)
+                    del self.crop_deduplication[old_key]
+                
+                # Also update saved_crops metadata to use merged cluster IDs
+                for crop_meta in self.saved_crops:
+                    if crop_meta.get('track_key') == old_key:
+                        crop_meta['track_key'] = new_key
             
             # Apply updates to track_ocr_results
             for old_key, new_key in spot_cluster_updates.items():
@@ -1081,7 +1798,80 @@ class VideoProcessor:
                     print(f"[VideoProcessor] Updated {len(spot_cluster_updates)} track keys after cluster merge")
             else:
                 print(f"[VideoProcessor] No clusters merged (found {len(cluster_ids)} clusters)")
-                # Debug: print cluster positions
+            
+            # Filter out small clusters (likely false positives) and unrealistic positions
+            # This is done AFTER merging to catch any remaining small clusters
+            # Lowered to 2 to allow trailers that are detected infrequently
+            MIN_CLUSTER_COUNT = 2  # Minimum detections to consider a cluster valid (lowered from 5)
+            MAX_REALISTIC_X = 50.0  # Maximum realistic X position (meters)
+            MAX_REALISTIC_Y = 100.0  # Maximum realistic Y position (meters)
+            MIN_REALISTIC_X = -20.0  # Minimum realistic X position (meters)
+            MIN_REALISTIC_Y = 0.0  # Minimum realistic Y position (meters)
+            
+            clusters_to_remove = []
+            for cid, cluster in self.position_clusters.items():
+                should_remove = False
+                reason = []
+                
+                # Check cluster size
+                if cluster['count'] < MIN_CLUSTER_COUNT:
+                    should_remove = True
+                    reason.append(f"count={cluster['count']} < {MIN_CLUSTER_COUNT}")
+                
+                # Check position bounds
+                x, y = cluster['center_x'], cluster['center_y']
+                if x > MAX_REALISTIC_X or x < MIN_REALISTIC_X:
+                    should_remove = True
+                    reason.append(f"x={x:.2f} out of bounds")
+                if y > MAX_REALISTIC_Y or y < MIN_REALISTIC_Y:
+                    should_remove = True
+                    reason.append(f"y={y:.2f} out of bounds")
+                
+                if should_remove:
+                    clusters_to_remove.append((cid, reason))
+            
+            # Remove invalid clusters
+            if clusters_to_remove:
+                print(f"[VideoProcessor] Filtering out {len(clusters_to_remove)} invalid clusters:")
+                for cid, reasons in clusters_to_remove:
+                    cluster = self.position_clusters[cid]
+                    print(f"  Removing Cluster {cid}: center=({cluster['center_x']:.2f}, {cluster['center_y']:.2f}), count={cluster['count']} - {', '.join(reasons)}")
+                    
+                    # Remove cluster
+                    del self.position_clusters[cid]
+                    
+                    # Remove associated track keys (handle both old and new formats)
+                    keys_to_remove = []
+                    for track_key in list(self.unique_tracks.keys()):
+                        # Check if this track_key uses the removed cluster
+                        # Format: "spot_cluster_cid" or "spot_cluster_cid_track_trackid"
+                        if f"_cluster_{cid}" in track_key:
+                            # Extract cluster_id from track_key to verify it matches
+                            parts = track_key.split("_cluster_")
+                            if len(parts) >= 2:
+                                cluster_part = parts[1].split("_track_")[0] if "_track_" in parts[1] else parts[1]
+                                try:
+                                    if int(cluster_part) == cid:
+                                        keys_to_remove.append(track_key)
+                                except ValueError:
+                                    # Invalid format, but contains cluster string, so remove it
+                                    keys_to_remove.append(track_key)
+                    
+                    for track_key in keys_to_remove:
+                        if track_key in self.unique_tracks:
+                            del self.unique_tracks[track_key]
+                        if track_key in self.unique_track_keys:
+                            self.unique_track_keys.remove(track_key)
+                        if track_key in self.crop_deduplication:
+                            del self.crop_deduplication[track_key]
+                        if track_key in self.track_ocr_results:
+                            del self.track_ocr_results[track_key]
+                
+                print(f"[VideoProcessor] After filtering: {len(self.position_clusters)} valid clusters remaining")
+            
+            # Debug: print remaining cluster positions
+            if len(self.position_clusters) > 0:
+                print(f"[VideoProcessor] Valid clusters:")
                 for cid, cluster in self.position_clusters.items():
                     print(f"  Cluster {cid}: center=({cluster['center_x']:.2f}, {cluster['center_y']:.2f}), count={cluster['count']}")
     
@@ -1328,12 +2118,32 @@ class VideoProcessor:
     def get_results(self) -> Dict:
         """Get processing results."""
         with self.lock:
-            # Get unique tracks count (based on unique track keys after cluster merging)
-            unique_tracks_count = len(self.unique_track_keys)
+            # Get unique tracks count based on final valid clusters (most accurate)
+            # This ensures the count matches the actual number of unique physical trailers
+            # Handle case where position_clusters might not be initialized yet
+            if not hasattr(self, 'position_clusters') or self.position_clusters is None:
+                self.position_clusters = {}
+            unique_tracks_count = len(self.position_clusters)
             
             # Get deduplicated events with consolidated OCR results
+            # Only include events for valid clusters (those that still exist)
+            valid_cluster_ids = set(self.position_clusters.keys())
             deduplicated_events = {}
+            
             for track_key, event in self.unique_tracks.items():
+                # Only include events for valid clusters (filter out deleted/merged clusters)
+                if "_cluster_" in track_key:
+                    # Extract cluster_id from track_key
+                    parts = track_key.split("_cluster_")
+                    if len(parts) == 2:
+                        try:
+                            cluster_id = int(parts[1])
+                            # Skip if cluster was filtered out or merged
+                            if cluster_id not in valid_cluster_ids:
+                                continue
+                        except ValueError:
+                            pass  # Invalid format, include it anyway
+                
                 # Update event with consolidated OCR result if available
                 if track_key in self.track_ocr_results:
                     ocr_data = self.track_ocr_results[track_key]
@@ -1359,14 +2169,27 @@ class VideoProcessor:
             # Take last 100 (most recent)
             unique_events = unique_events[:100]
             
-            # Count unique OCR results (non-empty)
-            unique_ocr_count = sum(1 for track_key, ocr_data in self.track_ocr_results.items() 
-                                 if isinstance(ocr_data, dict) and ocr_data.get('text', '').strip())
+            # Count unique OCR results (non-empty) for valid clusters only
+            unique_ocr_count = 0
+            for track_key, ocr_data in self.track_ocr_results.items():
+                if isinstance(ocr_data, dict) and ocr_data.get('text', '').strip():
+                    # Only count if cluster is still valid
+                    if "_cluster_" in track_key:
+                        parts = track_key.split("_cluster_")
+                        if len(parts) == 2:
+                            try:
+                                cluster_id = int(parts[1])
+                                if cluster_id in valid_cluster_ids:
+                                    unique_ocr_count += 1
+                            except ValueError:
+                                unique_ocr_count += 1  # Include if can't parse
+                    else:
+                        unique_ocr_count += 1  # Include non-cluster keys
             
             return {
                 'frames_processed': self.stats['frames_processed'],
                 'detections': self.stats['detections'],
-                'tracks': unique_tracks_count,  # Use unique tracks count after cluster merging
+                'tracks': unique_tracks_count,  # Use final valid cluster count (most accurate)
                 'ocr_results': unique_ocr_count,  # Count of unique tracks with OCR results
                 'events': unique_events,  # Deduplicated events with consolidated OCR
                 'total_frames_stored': len(self.processed_frames)  # Debug info

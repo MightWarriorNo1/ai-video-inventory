@@ -356,8 +356,6 @@ class OlmOCRRecognizer:
         This method uses adaptive thresholding and edge enhancement techniques
         that work well for vertical text, especially low-contrast vertical text.
         
-        Enhanced for better detection of vertical trailer IDs like "A96904".
-        
         Args:
             image: BGR image (H, W, 3) or grayscale (H, W)
             
@@ -372,20 +370,7 @@ class OlmOCRRecognizer:
         else:
             img_rgb = image
         
-        # OPTIMIZATION: For vertical text, try LAB color space for better contrast
-        # This helps with white text on colored backgrounds (like orange)
-        lab = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2LAB)
-        l, a, b = cv2.split(lab)
-        
-        # Very aggressive CLAHE on L channel for vertical text
-        clahe = cv2.createCLAHE(clipLimit=6.0, tileGridSize=(2, 2))  # More aggressive
-        l_enhanced = clahe.apply(l)
-        
-        # Convert back to RGB
-        lab_enhanced = cv2.merge([l_enhanced, a, b])
-        img_rgb = cv2.cvtColor(lab_enhanced, cv2.COLOR_LAB2RGB)
-        
-        # Convert to grayscale for additional processing
+        # Convert to grayscale for processing
         gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
         
         # Method 1: Very aggressive CLAHE with small tiles (good for vertical text)
@@ -416,7 +401,7 @@ class OlmOCRRecognizer:
         # Add edge enhancement (10% edges to sharpen text boundaries)
         result = cv2.addWeighted(blended, 0.9, edges_rgb, 0.1, 0)
         
-        # Apply gamma correction to brighten (helps with white text on colored backgrounds)
+        # Apply gamma correction to brighten
         img_float = result.astype(np.float32) / 255.0
         gamma = 0.6  # Very aggressive brightening for low-contrast text
         img_gamma = np.power(img_float, gamma)
@@ -467,20 +452,26 @@ class OlmOCRRecognizer:
                 except:
                     pass
             
-            # OPTIMIZATION: Balanced prompt - concise but emphasizes vertical text detection
-            # Vertical text (like "A96904") is critical for trailer identification
+            # Create prompt for OCR task
+            # Qwen3-VL/Qwen2.5-VL can handle vertical text naturally
             if full_image_mode:
-                # For full images, emphasize vertical text detection while keeping prompt concise
+                # For full images, use a detailed prompt that emphasizes low-contrast and vertical text
                 prompt = (
                     "Extract ALL text from this image. "
-                    "CRITICAL: Look for VERTICAL text on trailer sides (read top-to-bottom). "
-                    "Include: vertical trailer IDs (like A96904, HMKD 808154), "
-                    "horizontal text, company names, and numbers. "
-                    "Output only the text, separated by spaces."
+                    "CRITICAL: Look for VERTICAL text written from top to bottom, especially on the sides of trailers. "
+                    "Pay EXTREME attention to low-contrast text, such as light grey text on grey backgrounds. "
+                    "Scan the entire image systematically: left side, center, right side. "
+                    "Include ALL text elements: company names (like 'J.B. HUNT', 'ADVANCE Pallet Inc.'), "
+                    "trailer identification numbers in BOTH horizontal AND vertical orientations "
+                    "(examples: 'A96904', '538148', 'HMKD 808154', '53124'), "
+                    "phone numbers, and any other visible text. "
+                    "For vertical text, read each character from top to bottom. "
+                    "List each unique text element only once, separated by spaces. "
+                    "Do not skip any text, even if it appears faint or low-contrast."
                 )
             else:
                 # Simple prompt for cropped regions
-                prompt = "Read the text. Output only the text."
+                prompt = "What text is in this image? Return only the text, no explanations."
             
             # Calculate max_tokens before preprocessing
             model_name = getattr(self, 'model_name', '')
@@ -488,14 +479,13 @@ class OlmOCRRecognizer:
             is_4b_model = "4B" in model_name
             
             if full_image_mode:
-                # OPTIMIZATION: Increase max_tokens to ensure all text is captured
-                # Full images with multiple trailers need more tokens to capture all text
+                # Increase max_tokens for full images to capture all text including vertical text
                 if is_large_model:
-                    max_tokens = 256  # For 7B/32B models
+                    max_tokens = 256  # Increased from 192
                 elif is_4b_model:
-                    max_tokens = 384  # Increased from 320 for better coverage
+                    max_tokens = 320  # Increased from 256
                 else:
-                    max_tokens = 384  # Increased from 320 for 3B model to capture all text
+                    max_tokens = 320  # Increased from 256
             else:
                 max_tokens = 128
             
@@ -661,10 +651,6 @@ class OlmOCRRecognizer:
             with torch.no_grad():
                 # OPTIMIZATION 5: Optimized generation parameters for speed
                 # Greedy decoding (do_sample=False) is faster and more accurate for short text
-                # POWER OPTIMIZATION: Add small delay to reduce power spikes
-                import time
-                time.sleep(0.01)  # 10ms delay to reduce concurrent power draw
-                
                 # Note: temperature and top_p are not valid for all models
                 generation_kwargs = {
                     "max_new_tokens": max_tokens,
@@ -717,81 +703,31 @@ class OlmOCRRecognizer:
                     except:
                         pass
                 
-                # OPTIMIZATION: Extract only generated tokens (not input tokens)
-                # The model returns full sequence [input_tokens][generated_tokens]
-                # We need to extract only the generated part
+                # Decode full output (model returns full sequence including input)
+                full_output = self.processor.batch_decode(
+                    generated_ids,
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=False
+                )[0]
                 
-                # OPTIMIZATION: Extract only generated tokens (not input tokens)
-                # Get input token length to extract only generated tokens
-                input_ids = inputs.get('input_ids', None)
-                output_text = ""  # Initialize to avoid undefined variable
+                # Debug: show full output before extraction
+                if full_image_mode:
+                    print(f"[oLmOCR] Debug: Full decoded output (first 500 chars): '{full_output[:500]}'")
                 
-                if input_ids is not None and len(generated_ids.shape) >= 2:
-                    try:
-                        input_length = input_ids.shape[1]
-                        # Extract only the generated tokens (after input)
-                        if generated_ids.shape[1] > input_length:
-                            generated_token_ids = generated_ids[0, input_length:]
-                            # Check if we have any generated tokens
-                            if generated_token_ids.numel() > 0:
-                                # Decode only the generated part
-                                output_text = self.processor.batch_decode(
-                                    generated_token_ids.unsqueeze(0),
-                                    skip_special_tokens=True,
-                                    clean_up_tokenization_spaces=False
-                                )[0]
-                            else:
-                                # No generated tokens - model didn't generate anything
-                                print(f"[oLmOCR] Warning: No generated tokens, model may have stopped early")
-                                input_ids = None  # Force fallback
-                        else:
-                            # Fallback if shapes don't match
-                            raise ValueError("Generated tokens length <= input length")
-                    except (ValueError, IndexError, RuntimeError, AttributeError) as e:
-                        # Fallback to full decode if token extraction fails
-                        if full_image_mode:  # Only print warning in full image mode to reduce noise
-                            print(f"[oLmOCR] Warning: Token extraction failed, using fallback: {e}")
-                        input_ids = None  # Force fallback
+                # Extract only the generated part (after the input prompt)
+                # The model output format is typically: [input prompt][response]
+                # We need to find where the response starts
                 
-                if input_ids is None:
-                    # Fallback: decode full output and extract response
-                    full_output = self.processor.batch_decode(
-                        generated_ids,
-                        skip_special_tokens=True,
-                        clean_up_tokenization_spaces=False
-                    )[0]
-                    
-                    # Debug: show full output before extraction
-                    if full_image_mode:
-                        print(f"[oLmOCR] Debug: Full decoded output (first 500 chars): '{full_output[:500]}'")
-                    
-                    # Initialize output_text from full_output
+                # Method 1: Try to find the prompt and extract after it
+                if prompt in full_output:
+                    prompt_end = full_output.find(prompt) + len(prompt)
+                    output_text = full_output[prompt_end:].strip()
+                else:
+                    # Method 2: The model might have already processed the prompt
+                    # Look for common response patterns
                     output_text = full_output
                     
-                    # Extract only the generated part (after the input prompt)
-                    # The model output format is typically: [system][user prompt][assistant response]
-                    output_text = full_output
-                    
-                    # Method 1: Remove system and user messages (chat template format)
-                    # Qwen models format: "system\nYou are...\nuser\n[prompt]\nassistant\n[response]"
-                    if "assistant" in output_text.lower():
-                        # Find "assistant" and extract everything after it
-                        assistant_idx = output_text.lower().find("assistant")
-                        if assistant_idx >= 0:
-                            # Find the text after "assistant" (skip the word itself)
-                            after_assistant = output_text[assistant_idx + len("assistant"):].strip()
-                            # Remove leading colons, newlines, etc.
-                            output_text = after_assistant.lstrip(':\n\r\t ')
-                    
-                    # Method 2: Try to find the prompt and extract after it
-                    if prompt in output_text:
-                        prompt_end = output_text.find(prompt) + len(prompt)
-                        after_prompt = output_text[prompt_end:].strip()
-                        # Only use this if it's shorter (means we found the right place)
-                        if len(after_prompt) < len(output_text) * 0.8:
-                            output_text = after_prompt
-                    
-                    # Method 3: Remove common prefixes
+                    # Remove common prefixes that models add
                     prefixes_to_remove = [
                         "The text in the image is:",
                         "The text is:",
@@ -809,21 +745,21 @@ class OlmOCRRecognizer:
                             if colon_idx > 0:
                                 output_text = output_text[colon_idx + 1:].strip()
                                 break
-                    
-                    # Method 4: If still contains system/user messages, extract last meaningful part
-                    if "system" in output_text.lower() or "user" in output_text.lower() or len(output_text) > 500:
-                        # Split by common separators and take the last part
-                        for separator in ["\n\nassistant", "\nassistant", "\n\n", "\n", ". ", "。", "："]:
-                            parts = output_text.split(separator)
-                            if len(parts) > 1:
-                                # Take the last meaningful part (likely the answer)
-                                output_text = parts[-1].strip()
-                                break
                 
-                # OPTIMIZATION: Better removal of chat template prefixes
-                # Qwen models format: "system\n...\nuser\n...\nassistant\n[response]"
-                # Remove all chat template artifacts
-                chat_prefixes = ["assistant", "Assistant", "ASSISTANT", "user", "User", "USER", "system", "System", "SYSTEM"]
+                # If still contains the original prompt, try to split on newlines or special tokens
+                if prompt in output_text or len(output_text) > 500:
+                    # Try to find the last occurrence of common separators
+                    for separator in ["\n\n", "\n", ". ", "。", "："]:
+                        parts = output_text.split(separator)
+                        if len(parts) > 1:
+                            # Take the last meaningful part (likely the answer)
+                            output_text = parts[-1].strip()
+                            break
+                
+                # Remove chat template prefixes (assistant, user, etc.)
+                # Qwen models add "assistant" prefix to responses
+                # Also handle cases where it's on a separate line: "assistant\n\nA9E904"
+                chat_prefixes = ["assistant", "Assistant", "ASSISTANT", "user", "User", "USER"]
                 
                 # Split by newlines first to handle multi-line responses
                 lines = output_text.split('\n')
@@ -832,34 +768,21 @@ class OlmOCRRecognizer:
                 
                 for line in lines:
                     line_stripped = line.strip()
-                    
                     # Skip empty lines after a prefix
                     if skip_next_empty and not line_stripped:
                         skip_next_empty = False
                         continue
                     skip_next_empty = False
                     
-                    # Check if line is a chat prefix or contains only chat template text
+                    # Check if line is a chat prefix
                     is_prefix = False
                     for prefix in chat_prefixes:
-                        if line_stripped.lower() == prefix.lower() or line_stripped.lower().startswith(prefix.lower() + ":"):
+                        if line_stripped.lower() == prefix.lower():
                             is_prefix = True
                             skip_next_empty = True  # Skip next empty line after prefix
                             break
                     
-                    # Skip lines that are just chat template artifacts
-                    if is_prefix:
-                        continue
-                    
-                    # Skip lines that are clearly part of the prompt (contain prompt keywords)
-                    # But be careful - don't skip lines that contain actual text like "A96904" or "HMKD"
-                    prompt_keywords = ["extract all text", "critical:", "look for vertical", "scan the entire", "include:", "output only"]
-                    # Only skip if the line is clearly a prompt instruction, not actual detected text
-                    if any(keyword in line_stripped.lower() for keyword in prompt_keywords) and len(line_stripped) < 50:
-                        continue
-                    
-                    # Keep meaningful lines
-                    if line_stripped and not is_prefix:
+                    if not is_prefix and line_stripped:
                         cleaned_lines.append(line_stripped)
                 
                 # Rejoin lines, or if empty, try removing prefix from original
@@ -872,46 +795,19 @@ class OlmOCRRecognizer:
                             output_text = output_text[len(prefix):].lstrip(':\n\r\t ')
                             break
                 
-                # OPTIMIZATION: Remove any remaining prompt text
-                # Check if output still contains prompt keywords and remove them
-                prompt_phrases = [
-                    "List all visible text",
-                    "Include vertical text",
-                    "Output only the text",
-                    "Extract ALL text",  # Old prompt phrases (for backward compatibility)
-                    "CRITICAL:",
-                    "Look for VERTICAL",
-                    "Pay EXTREME attention",
-                    "Scan the entire image",
-                    "Include ALL text elements",
-                ]
-                for phrase in prompt_phrases:
-                    if phrase in output_text:
-                        # Remove everything up to and including the phrase
-                        idx = output_text.find(phrase)
-                        if idx >= 0:
-                            # Take text after the phrase
-                            after_phrase = output_text[idx + len(phrase):].strip()
-                            # Only use if it's shorter (means we removed prompt)
-                            if len(after_phrase) < len(output_text):
-                                output_text = after_phrase.lstrip(':\n\r\t ')
-                
-                # Final cleanup - remove any leading/trailing punctuation from prompt artifacts
-                output_text = output_text.strip().lstrip('!?.,:;').strip()
+                # Final cleanup
+                output_text = output_text.strip()
             
             # Post-process output
             # oLmOCR may return text with explanations, extract just the text
             output_text = output_text.strip()
             
-            # Debug: print raw output for troubleshooting (only if not empty)
-            if output_text and len(output_text.strip()) > 0:
-                print(f"[oLmOCR] Debug: Raw model output (first 200 chars): '{output_text[:200]}'")
-                print(f"[oLmOCR] Debug: Full output length: {len(output_text)} chars")
-            else:
-                print(f"[oLmOCR] Warning: Model returned empty output - this may indicate:")
-                print(f"  - Token extraction issue")
-                print(f"  - Model stopped early")
-                print(f"  - Prompt filtering too aggressive")
+            # Debug: print raw output for troubleshooting
+            print(f"[oLmOCR] Debug: Raw model output (first 200 chars): '{output_text[:200]}'")
+            print(f"[oLmOCR] Debug: Full output length: {len(output_text)} chars")
+            
+            if not output_text or len(output_text.strip()) < 1:
+                print(f"[oLmOCR] Warning: Model returned empty or very short output")
                 return {'text': '', 'conf': 0.0}
             
             # If output is suspiciously short (less than 10 chars), the model might have been cut off
@@ -961,7 +857,7 @@ class OlmOCRRecognizer:
                         continue
                     filtered_elements.append(elem)
                 
-                # OPTIMIZATION: Better deduplication to handle model repetition
+                # Additional pass: if we see the same number repeated many times, keep only one
                 # Count occurrences of each normalized element
                 from collections import Counter
                 normalized_counts = Counter()
@@ -969,13 +865,13 @@ class OlmOCRRecognizer:
                     elem_normalized = ''.join(c.upper() for c in elem if c.isalnum())
                     normalized_counts[elem_normalized] += 1
                 
-                # If a normalized text appears more than 3 times, it's likely a repetition artifact
-                # Keep only the first occurrence (reduced threshold from 5 to 3 for better deduplication)
+                # If a normalized text appears more than 5 times, it's likely a repetition artifact
+                # Keep only the first occurrence (increased threshold from 3 to 5 to be less aggressive)
                 final_elements = []
                 seen_normalized = set()
                 for elem in filtered_elements:
                     elem_normalized = ''.join(c.upper() for c in elem if c.isalnum())
-                    if normalized_counts[elem_normalized] > 3:  # Reduced threshold for better deduplication
+                    if normalized_counts[elem_normalized] > 5:  # Increased threshold
                         # This appears too many times, only keep first occurrence
                         if elem_normalized not in seen_normalized:
                             seen_normalized.add(elem_normalized)

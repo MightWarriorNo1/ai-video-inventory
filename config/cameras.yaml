@@ -1,15 +1,15 @@
 globals:
   use_gstreamer: false  # USB cameras don't use GStreamer (only RTSP streams do)
-  detector_conf: 0.20  # Detection confidence threshold (lowered to detect more trailers)
+  detector_conf: 0.05  # Detection confidence threshold (lowered to detect partially visible trailers)
   detect_every_n: 5    # Run detector every N frames (tracking runs every frame)
   save_frames: true    # Save screenshots
   keep_screenshots: 10 # Keep last N screenshots per camera
   
   # Image preprocessing configuration
   preprocessing:
-    enable_yolo: true      # Enable preprocessing for YOLO detection
+    enable_yolo: false     # Enable preprocessing for YOLO detection (DISABLED: better detection for partially visible trailers)
     enable_ocr: true       # Enable preprocessing for OCR recognition
-    yolo_strategy: "enhanced"  # YOLO strategy: "none", "basic", "enhanced"
+    yolo_strategy: "enhanced"  # YOLO strategy: "none", "basic", "enhanced" (not used when enable_yolo=false)
     ocr_strategy: "realworld"  # OCR strategy: "none", "morphological", "clahe", "adaptive", "multi", "realworld"
 
 cameras:

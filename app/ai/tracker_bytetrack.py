@@ -30,8 +30,9 @@ class KalmanFilter:
         self.H[2, 2] = 1.0  # observe s
         self.H[3, 3] = 1.0  # observe r
         
-        # Process noise
-        self.Q = np.eye(8, dtype=np.float32) * 0.1
+        # Process noise - increased to allow for more movement prediction
+        # This helps when trailers move across the frame
+        self.Q = np.eye(8, dtype=np.float32) * 0.2  # Increased from 0.1 to allow more movement
         
         # Measurement noise
         self.R = np.eye(4, dtype=np.float32) * 1.0
@@ -135,9 +136,20 @@ class ByteTrackWrapper:
         self.frame_count += 1
         
         # Predict all active tracks
+        # For lost tracks, predict multiple steps to account for detection gaps
+        # (e.g., if detection runs every 5 frames, predict 5 steps ahead)
         for track_id, track in list(self.tracks.items()):
             if track['state'] == 'tracked':
                 track['kf'].predict()
+                track['bbox'] = track['kf'].get_bbox()
+            elif track['state'] == 'lost':
+                # For lost tracks, predict multiple steps to catch up with detection gaps
+                # This helps when detection runs every N frames
+                frames_lost = self.frame_count - track['frame_count']
+                # Predict ahead by the number of frames lost (up to 10 steps for better prediction)
+                # This accounts for detection gaps (detect_every_n=5) and movement
+                for _ in range(min(frames_lost, 10)):  # Predict up to 10 steps ahead
+                    track['kf'].predict()
                 track['bbox'] = track['kf'].get_bbox()
         
         # Separate detections into high and low confidence
@@ -162,10 +174,20 @@ class ByteTrackWrapper:
             track['state'] = 'tracked'
         
         # Second association: match remaining detections with lost tracks
+        # Use more lenient matching for lost tracks (they may have moved significantly)
         lost_tracks = {tid: t for tid, t in self.tracks.items() if t['state'] == 'lost'}
+        
+        # For lost tracks, use VERY lenient matching to maximize reconnection
+        # This is critical for maintaining track identity when trailers move significantly
+        original_match_thresh = self.match_thresh
+        self.match_thresh = 0.15  # Very low threshold for lost tracks (allows reconnection even with low IoU)
+        
         matched_pairs_lost, unmatched_lost, unmatched_dets_rem = self._associate_detections_to_tracks(
             [high_conf_dets[i] for i in unmatched_dets], lost_tracks
         )
+        
+        # Restore original threshold
+        self.match_thresh = original_match_thresh
         
         # Reactivate lost tracks
         for det_idx_rem, track_id in matched_pairs_lost:
@@ -225,9 +247,36 @@ class ByteTrackWrapper:
         
         return active_tracks
     
+    def _compute_center_distance(self, bbox1: List[float], bbox2: List[float]) -> float:
+        """Compute distance between centers of two bounding boxes."""
+        x1_1, y1_1, x2_1, y2_1 = bbox1
+        x1_2, y1_2, x2_2, y2_2 = bbox2
+        
+        cx1 = (x1_1 + x2_1) / 2.0
+        cy1 = (y1_1 + y2_1) / 2.0
+        cx2 = (x1_2 + x2_2) / 2.0
+        cy2 = (y1_2 + y2_2) / 2.0
+        
+        dx = cx2 - cx1
+        dy = cy2 - cy1
+        distance = np.sqrt(dx * dx + dy * dy)
+        
+        return distance
+    
+    def _compute_bbox_size(self, bbox: List[float]) -> float:
+        """Compute average size (diagonal) of bounding box."""
+        x1, y1, x2, y2 = bbox
+        w = x2 - x1
+        h = y2 - y1
+        return np.sqrt(w * w + h * h)
+    
     def _associate_detections_to_tracks(self, detections: List[Dict], tracks: Dict) -> Tuple[List, List, List]:
         """
-        Associate detections to tracks using IoU matching.
+        Associate detections to tracks using IoU matching with position-based fallback.
+        
+        Enhanced matching strategy:
+        1. Primary: IoU matching (works when trailer is in similar position)
+        2. Fallback: Position-based matching (works when trailer moved significantly)
         
         Returns:
             (matched_pairs, unmatched_tracks, unmatched_dets)
@@ -240,38 +289,101 @@ class ByteTrackWrapper:
         
         # Compute IoU matrix
         iou_matrix = np.zeros((len(detections), len(tracks)), dtype=np.float32)
+        distance_matrix = np.zeros((len(detections), len(tracks)), dtype=np.float32)
         track_ids = list(tracks.keys())
         
         for i, det in enumerate(detections):
             for j, track_id in enumerate(track_ids):
                 track = tracks[track_id]
                 iou_matrix[i, j] = self._compute_iou(det['bbox'], track['bbox'])
+                # Compute center distance for fallback matching
+                distance_matrix[i, j] = self._compute_center_distance(det['bbox'], track['bbox'])
         
-        # Greedy matching
+        # Greedy matching with two strategies
         matched_pairs = []
         unmatched_dets = list(range(len(detections)))
         unmatched_tracks = list(tracks.keys())
         
-        # Sort by IoU (highest first)
-        matches = []
+        # Strategy 1: IoU-based matching (primary)
+        matches_iou = []
         for i in range(len(detections)):
             for j in range(len(tracks)):
                 if iou_matrix[i, j] > self.match_thresh:
-                    matches.append((iou_matrix[i, j], i, j))
+                    matches_iou.append((iou_matrix[i, j], i, j, 'iou'))
         
-        matches.sort(reverse=True, key=lambda x: x[0])
+        matches_iou.sort(reverse=True, key=lambda x: x[0])
         
         used_dets = set()
         used_tracks = set()
         
-        for _, i, j in matches:
+        # Match using IoU first
+        for _, i, j, _ in matches_iou:
             if i not in used_dets and j not in used_tracks:
                 matched_pairs.append((i, track_ids[j]))
                 used_dets.add(i)
                 used_tracks.add(j)
         
+        # Strategy 2: Position-based fallback for unmatched detections/tracks
+        # This helps when trailer moved significantly (low IoU but reasonable distance)
+        # Only use for lost tracks or when IoU is very low
+        remaining_dets = [i for i in range(len(detections)) if i not in used_dets]
+        remaining_track_indices = [j for j in range(len(tracks)) if track_ids[j] not in used_tracks]
+        
+        if remaining_dets and remaining_track_indices:
+            # For lost tracks, use more lenient position-based matching
+            # Calculate relative distance threshold based on bbox size
+            matches_position = []
+            for i in remaining_dets:
+                det = detections[i]
+                det_size = self._compute_bbox_size(det['bbox'])
+                
+                for j in remaining_track_indices:
+                    track_id = track_ids[j]
+                    track = tracks[track_id]
+                    distance = distance_matrix[i, j]
+                    
+                    # Use relative distance threshold: within 2x the bbox size
+                    # This allows matching even when trailer moved significantly
+                    max_distance = det_size * 2.0
+                    
+                    # Also check IoU - if it's above a lower threshold, consider it
+                    iou = iou_matrix[i, j]
+                    
+                    # Match if:
+                    # 1. Distance is reasonable (within 2x bbox size) AND
+                    # 2. IoU is above a lower threshold (very lenient for lost tracks)
+                    # Note: When matching lost tracks, all tracks in the dict should be lost,
+                    # but we check state for safety and to handle edge cases
+                    is_lost_track = track.get('state', 'tracked') == 'lost'
+                    
+                    # For lost tracks, use VERY lenient matching to allow reconnection after movement
+                    if is_lost_track:
+                        # Extremely lenient: within 3x bbox size (allows significant movement) and IoU >= 0.02
+                        # This ensures trailers that move across the frame can be reconnected
+                        max_distance_lost = det_size * 3.0  # Increased from 1.5x to 3x for very lenient matching
+                        if distance <= max_distance_lost and iou >= 0.02:  # Very low IoU threshold
+                            # Score: prefer higher IoU and lower distance, but prioritize distance for lost tracks
+                            score = iou * 0.4 + (1.0 - min(distance / max_distance_lost, 1.0)) * 0.6
+                            matches_position.append((score, i, j, 'position'))
+                    else:
+                        # For active tracks, use standard matching
+                        if distance <= max_distance and iou >= 0.20:
+                            # Score: prefer higher IoU and lower distance
+                            score = iou * 0.7 + (1.0 - min(distance / max_distance, 1.0)) * 0.3
+                            matches_position.append((score, i, j, 'position'))
+            
+            matches_position.sort(reverse=True, key=lambda x: x[0])
+            
+            # Match using position-based fallback
+            for _, i, j, _ in matches_position:
+                track_id = track_ids[j]
+                if i not in used_dets and track_id not in used_tracks:
+                    matched_pairs.append((i, track_id))
+                    used_dets.add(i)
+                    used_tracks.add(track_id)
+        
         unmatched_dets = [i for i in range(len(detections)) if i not in used_dets]
-        unmatched_tracks = [track_ids[j] for j in range(len(tracks)) if j not in used_tracks]
+        unmatched_tracks = [track_ids[j] for j in range(len(tracks)) if track_ids[j] not in used_tracks]
         
         return matched_pairs, unmatched_tracks, unmatched_dets
     

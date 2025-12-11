@@ -133,15 +133,12 @@ class TrailerVisionApp:
         # Try oLmOCR first (best accuracy for vertical text, complex layouts, and multi-language support)
         try:
             from app.ocr.olmocr_recognizer import OlmOCRRecognizer
-            # POWER OPTIMIZATION: Use Qwen2.5-VL-3B-Instruct instead of 4B to reduce power consumption
-            # The 4B model causes "Over-current" throttling on Jetson Orin NX
-            # 3B model: ~30-40% less power, ~20-30% faster, still excellent accuracy
+            # Use Qwen3-VL-4B-Instruct for best OCR performance (32 languages, 4B params)
             # For edge devices with limited memory, consider Qwen2.5-VL-3B-Instruct
             # OPTIMIZATION: Enable fast preprocessing for better speed
             # Set fast_preprocessing=True for 2-3x faster preprocessing (slightly less enhancement)
-            ocr_model = globals_cfg.get('ocr_model', 'Qwen/Qwen2.5-VL-3B-Instruct')  # Default to 3B for power efficiency
             self.ocr = OlmOCRRecognizer(
-                model_name=ocr_model,
+                model_name="Qwen/Qwen3-VL-4B-Instruct",
                 use_gpu=True,
                 fast_preprocessing=globals_cfg.get('ocr_fast_preprocessing', False)  # Enable via config
             )
@@ -329,7 +326,16 @@ class TrailerVisionApp:
         
         # Initialize video processor for testing
         def create_tracker():
-            return ByteTrackWrapper(track_thresh=track_thresh)
+            # Enhanced ByteTrack parameters for video tracking:
+            # - match_thresh: 0.5 (aggressive matching to reconnect tracks)
+            # - track_buffer: 150 (keep lost tracks for 150 frames = 5 seconds at 30fps)
+            #   This ensures trailers maintain identity even with detection gaps
+            # - Enhanced matching: Uses IoU + position-based fallback for moving trailers
+            return ByteTrackWrapper(
+                track_thresh=track_thresh,
+                track_buffer=150,  # Keep lost tracks for 150 frames (5 sec at 30fps) to reconnect same trailer
+                match_thresh=0.5   # Aggressive IoU matching + position-based fallback for moving trailers
+            )
         
         # Get homography for first camera (or None) for video processing
         test_homography = None

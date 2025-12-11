@@ -8,10 +8,15 @@ Usage:
     python3 test_olmocr.py [image_path]
 """
 
-from app.ocr.olmocr_recognizer import OlmOCRRecognizer
-import cv2
 import sys
 import os
+from pathlib import Path
+
+# Add parent directory to path to import app modules
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+
+from app.ocr.olmocr_recognizer import OlmOCRRecognizer
+import cv2
 import gc
 
 # Try to import torch for GPU memory management

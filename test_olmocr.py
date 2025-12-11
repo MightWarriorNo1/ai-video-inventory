@@ -78,22 +78,22 @@ def main():
     print("=" * 60)
     
     # Initialize oLmOCR
-    # POWER OPTIMIZATION: Using Qwen2.5-VL-3B for Jetson Orin NX
-    # - FP8 quantization requires compute capability >= 8.9 (Jetson Orin NX has 8.7)
-    # - 3B model: Lower power consumption, prevents "Over-current" throttling
-    # - Still excellent accuracy for trailer ID recognition
-    print("\nInitializing oLmOCR (Qwen2.5-VL-3B-Instruct)...")
-    print("Note: First run will download model weights (~3GB)")
-    print("Qwen2.5-VL-3B: Good balance for Jetson Orin NX (~5-6GB GPU memory)")
-    print("Alternative: Use 'Qwen/Qwen2.5-VL-2B-Instruct' for even less memory")
+    # Using Qwen3-VL-4B (RECOMMENDED: Best OCR performance, good memory balance)
+    # Alternative: "Qwen/Qwen3-VL-4B-Instruct-FP8" (Quantized, less memory)
+    # Older: "Qwen/Qwen2.5-VL-7B-Instruct" (Larger, more memory)
+    print("\nInitializing oLmOCR (Qwen3-VL-4B-Instruct)...")
+    print("Note: First run will download model weights (~4GB)")
+    print("Qwen3-VL-4B: Best OCR (32 languages), requires ~6GB GPU memory")
+    print("Alternative: Use 'Qwen/Qwen3-VL-4B-Instruct-FP8' for less memory")
     
     try:
         ocr = OlmOCRRecognizer(
-            model_name="Qwen/Qwen2.5-VL-3B-Instruct",  # RECOMMENDED for Jetson Orin NX
-            # Alternative options:
-            # model_name="Qwen/Qwen2.5-VL-2B-Instruct",  # Smallest, lowest power
-            # model_name="Qwen/Qwen3-VL-4B-Instruct",  # Better accuracy but higher power (may cause throttling)
-            # NOTE: FP8 models don't work on Jetson Orin NX (requires compute capability >= 8.9)
+            # model_name="Qwen/Qwen3-VL-4B-Instruct",  # Best OCR, good balance
+            # Alternative for less memory:
+            model_name="Qwen/Qwen3-VL-4B-Instruct-FP8",  # Quantized version
+            # Older options:
+            # model_name="Qwen/Qwen2.5-VL-7B-Instruct",  # Larger, more memory
+            # model_name="Qwen/Qwen2.5-VL-3B-Instruct",  # Smaller, less memory
             use_gpu=True  # Use GPU if available
         )
     except Exception as e:
@@ -176,8 +176,8 @@ def main():
         print("\n✗ No text recognized. Try:")
         if not is_full_image:
             print("  - Using full_image_mode=True for full images")
-        print("  - Using a larger model (4B or 7B) - note: may cause power throttling")
-        print("  - Or try Qwen2.5-VL-2B: model_name='Qwen/Qwen2.5-VL-2B-Instruct'")
+        print("  - Using a larger model (7B or 32B)")
+        print("  - Or try Qwen2-VL-2B: model_name='Qwen/Qwen2-VL-2B'")
         print("  - Checking image quality")
         print("  - Adjusting preprocessing parameters")
     
