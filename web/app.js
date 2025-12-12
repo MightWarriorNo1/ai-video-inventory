@@ -178,9 +178,14 @@ function startResultsPolling() {
     
     resultsInterval = setInterval(async () => {
         try {
-            const response = await fetch('/api/processing-results');
-            if (response.ok) {
-                const results = await response.json();
+            // Poll both processing results and status
+            const [resultsResponse, statusResponse] = await Promise.all([
+                fetch('/api/processing-results'),
+                fetch('/api/processing-status')
+            ]);
+            
+            if (resultsResponse.ok) {
+                const results = await resultsResponse.json();
                 updateProcessingResults(results);
                 
                 // Check if processing is complete
@@ -188,13 +193,31 @@ function startResultsPolling() {
                     consecutiveNoProcessing++;
                     if (consecutiveNoProcessing > 3) {
                         // Processing is done
-                        updateProcessingStatus('Processing complete', 'success');
                         document.getElementById('processVideoBtn').disabled = false;
                         document.getElementById('stopProcessingBtn').disabled = true;
                         // Keep polling but less frequently to show final results
                     }
                 } else {
                     consecutiveNoProcessing = 0;
+                }
+            }
+            
+            // Update status from status endpoint
+            if (statusResponse.ok) {
+                const status = await statusResponse.json();
+                if (status.message) {
+                    // Map backend status to frontend status types
+                    let statusType = 'processing';
+                    if (status.status === 'completed') {
+                        statusType = 'success';
+                    } else if (status.status === 'error') {
+                        statusType = 'error';
+                    } else if (status.status === 'processing_video' || status.status === 'processing_ocr') {
+                        statusType = 'processing';
+                    } else if (status.status === 'idle') {
+                        statusType = 'idle';
+                    }
+                    updateProcessingStatus(status.message, statusType);
                 }
             }
         } catch (error) {

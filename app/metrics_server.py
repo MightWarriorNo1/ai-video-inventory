@@ -62,6 +62,15 @@ class MetricsServer:
         # Video upload directory
         self.upload_dir = Path(tempfile.gettempdir()) / 'trailer_vision_uploads'
         self.upload_dir.mkdir(exist_ok=True)
+        
+        # Processing status tracking
+        self.processing_status = {
+            'status': 'idle',  # 'idle', 'processing_video', 'processing_ocr', 'completed', 'error'
+            'message': '',
+            'video_processing_complete': False,
+            'ocr_processing_complete': False
+        }
+        self.status_lock = threading.Lock()
     
     def _setup_error_handlers(self):
         """Setup Flask error handlers."""
@@ -205,11 +214,25 @@ class MetricsServer:
                 captured_video_path = video_path
                 captured_detect_every_n = detect_every_n
                 
+                # Reset status before starting new processing
+                with self.status_lock:
+                    self.processing_status['status'] = 'idle'
+                    self.processing_status['message'] = ''
+                    self.processing_status['video_processing_complete'] = False
+                    self.processing_status['ocr_processing_complete'] = False
+                
                 # Start processing in background thread
                 def process_in_background():
                     try:
                         import traceback
                         print(f"[MetricsServer] Starting video processing: {captured_video_path}, detect_every_n={captured_detect_every_n}")
+                        
+                        # Update status: video processing started
+                        with self.status_lock:
+                            self.processing_status['status'] = 'processing_video'
+                            self.processing_status['message'] = 'Processing video...'
+                            self.processing_status['video_processing_complete'] = False
+                            self.processing_status['ocr_processing_complete'] = False
                         
                         frame_count = 0
                         last_results_check = 0
@@ -235,6 +258,66 @@ class MetricsServer:
                         print(f"[MetricsServer] Video processing completed: {frame_count} frames processed")
                         print(f"[MetricsServer] Final results: {final_results}")
                         
+                        # Update status: video processing complete
+                        with self.status_lock:
+                            self.processing_status['status'] = 'processing_ocr'
+                            self.processing_status['message'] = 'Video processing completed. Running OCR on cropped images...'
+                            self.processing_status['video_processing_complete'] = True
+                        
+                        # Stage 2: Run OCR on cropped images
+                        if self.video_processor.ocr is not None and self.video_processor.crops_dir is not None:
+                            crops_dir = self.video_processor.crops_dir
+                            # Ensure crops_dir is a Path object
+                            from pathlib import Path
+                            if not isinstance(crops_dir, Path):
+                                crops_dir = Path(crops_dir)
+                            if crops_dir.exists() and (crops_dir / "crops_metadata.json").exists():
+                                print(f"[MetricsServer] Starting OCR processing on crops in: {crops_dir}")
+                                try:
+                                    from app.batch_ocr_processor import BatchOCRProcessor
+                                    
+                                    # Create batch OCR processor
+                                    batch_ocr = BatchOCRProcessor(
+                                        self.video_processor.ocr,
+                                        self.video_processor.preprocessor
+                                    )
+                                    
+                                    # Process all crops (convert Path to string)
+                                    crops_dir_str = str(crops_dir)
+                                    ocr_results = batch_ocr.process_crops_directory(crops_dir_str)
+                                    
+                                    # Match OCR results back to detections
+                                    combined_results = batch_ocr.match_ocr_to_detections(crops_dir_str, ocr_results)
+                                    
+                                    print(f"[MetricsServer] OCR processing completed: {len(ocr_results)} crops processed")
+                                    
+                                    # Update status: OCR complete
+                                    with self.status_lock:
+                                        self.processing_status['status'] = 'completed'
+                                        self.processing_status['message'] = 'All the processes completed on the video:'
+                                        self.processing_status['ocr_processing_complete'] = True
+                                    
+                                except Exception as ocr_error:
+                                    print(f"[MetricsServer] Error during OCR processing: {ocr_error}")
+                                    import traceback
+                                    traceback.print_exc()
+                                    with self.status_lock:
+                                        self.processing_status['status'] = 'error'
+                                        self.processing_status['message'] = f'Video processing completed, but OCR failed: {str(ocr_error)}'
+                                        self.processing_status['ocr_processing_complete'] = False
+                            else:
+                                print(f"[MetricsServer] No crops directory or metadata found, skipping OCR")
+                                with self.status_lock:
+                                    self.processing_status['status'] = 'completed'
+                                    self.processing_status['message'] = 'Video processing completed (no crops to process)'
+                                    self.processing_status['ocr_processing_complete'] = True
+                        else:
+                            print(f"[MetricsServer] OCR not available or crops not saved, skipping OCR processing")
+                            with self.status_lock:
+                                self.processing_status['status'] = 'completed'
+                                self.processing_status['message'] = 'Video processing completed (OCR not available)'
+                                self.processing_status['ocr_processing_complete'] = True
+                        
                     except Exception as e:
                         print(f"[MetricsServer] Error processing video: {e}")
                         import traceback
@@ -244,6 +327,12 @@ class MetricsServer:
                             self.video_processor.stop_processing()
                         except:
                             pass
+                        # Update status: error
+                        with self.status_lock:
+                            self.processing_status['status'] = 'error'
+                            self.processing_status['message'] = f'Processing failed: {str(e)}'
+                            self.processing_status['video_processing_complete'] = False
+                            self.processing_status['ocr_processing_complete'] = False
                 
                 thread = threading.Thread(target=process_in_background, daemon=True)
                 thread.start()
@@ -274,7 +363,18 @@ class MetricsServer:
             
             results = self.video_processor.get_results()
             results['processing'] = self.video_processor.is_processing()
+            
+            # Add processing status
+            with self.status_lock:
+                results['processing_status'] = self.processing_status.copy()
+            
             return jsonify(results)
+        
+        @self.app.route('/api/processing-status', methods=['GET'])
+        def get_processing_status():
+            """Get current processing status for dashboard."""
+            with self.status_lock:
+                return jsonify(self.processing_status.copy())
         
         @self.app.route('/api/processed-frame/<int:frame_number>')
         def get_processed_frame(frame_number):
