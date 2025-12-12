@@ -111,7 +111,7 @@ class OlmOCRRecognizer:
             self.device = device
             self.use_gpu = (device == "cuda")
         
-        print(f"[oLmOCR] Initializing Qwen2.5-VL model...")
+        print(f"[oLmOCR] Initializing Qwen3-VL model...")
         print(f"  Model: {model_name}")
         print(f"  Device: {self.device}")
         print(f"  GPU: {self.use_gpu}")

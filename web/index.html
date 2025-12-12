@@ -16,13 +16,6 @@
             </div>
         </header>
 
-        <div class="video-section">
-            <h2>Live Camera Feeds</h2>
-            <div id="videoFeeds" class="video-grid">
-                <!-- Populated by JavaScript -->
-            </div>
-        </div>
-
         <div class="video-processing-section">
             <h2>Video Processing</h2>
             <div class="video-upload-controls">
@@ -60,56 +53,11 @@
                                 <span class="stat-value" id="totalOCR">0</span>
                             </div>
                         </div>
-                        <div class="results-events">
-                            <h4>Processing Events</h4>
-                            <div id="processingEvents" class="events-list">
-                                <p class="no-events">No events yet. Start processing to see results.</p>
-                            </div>
-                        </div>
                     </div>
                 </div>
             </div>
         </div>
 
-        <div class="metrics-grid">
-            <div class="metrics-section">
-                <h2>Camera Metrics</h2>
-                <div id="cameraMetrics" class="camera-list">
-                    <!-- Populated by JavaScript -->
-                </div>
-            </div>
-
-            <div class="events-section">
-                <h2>Recent Events</h2>
-                <div class="events-controls">
-                    <select id="cameraFilter">
-                        <option value="">All Cameras</option>
-                    </select>
-                    <input type="number" id="eventLimit" value="50" min="1" max="500">
-                    <button onclick="loadEvents()">Refresh</button>
-                </div>
-                <div class="events-table-container">
-                    <table id="eventsTable">
-                        <thead>
-                            <tr>
-                                <th>Timestamp</th>
-                                <th>Camera</th>
-                                <th>Track ID</th>
-                                <th>Trailer Size</th>
-                                <th>Text</th>
-                                <th>OCR Conf</th>
-                                <th>Det Conf</th>
-                                <th>Spot</th>
-                                <th>Method</th>
-                            </tr>
-                        </thead>
-                        <tbody id="eventsBody">
-                            <!-- Populated by JavaScript -->
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-        </div>
     </div>
 
     <script src="app.js"></script>

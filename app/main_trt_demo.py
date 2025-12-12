@@ -39,6 +39,7 @@ load_dotenv()
 # Application modules
 from app.rtsp import open_stream, frame_generator
 from app.ai.detector_trt import TrtEngineYOLO
+from app.ai.detector_yolov8 import YOLOv8Detector
 from app.ai.tracker_bytetrack import ByteTrackWrapper
 from app.ocr.recognize import PlateRecognizer
 from app.spot_resolver import SpotResolver
@@ -116,15 +117,45 @@ class TrailerVisionApp:
         """Initialize all application components."""
         globals_cfg = self.config.get('globals', {})
         
-        # Initialize detector
-        detector_path = "models/trailer_detector.engine"
-        if os.path.exists(detector_path):
-            self.detector = TrtEngineYOLO(
-                detector_path,
-                conf_threshold=globals_cfg.get('detector_conf', 0.35)
-            )
+        # Initialize detector - prefer fine-tuned YOLO model over TensorRT engine
+        fine_tuned_model_path = "runs/detect/truck_detector_finetuned/weights/best.pt"
+        engine_path = "models/trailer_detector.engine"
+        
+        if os.path.exists(fine_tuned_model_path):
+            # Use fine-tuned YOLO model
+            print(f"Loading fine-tuned YOLO model: {fine_tuned_model_path}")
+            try:
+                self.detector = YOLOv8Detector(
+                    model_name=fine_tuned_model_path,
+                    conf_threshold=globals_cfg.get('detector_conf', 0.35),
+                    target_class=0  # Fine-tuned model is single-class (trailer = class 0)
+                )
+                print(f"✓ Fine-tuned YOLO model loaded successfully")
+            except Exception as e:
+                print(f"Error loading fine-tuned YOLO model: {e}")
+                print(f"Falling back to TensorRT engine...")
+                self.detector = None
         else:
-            print(f"Warning: Detector engine not found: {detector_path}")
+            print(f"Fine-tuned model not found: {fine_tuned_model_path}")
+            self.detector = None
+        
+        # Fallback to TensorRT engine if fine-tuned model not available or failed
+        if self.detector is None and os.path.exists(engine_path):
+            print(f"Loading TensorRT engine: {engine_path}")
+            try:
+                self.detector = TrtEngineYOLO(
+                    engine_path,
+                    conf_threshold=globals_cfg.get('detector_conf', 0.35)
+                )
+                print(f"✓ TensorRT engine loaded successfully")
+            except Exception as e:
+                print(f"Error loading TensorRT engine: {e}")
+                self.detector = None
+        
+        if self.detector is None:
+            print(f"Warning: No detector available. Tried:")
+            print(f"  - Fine-tuned model: {fine_tuned_model_path}")
+            print(f"  - TensorRT engine: {engine_path}")
         
         # Initialize OCR - Priority: oLmOCR > EasyOCR > TrOCR > PaddleOCR English-only > Multilingual > Legacy CRNN
         # oLmOCR (Qwen3-VL/Qwen2.5-VL) is recommended for best accuracy, especially for vertical text and complex layouts

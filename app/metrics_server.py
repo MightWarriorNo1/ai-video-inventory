@@ -327,12 +327,62 @@ class MetricsServer:
                 for row in reader:
                     if camera_id and row.get('camera_id') != camera_id:
                         continue
-                    events.append(row)
+                    
+                    # Normalize row data: ensure all values are JSON-serializable
+                    # Convert all values to JSON-safe types (no None to avoid comparison errors)
+                    normalized_row = {}
+                    for key, value in row.items():
+                        # Ensure value is not None and convert to appropriate type
+                        # CSV DictReader should return strings, but handle all edge cases
+                        if value is None:
+                            normalized_row[key] = ''
+                        elif value == '':
+                            normalized_row[key] = ''
+                        else:
+                            # Non-empty value - convert to appropriate type
+                            try:
+                                value_str = str(value).strip()
+                                if not value_str:
+                                    normalized_row[key] = ''
+                                elif key in ['x_world', 'y_world', 'conf']:
+                                    # Convert numeric fields to float, use 0.0 for empty/invalid
+                                    try:
+                                        float_val = float(value_str)
+                                        # Check for NaN or infinity
+                                        if float_val != float_val or not (-1e308 < float_val < 1e308):
+                                            normalized_row[key] = 0.0
+                                        else:
+                                            normalized_row[key] = float_val
+                                    except (ValueError, TypeError, OverflowError):
+                                        normalized_row[key] = 0.0
+                                elif key == 'track_id':
+                                    # Convert track_id to int, use 0 for empty/invalid
+                                    try:
+                                        normalized_row[key] = int(value_str)
+                                    except (ValueError, TypeError):
+                                        normalized_row[key] = 0
+                                else:
+                                    # Keep as string for text fields
+                                    normalized_row[key] = value_str
+                            except Exception:
+                                # Fallback: use empty string for any conversion error
+                                normalized_row[key] = ''
+                    
+                    events.append(normalized_row)
+            
+            # Final safety check: ensure all events are JSON-serializable
+            # Convert any remaining None values to safe defaults
+            for event in events:
+                for key, value in list(event.items()):
+                    if value is None:
+                        event[key] = '' if key not in ['x_world', 'y_world', 'conf'] else 0.0
             
             # Return last N events
             return events[-limit:]
         except Exception as e:
             print(f"Error reading events: {e}")
+            import traceback
+            traceback.print_exc()
             return []
     
     def update_camera_metrics(self, camera_id: str, fps_ema: float, frames_processed_count: int, 

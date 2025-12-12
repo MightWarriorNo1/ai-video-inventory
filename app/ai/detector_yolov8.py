@@ -258,54 +258,161 @@ class YOLOv8Detector:
         if image is None or image.size == 0:
             return []
         
-        # Run YOLOv8 inference
-        # YOLOv8 expects RGB images, but cv2 images are BGR
-        # The model will handle conversion internally
-        results = self.model(
-            image,
-            conf=self.conf_threshold,
-            device=self.device,
-            verbose=False  # Disable verbose output
-        )
+        # Validate input image
+        try:
+            # Check for invalid values (NaN, inf)
+            if not isinstance(image, np.ndarray):
+                return []
+            
+            # Check image shape
+            if len(image.shape) != 3 or image.shape[2] != 3:
+                return []
+            
+            # Check for NaN or inf values
+            if np.any(np.isnan(image)) or np.any(np.isinf(image)):
+                print(f"[YOLOv8Detector] Warning: Image contains NaN or inf values, skipping detection")
+                return []
+            
+            # Check image dimensions are valid
+            h, w = image.shape[:2]
+            if h <= 0 or w <= 0 or h > 10000 or w > 10000:
+                print(f"[YOLOv8Detector] Warning: Invalid image dimensions: {h}x{w}, skipping detection")
+                return []
+            
+            # Ensure image is contiguous and in correct dtype
+            if not image.flags['C_CONTIGUOUS']:
+                image = np.ascontiguousarray(image)
+            
+            # Ensure uint8 dtype
+            if image.dtype != np.uint8:
+                # Normalize to uint8 if needed
+                if image.dtype == np.float32 or image.dtype == np.float64:
+                    if image.max() <= 1.0:
+                        image = (image * 255).astype(np.uint8)
+                    else:
+                        image = np.clip(image, 0, 255).astype(np.uint8)
+                else:
+                    image = image.astype(np.uint8)
+            
+        except Exception as e:
+            print(f"[YOLOv8Detector] Error validating input image: {e}")
+            return []
+        
+        # Run YOLOv8 inference with error handling
+        try:
+            results = self.model(
+                image,
+                conf=self.conf_threshold,
+                device=self.device,
+                verbose=False,  # Disable verbose output
+                imgsz=640  # Explicitly set image size to avoid issues
+            )
+        except RuntimeError as e:
+            if 'CUDA' in str(e) or 'cuda' in str(e).lower():
+                print(f"[YOLOv8Detector] CUDA error during inference: {e}")
+                # Try to clear CUDA cache and retry once
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        torch.cuda.synchronize()
+                except:
+                    pass
+                return []
+            else:
+                print(f"[YOLOv8Detector] Runtime error during inference: {e}")
+                return []
+        except Exception as e:
+            print(f"[YOLOv8Detector] Unexpected error during inference: {e}")
+            return []
         
         detections = []
         
-        # Process results
+        # Process results with validation
         # YOLOv8 returns Results object with boxes
-        if len(results) > 0:
-            result = results[0]  # First (and usually only) result
-            
-            # Get boxes (xyxy format: x1, y1, x2, y2)
-            boxes = result.boxes
-            
-            if boxes is not None and len(boxes) > 0:
-                # Extract data
-                boxes_xyxy = boxes.xyxy.cpu().numpy()  # [N, 4] in xyxy format
-                confidences = boxes.conf.cpu().numpy()  # [N]
-                class_ids = boxes.cls.cpu().numpy().astype(int)  # [N]
+        detections = []
+        try:
+            if len(results) > 0:
+                result = results[0]  # First (and usually only) result
                 
-                # Filter to only target class (truck = 7)
-                mask = class_ids == self.target_class
-                boxes_xyxy = boxes_xyxy[mask]
-                confidences = confidences[mask]
-                class_ids = class_ids[mask]
+                # Get boxes (xyxy format: x1, y1, x2, y2)
+                boxes = result.boxes
                 
-                # Convert to detection dicts
-                for i in range(len(boxes_xyxy)):
-                    x1, y1, x2, y2 = boxes_xyxy[i]
+                if boxes is not None and len(boxes) > 0:
+                    # Extract data with validation
+                    try:
+                        boxes_xyxy = boxes.xyxy.cpu().numpy()  # [N, 4] in xyxy format
+                        confidences = boxes.conf.cpu().numpy()  # [N]
+                        class_ids = boxes.cls.cpu().numpy().astype(int)  # [N]
+                    except Exception as e:
+                        print(f"[YOLOv8Detector] Error extracting box data: {e}")
+                        return []
                     
-                    # Clip to image bounds
+                    # Validate extracted data
+                    if boxes_xyxy is None or confidences is None or class_ids is None:
+                        return []
+                    
+                    # Check for invalid values in boxes and confidences
+                    if np.any(np.isnan(boxes_xyxy)) or np.any(np.isinf(boxes_xyxy)):
+                        print(f"[YOLOv8Detector] Warning: Invalid box coordinates (NaN/inf), skipping")
+                        return []
+                    
+                    if np.any(np.isnan(confidences)) or np.any(np.isinf(confidences)):
+                        print(f"[YOLOv8Detector] Warning: Invalid confidence values (NaN/inf), skipping")
+                        return []
+                    
+                    # Filter to only target class
+                    mask = class_ids == self.target_class
+                    boxes_xyxy = boxes_xyxy[mask]
+                    confidences = confidences[mask]
+                    class_ids = class_ids[mask]
+                    
+                    if len(boxes_xyxy) == 0:
+                        return []
+                    
+                    # Convert to detection dicts with validation
                     h, w = image.shape[:2]
-                    x1 = max(0, min(int(x1), w - 1))
-                    y1 = max(0, min(int(y1), h - 1))
-                    x2 = max(0, min(int(x2), w - 1))
-                    y2 = max(0, min(int(y2), h - 1))
-                    
-                    detections.append({
-                        'bbox': [x1, y1, x2, y2],
-                        'cls': int(class_ids[i]),
-                        'conf': float(confidences[i])
-                    })
+                    for i in range(len(boxes_xyxy)):
+                        try:
+                            x1, y1, x2, y2 = boxes_xyxy[i]
+                            conf = float(confidences[i])
+                            cls_id = int(class_ids[i])
+                            
+                            # Validate box coordinates
+                            if np.isnan(x1) or np.isnan(y1) or np.isnan(x2) or np.isnan(y2):
+                                continue
+                            if np.isinf(x1) or np.isinf(y1) or np.isinf(x2) or np.isinf(y2):
+                                continue
+                            
+                            # Validate confidence
+                            if np.isnan(conf) or np.isinf(conf):
+                                continue
+                            
+                            # Ensure valid box (x1 < x2, y1 < y2)
+                            if x1 >= x2 or y1 >= y2:
+                                continue
+                            
+                            # Clip to image bounds
+                            x1 = max(0, min(int(x1), w - 1))
+                            y1 = max(0, min(int(y1), h - 1))
+                            x2 = max(0, min(int(x2), w - 1))
+                            y2 = max(0, min(int(y2), h - 1))
+                            
+                            # Final validation: ensure box is still valid after clipping
+                            if x1 >= x2 or y1 >= y2:
+                                continue
+                            
+                            detections.append({
+                                'bbox': [x1, y1, x2, y2],
+                                'cls': cls_id,
+                                'conf': conf
+                            })
+                        except Exception as e:
+                            print(f"[YOLOv8Detector] Error processing detection {i}: {e}")
+                            continue
+        except Exception as e:
+            print(f"[YOLOv8Detector] Error processing results: {e}")
+            return []
         
         return detections
 
