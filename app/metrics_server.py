@@ -188,7 +188,7 @@ class MetricsServer:
                     return jsonify({'error': f'Failed to find video file: {str(e)}'}), 500
                 
                 # Get detect_every_n parameter safely (must be done in request context)
-                detect_every_n = 5  # default
+                detect_every_n = 20  # default
                 try:
                     if request.is_json:
                         try:

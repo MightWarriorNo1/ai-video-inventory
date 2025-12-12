@@ -105,11 +105,51 @@ class BatchOCRProcessor:
                     # Full image: use direct OCR with try_multiple_preprocessing=True (matching test script)
                     ocr_params = base_ocr_params.copy()
                     ocr_params['try_multiple_preprocessing'] = True  # Critical for full images!
-                    result = self.ocr.recognize(crop_image, **ocr_params)
+                    
+                    # Try OCR with GPU first
+                    result = None
+                    ocr_failed = False
+                    try:
+                        result = self.ocr.recognize(crop_image, **ocr_params)
+                        # Check if result is empty (might indicate GPU memory failure)
+                        if not result.get('text', '').strip() and result.get('conf', 0.0) == 0.0:
+                            # Empty result might be due to GPU memory error - try with resized image
+                            print(f"[BatchOCRProcessor] Empty OCR result for {crop_filename}, trying with resized image...")
+                            # Resize image to 50% to reduce memory usage
+                            h, w = crop_image.shape[:2]
+                            resized = cv2.resize(crop_image, (w // 2, h // 2), interpolation=cv2.INTER_AREA)
+                            result = self.ocr.recognize(resized, **ocr_params)
+                    except RuntimeError as e:
+                        error_str = str(e).lower()
+                        if any(keyword in error_str for keyword in ["gpu", "memory", "cuda", "nvmap", "nvidia"]):
+                            print(f"[BatchOCRProcessor] GPU memory error for {crop_filename}, trying with resized image...")
+                            ocr_failed = True
+                            # Try with resized image (50% size)
+                            try:
+                                h, w = crop_image.shape[:2]
+                                resized = cv2.resize(crop_image, (w // 2, h // 2), interpolation=cv2.INTER_AREA)
+                                result = self.ocr.recognize(resized, **ocr_params)
+                                ocr_failed = False
+                            except Exception as resize_error:
+                                print(f"[BatchOCRProcessor] Resized image also failed: {resize_error}")
+                                result = {'text': '', 'conf': 0.0}
+                    except Exception as e:
+                        print(f"[BatchOCRProcessor] OCR error for {crop_filename}: {e}")
+                        result = {'text': '', 'conf': 0.0}
+                        ocr_failed = True
+                    
+                    # Clean GPU memory after each crop (especially important for oLmOCR)
+                    if self.is_olmocr:
+                        try:
+                            import torch
+                            torch.cuda.empty_cache()
+                        except:
+                            pass
+                    
                     ocr_results[crop_filename] = {
-                        'text': result.get('text', ''),
-                        'conf': result.get('conf', 0.0),
-                        'method': 'original'
+                        'text': result.get('text', '') if result else '',
+                        'conf': result.get('conf', 0.0) if result else 0.0,
+                        'method': 'original' if not ocr_failed else 'error_retry'
                     }
                 elif self.preprocessor and self.preprocessor.enable_ocr_preprocessing:
                     # Cropped region: use preprocessor (multiple preprocessing strategies)

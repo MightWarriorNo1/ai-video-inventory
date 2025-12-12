@@ -1,27 +1,15 @@
 globals:
   use_gstreamer: false  # USB cameras don't use GStreamer (only RTSP streams do)
-  
-  # Detector configuration
-  detector_model: null  # Path to YOLOv8 model file (null = auto-detect fine-tuned model, or use COCO pre-trained)
-                        # Examples:
-                        #   "runs/detect/truck_detector_finetuned/weights/best.pt"
-                        #   "runs/detect/trailer_back_detector/weights/best.pt"
-                        #   "yolov8m.pt" (COCO pre-trained)
-  detector_target_class: null  # Target class ID to detect (null = auto: 0 for fine-tuned, 7 for COCO)
-  detector_conf: 0.25  # Detection confidence threshold
-  detector_device: null  # Device to use ('cuda', 'cpu', or null for auto-detect)
-  
-  detect_every_n: 5    # Run detector every N frames (tracking runs every frame for stability)
-  track_buffer: 150     # Keep lost tracks for 150 frames (5 seconds at 30fps) - maintains stable detection
-  track_match_thresh: 0.5  # IoU threshold for matching tracks (lower = more aggressive reconnection)
+  detector_conf: 0.20  # Detection confidence threshold (lowered to detect more trailers)
+  detect_every_n: 5    # Run detector every N frames (tracking runs every frame)
   save_frames: true    # Save screenshots
   keep_screenshots: 10 # Keep last N screenshots per camera
   
   # Image preprocessing configuration
   preprocessing:
-    enable_yolo: false     # Enable preprocessing for YOLO detection (DISABLED: better detection for partially visible trailers)
+    enable_yolo: true      # Enable preprocessing for YOLO detection
     enable_ocr: true       # Enable preprocessing for OCR recognition
-    yolo_strategy: "enhanced"  # YOLO strategy: "none", "basic", "enhanced" (not used when enable_yolo=false)
+    yolo_strategy: "enhanced"  # YOLO strategy: "none", "basic", "enhanced"
     ocr_strategy: "realworld"  # OCR strategy: "none", "morphological", "clahe", "adaptive", "multi", "realworld"
 
 cameras:
