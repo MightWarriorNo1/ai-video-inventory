@@ -1,0 +1,71 @@
+// API service for fetching data from backend
+
+const API_BASE = '/api'
+
+export const fetchDashboardData = async () => {
+  try {
+    const response = await fetch(`${API_BASE}/dashboard/data`)
+    if (!response.ok) {
+      throw new Error('Failed to fetch dashboard data')
+    }
+    return await response.json()
+  } catch (error) {
+    console.error('Error fetching dashboard data:', error)
+    return null
+  }
+}
+
+export const fetchDashboardEvents = async (limit = 1000) => {
+  try {
+    const response = await fetch(`${API_BASE}/dashboard/events?limit=${limit}`)
+    if (!response.ok) {
+      throw new Error('Failed to fetch events')
+    }
+    const data = await response.json()
+    return data.events || []
+  } catch (error) {
+    console.error('Error fetching events:', error)
+    return []
+  }
+}
+
+export const fetchInventoryData = async () => {
+  try {
+    const response = await fetch(`${API_BASE}/inventory`)
+    if (!response.ok) {
+      throw new Error('Failed to fetch inventory data')
+    }
+    return await response.json()
+  } catch (error) {
+    console.error('Error fetching inventory data:', error)
+    return null
+  }
+}
+
+export const fetchCameras = async () => {
+  try {
+    const response = await fetch(`${API_BASE}/cameras`)
+    if (!response.ok) {
+      throw new Error('Failed to fetch cameras')
+    }
+    const data = await response.json()
+    return data.cameras || []
+  } catch (error) {
+    console.error('Error fetching cameras:', error)
+    return []
+  }
+}
+
+export const fetchEvents = async (limit = 100) => {
+  try {
+    const response = await fetch(`/events?limit=${limit}`)
+    if (!response.ok) {
+      throw new Error('Failed to fetch events')
+    }
+    const data = await response.json()
+    return data.events || []
+  } catch (error) {
+    console.error('Error fetching events:', error)
+    return []
+  }
+}

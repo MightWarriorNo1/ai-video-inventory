@@ -1,0 +1,119 @@
+.yard-view-page {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+
+.yard-view-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background-color: white;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  padding: 20px;
+}
+
+.yard-view-header h2 {
+  font-size: 20px;
+  font-weight: 600;
+  color: #1a1f3a;
+}
+
+.legend {
+  display: flex;
+  gap: 24px;
+}
+
+.legend-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  color: #6b7280;
+}
+
+.legend-color {
+  width: 20px;
+  height: 20px;
+  border-radius: 4px;
+  border: 1px solid #e5e7eb;
+}
+
+.legend-color.occupied {
+  background-color: #ef4444;
+}
+
+.legend-color.available {
+  background-color: #10b981;
+}
+
+.yard-layout {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+
+.lane-section {
+  background-color: white;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  padding: 20px;
+}
+
+.lane-title {
+  font-size: 18px;
+  font-weight: 600;
+  color: #1a1f3a;
+  margin-bottom: 16px;
+}
+
+.spots-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 12px;
+}
+
+.spot-card {
+  border: 2px solid #e5e7eb;
+  border-radius: 8px;
+  padding: 12px;
+  text-align: center;
+  transition: all 0.2s;
+}
+
+.spot-card.occupied {
+  background-color: #fee2e2;
+  border-color: #ef4444;
+}
+
+.spot-card.available {
+  background-color: #d1fae5;
+  border-color: #10b981;
+}
+
+.spot-id {
+  font-size: 12px;
+  font-weight: 600;
+  color: #6b7280;
+  margin-bottom: 8px;
+}
+
+.spot-trailer-id {
+  font-size: 14px;
+  font-weight: 600;
+  color: #1a1f3a;
+  margin-bottom: 4px;
+}
+
+.spot-plate {
+  font-size: 12px;
+  color: #6b7280;
+}
+
+.spot-empty {
+  font-size: 12px;
+  color: #6b7280;
+  font-style: italic;
+}
+

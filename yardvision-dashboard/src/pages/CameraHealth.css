@@ -1,0 +1,55 @@
+.camera-health-page {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+
+.camera-stats {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 20px;
+}
+
+.stat-card {
+  background-color: white;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  padding: 20px;
+  text-align: center;
+}
+
+.stat-label {
+  font-size: 12px;
+  color: #6b7280;
+  margin-bottom: 8px;
+  font-weight: 500;
+}
+
+.stat-value {
+  font-size: 32px;
+  font-weight: 600;
+  color: #1a1f3a;
+}
+
+.camera-health-table-container {
+  background-color: white;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  padding: 20px;
+}
+
+.camera-health-table-container h3 {
+  font-size: 18px;
+  font-weight: 600;
+  color: #1a1f3a;
+  margin-bottom: 16px;
+}
+
+.loading-message,
+.no-cameras-message {
+  text-align: center;
+  padding: 40px;
+  font-size: 16px;
+  color: #6b7280;
+}
+

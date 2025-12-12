@@ -1,0 +1,110 @@
+.yard-map-spot-resolver {
+  background-color: white;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  padding: 20px;
+}
+
+.yard-map-spot-resolver h3 {
+  font-size: 18px;
+  font-weight: 600;
+  color: #1a1f3a;
+  margin-bottom: 16px;
+}
+
+.yard-map-container {
+  display: grid;
+  grid-template-columns: 2fr 1fr;
+  gap: 20px;
+}
+
+.map-placeholder {
+  background-color: #f9fafb;
+  border: 2px dashed #d1d5db;
+  border-radius: 8px;
+  padding: 60px 20px;
+  text-align: center;
+  color: #6b7280;
+  font-size: 14px;
+  min-height: 300px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.selected-trailer-details {
+  background-color: #f9fafb;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  padding: 20px;
+}
+
+.selected-trailer-details h4 {
+  font-size: 16px;
+  font-weight: 600;
+  color: #1a1f3a;
+  margin-bottom: 16px;
+}
+
+.trailer-info {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.info-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.info-label {
+  font-size: 12px;
+  color: #6b7280;
+  font-weight: 500;
+}
+
+.info-value {
+  font-size: 14px;
+  color: #1a1f3a;
+}
+
+.trailer-id {
+  color: #3b82f6;
+  font-weight: 600;
+}
+
+.spot-badge-large {
+  display: inline-block;
+  padding: 6px 12px;
+  background-color: #1e3a8a;
+  color: white;
+  border-radius: 6px;
+  font-size: 14px;
+  font-weight: 600;
+  margin-top: 4px;
+}
+
+.quality-badge {
+  display: inline-block;
+  padding: 6px 12px;
+  background-color: #10b981;
+  color: white;
+  border-radius: 6px;
+  font-size: 14px;
+  font-weight: 600;
+  margin-top: 4px;
+}
+
+.no-selection {
+  text-align: center;
+  padding: 40px 20px;
+  color: #6b7280;
+  font-size: 14px;
+}
+
+@media (max-width: 1024px) {
+  .yard-map-container {
+    grid-template-columns: 1fr;
+  }
+}

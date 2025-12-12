@@ -1,0 +1,71 @@
+.camera-health-table {
+  width: 100%;
+}
+
+.camera-health-table table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.camera-health-table thead th {
+  text-align: left;
+  padding: 12px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #6b7280;
+  text-transform: uppercase;
+  border-bottom: 1px solid #e5e7eb;
+}
+
+.camera-health-table tbody td {
+  padding: 12px;
+  font-size: 14px;
+  color: #1a1f3a;
+  border-bottom: 1px solid #f3f4f6;
+}
+
+.camera-icon {
+  margin-right: 8px;
+  vertical-align: middle;
+  display: inline-block;
+}
+
+.uptime-container {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.uptime-bar {
+  flex: 1;
+  height: 8px;
+  background-color: #f3f4f6;
+  border-radius: 4px;
+  overflow: hidden;
+  max-width: 200px;
+}
+
+.uptime-fill {
+  height: 100%;
+  background-color: #10b981;
+  transition: width 0.3s;
+}
+
+.status-badge {
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.status-badge.online {
+  background-color: #d1fae5;
+  color: #065f46;
+}
+
+.status-badge.degraded {
+  background-color: #fed7aa;
+  color: #92400e;
+}
+

@@ -352,8 +352,8 @@ tbody tr:hover {
 }
 
 .processed-video-container {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
+    display: flex;
+    flex-direction: column;
     gap: 20px;
 }
 
@@ -500,10 +500,6 @@ tbody tr:hover {
 
 @media (max-width: 1024px) {
     .metrics-grid {
-        grid-template-columns: 1fr;
-    }
-    
-    .processed-video-container {
         grid-template-columns: 1fr;
     }
     

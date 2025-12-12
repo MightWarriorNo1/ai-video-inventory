@@ -1,0 +1,82 @@
+.recent-trailer-events {
+  background-color: white;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  padding: 20px;
+  margin-bottom: 24px;
+}
+
+.recent-trailer-events h3 {
+  font-size: 18px;
+  font-weight: 600;
+  color: #1a1f3a;
+  margin-bottom: 16px;
+}
+
+.events-table-wrapper {
+  overflow-x: auto;
+}
+
+.events-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.events-table thead th {
+  text-align: left;
+  padding: 12px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #6b7280;
+  text-transform: uppercase;
+  border-bottom: 1px solid #e5e7eb;
+  background-color: #f9fafb;
+}
+
+.events-table tbody td {
+  padding: 12px;
+  font-size: 14px;
+  color: #1a1f3a;
+  border-bottom: 1px solid #f3f4f6;
+}
+
+.events-table tbody tr {
+  cursor: pointer;
+  transition: background-color 0.2s;
+}
+
+.events-table tbody tr:hover {
+  background-color: #f9fafb;
+}
+
+.events-table tbody tr.selected {
+  background-color: #eff6ff;
+}
+
+.trailer-link {
+  color: #3b82f6;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.spot-badge {
+  display: inline-block;
+  padding: 4px 8px;
+  background-color: #e0e7ff;
+  color: #3730a3;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.no-events {
+  text-align: center;
+  padding: 40px;
+  color: #6b7280;
+}
+
+.loading-message {
+  text-align: center;
+  padding: 40px;
+  color: #6b7280;
+}
