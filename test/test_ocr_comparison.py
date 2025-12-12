@@ -58,20 +58,38 @@ def test_easyocr(image_path: str, use_detection: bool = False, force_cpu: bool =
             detections = []
             try:
                 from app.ai.detector_yolov8 import YOLOv8Detector
-                print("Using YOLOv8 detection to crop truck regions...")
+                print("Using YOLOv8 detection to crop truck/trailer regions...")
+                
+                # Check for fine-tuned model in common training output locations
+                fine_tuned_models = [
+                    "runs/detect/trailer_back_detector/weights/best.pt",
+                    "runs/detect/trailer_back_detector/weights/last.pt",
+                    "models/trailer_detector.pt",
+                ]
+                
+                model_path = "yolov8m.pt"  # Default: COCO pre-trained
+                target_class = 7  # Default: COCO truck class
+                
+                # Try to find fine-tuned model
+                for model in fine_tuned_models:
+                    if os.path.exists(model):
+                        model_path = model
+                        target_class = 0  # Fine-tuned models typically use class 0
+                        print(f"  Found fine-tuned model: {model_path}")
+                        break
                 
                 try:
                     detector = YOLOv8Detector(
-                        model_name="yolov8m.pt",  # YOLOv8m pre-trained on COCO
+                        model_name=model_path,
                         conf_threshold=0.25,
-                        target_class=7,  # COCO class 7 = truck
+                        target_class=target_class,
                         device=None  # Auto-detect device
                     )
                     detections = detector.detect(image)
-                except Exception as det_error:
+                    except Exception as det_error:
                     print(f"YOLOv8 detection failed: {det_error}")
-                    print("Falling back to full image OCR...")
-                    detections = []
+                        print("Falling back to full image OCR...")
+                        detections = []
                     
                     if detections:
                         print(f"Found {len(detections)} trailer detection(s)")

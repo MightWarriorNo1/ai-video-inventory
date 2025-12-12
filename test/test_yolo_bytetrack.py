@@ -2,16 +2,22 @@
 """
 Test YOLOv8 Detection and ByteTrack Tracking on Single Image
 
-This script tests YOLOv8m (COCO pre-trained) truck detection and ByteTrack tracking on a single image.
+This script tests YOLOv8 detection and ByteTrack tracking on a single image.
 It visualizes the detection results with bounding boxes and track IDs.
 
-Uses YOLOv8m pre-trained on COCO dataset, filtered to only detect trucks (class 7).
+Supports both:
+- Pre-trained COCO models (default: yolov8m.pt, detects trucks - class 7)
+- Fine-tuned models (e.g., runs/detect/trailer_back_detector/weights/best.pt, detects trailers - class 0)
 
 Usage:
-    python test/test_yolo_bytetrack.py <image_path> [--output <output_path>] [--conf <confidence>]
+    python test/test_yolo_bytetrack.py <image_path> [--output <output_path>] [--conf <confidence>] [--model <model_path>] [--target-class <class_id>]
     
-Example:
+Examples:
+    # Pre-trained COCO model (trucks)
     python test/test_yolo_bytetrack.py img_00675.jpg --output result.jpg --conf 0.25
+    
+    # Fine-tuned model (trailers)
+    python test/test_yolo_bytetrack.py img_00675.jpg --model runs/detect/trailer_back_detector/weights/best.pt --target-class 0
 """
 
 import sys
@@ -99,7 +105,8 @@ def draw_tracks(image, tracks, color=(255, 0, 0)):
     return image
 
 
-def test_yolo_bytetrack(image_path, output_path=None, conf_threshold=0.20, use_preprocessing=True, show_all_detections=False):
+def test_yolo_bytetrack(image_path, output_path=None, conf_threshold=0.20, use_preprocessing=True, 
+                        show_all_detections=False, model_path=None, target_class=None):
     """
     Test YOLO detection and ByteTrack tracking on a single image.
     
@@ -143,15 +150,36 @@ def test_yolo_bytetrack(image_path, output_path=None, conf_threshold=0.20, use_p
     # Initialize YOLO detector
     print(f"\n[3/5] Initializing YOLOv8 detector...")
     try:
+        # Determine model path and target class
+        if model_path is None:
+            # Default: use pre-trained COCO model
+            model_path = "yolov8m.pt"
+            default_target_class = 7  # COCO class 7 = truck
+            model_description = "yolov8m.pt (COCO pre-trained)"
+        else:
+            # Use fine-tuned model
+            default_target_class = 0  # Fine-tuned models typically use class 0
+            model_description = model_path
+        
+        # Use provided target_class or default
+        if target_class is None:
+            target_class = default_target_class
+        
         detector = YOLOv8Detector(
-            model_name="yolov8m.pt",  # YOLOv8m pre-trained on COCO
+            model_name=model_path,
             conf_threshold=conf_threshold,
-            target_class=7,  # COCO class 7 = truck
+            target_class=target_class,
             device=None  # Auto-detect device (CUDA if available, else CPU)
         )
+        
+        # Get actual class name from detector (reads from model)
+        actual_class_name = "unknown"
+        if hasattr(detector, 'class_names'):
+            actual_class_name = detector.class_names.get(target_class, f'class_{target_class}')
+        
         print(f"  ✓ YOLOv8 detector initialized")
-        print(f"    - Model: yolov8m.pt (COCO pre-trained)")
-        print(f"    - Target class: 7 (truck)")
+        print(f"    - Model: {model_description}")
+        print(f"    - Target class: {target_class} ({actual_class_name})")
         print(f"    - Confidence threshold: {conf_threshold}")
     except Exception as e:
         print(f"✗ Error initializing detector: {e}")
@@ -248,10 +276,11 @@ def test_yolo_bytetrack(image_path, output_path=None, conf_threshold=0.20, use_p
             print(f"\n  [Debug Mode] Checking for detections below threshold...")
             # Create a temporary detector with lower threshold to see all detections
             try:
+                # Use same model and target class as main detector
                 low_conf_detector = YOLOv8Detector(
-                    model_name="yolov8m.pt",
+                    model_name=model_path if model_path else "yolov8m.pt",
                     conf_threshold=0.05,  # Very low threshold to see all detections
-                    target_class=7,  # Truck
+                    target_class=target_class,
                     device=None
                 )
                 all_detections = low_conf_detector.detect(preprocessed_image)
@@ -270,14 +299,22 @@ def test_yolo_bytetrack(image_path, output_path=None, conf_threshold=0.20, use_p
                 print(f"    ⚠ Could not get all detections: {e}")
         
         if len(detections) == 0:
+            # Get class name for better error message
+            class_name = "target objects"
+            if hasattr(detector, 'class_names'):
+                class_name = detector.class_names.get(target_class, f'class {target_class}')
+            
             print(f"\n  ⚠ WARNING: No detections found!")
             print(f"    This could be due to:")
             print(f"    1. Confidence threshold too high (current: {conf_threshold})")
-            print(f"    2. No trucks in image (YOLOv8 only detects trucks, class 7)")
+            print(f"    2. No {class_name} in image (detecting class {target_class})")
             print(f"    3. Model loading/inference error (check error messages above)")
             print(f"\n    Try running with:")
             print(f"    - Lower confidence: python test/test_yolo_bytetrack.py {image_path} --conf 0.10")
             print(f"    - Debug mode: python test/test_yolo_bytetrack.py {image_path} --show-all")
+            if model_path and model_path != "yolov8m.pt":
+                print(f"    - Check if model path is correct: {model_path}")
+                print(f"    - Verify target class is correct (model may use different class IDs)")
         
         # Print detection details
         for i, det in enumerate(detections):
@@ -387,11 +424,18 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python test/test_yolo_bytetrack.py img_00675.jpg
-  python test/test_yolo_bytetrack.py img_00675.jpg --output result.jpg
-  python test/test_yolo_bytetrack.py img_00675.jpg --conf 0.10
-  python test/test_yolo_bytetrack.py img_00675.jpg --show-all
-  python test/test_yolo_bytetrack.py img_00675.jpg --conf 0.25 --no-preprocessing
+    # Use pre-trained COCO model (default)
+    python test/test_yolo_bytetrack.py img_00675.jpg
+    python test/test_yolo_bytetrack.py img_00675.jpg --output result.jpg
+    python test/test_yolo_bytetrack.py img_00675.jpg --conf 0.25
+    
+    # Use fine-tuned model
+    python test/test_yolo_bytetrack.py img_00675.jpg --model runs/detect/trailer_back_detector/weights/best.pt --target-class 0
+    python test/test_yolo_bytetrack.py img_00675.jpg --model runs/detect/trailer_back_detector/weights/best.pt --conf 0.25
+    
+    # Debug mode
+    python test/test_yolo_bytetrack.py img_00675.jpg --show-all
+    python test/test_yolo_bytetrack.py img_00675.jpg --conf 0.25 --no-preprocessing
         """
     )
     
@@ -427,6 +471,20 @@ Examples:
         help='Show all detections including those below confidence threshold (debug mode)'
     )
     
+    parser.add_argument(
+        '--model',
+        type=str,
+        default=None,
+        help='Path to YOLOv8 model file (default: yolov8m.pt for COCO pre-trained). Use trained model path like: runs/detect/trailer_back_detector/weights/best.pt'
+    )
+    
+    parser.add_argument(
+        '--target-class',
+        type=int,
+        default=None,
+        help='Target class ID to detect (default: 7 for COCO truck, 0 for fine-tuned trailer models)'
+    )
+    
     args = parser.parse_args()
     
     success = test_yolo_bytetrack(
@@ -434,7 +492,9 @@ Examples:
         output_path=args.output,
         conf_threshold=args.conf,
         use_preprocessing=not args.no_preprocessing,
-        show_all_detections=args.show_all
+        show_all_detections=args.show_all,
+        model_path=args.model,
+        target_class=args.target_class
     )
     
     sys.exit(0 if success else 1)

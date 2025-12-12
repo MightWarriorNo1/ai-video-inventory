@@ -204,13 +204,30 @@ class YOLOv8Detector:
         self.device = device
         print(f"Using device: {device}")
         
-        # COCO class names for reference
-        self.coco_classes = {
-            0: 'person', 1: 'bicycle', 2: 'car', 3: 'motorcycle', 4: 'airplane',
-            5: 'bus', 6: 'train', 7: 'truck', 8: 'boat', 9: 'traffic light',
-            # ... (full list available but we only care about truck = 7)
-        }
-        print(f"Target class: {target_class} ({self.coco_classes.get(target_class, 'unknown')})")
+        # Get class names from model (works for both COCO and fine-tuned models)
+        try:
+            # YOLOv8 models store class names in model.names
+            if hasattr(self.model, 'names') and self.model.names:
+                self.class_names = self.model.names
+                # Convert to dict if it's a list
+                if isinstance(self.class_names, list):
+                    self.class_names = {i: name for i, name in enumerate(self.class_names)}
+            else:
+                # Fallback to COCO class names
+                self.class_names = {
+                    0: 'person', 1: 'bicycle', 2: 'car', 3: 'motorcycle', 4: 'airplane',
+                    5: 'bus', 6: 'train', 7: 'truck', 8: 'boat', 9: 'traffic light',
+                }
+        except Exception:
+            # Fallback to COCO class names if model doesn't have names
+            self.class_names = {
+                0: 'person', 1: 'bicycle', 2: 'car', 3: 'motorcycle', 4: 'airplane',
+                5: 'bus', 6: 'train', 7: 'truck', 8: 'boat', 9: 'traffic light',
+            }
+        
+        # Display target class with actual class name from model
+        class_name = self.class_names.get(target_class, f'class_{target_class}')
+        print(f"Target class: {target_class} ({class_name})")
     
     def preprocess(self, image: np.ndarray) -> np.ndarray:
         """

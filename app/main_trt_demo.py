@@ -116,20 +116,64 @@ class TrailerVisionApp:
         """Initialize all application components."""
         globals_cfg = self.config.get('globals', {})
         
-        # Initialize detector - YOLOv8m pre-trained on COCO (truck detection only)
+        # Initialize detector - try fine-tuned model first, fallback to COCO pre-trained
         detector_conf = globals_cfg.get('detector_conf', 0.25)
         detector_device = globals_cfg.get('detector_device', None)  # 'cuda', 'cpu', or None for auto
+        detector_model = globals_cfg.get('detector_model', None)  # Path to model file, or None for auto-detect
+        detector_target_class = globals_cfg.get('detector_target_class', None)  # Target class ID, or None for auto
+        
+        # Auto-detect fine-tuned model if not specified
+        if detector_model is None:
+            # Check common training output locations for fine-tuned models
+            fine_tuned_models = [
+                "runs/detect/truck_detector_finetuned/weights/best.pt",
+                "runs/detect/trailer_back_detector/weights/best.pt",
+                "runs/detect/trailer_back_detector/weights/last.pt",
+                "models/trailer_detector.pt",
+                "models/truck_detector.pt",
+            ]
+            
+            for model_path in fine_tuned_models:
+                if os.path.exists(model_path):
+                    detector_model = model_path
+                    print(f"Found fine-tuned model: {detector_model}")
+                    # Fine-tuned models typically use class 0 for single-class detection
+                    if detector_target_class is None:
+                        detector_target_class = 0
+                    break
+        
+        # Use COCO pre-trained model if no fine-tuned model found
+        if detector_model is None:
+            detector_model = "yolov8m.pt"  # YOLOv8m pre-trained on COCO
+            if detector_target_class is None:
+                detector_target_class = 7  # COCO class 7 = truck
+            print(f"Using pre-trained COCO model: {detector_model} (truck detection, class 7)")
+        else:
+            if detector_target_class is None:
+                detector_target_class = 0  # Default to class 0 for fine-tuned models
+            print(f"Using fine-tuned model: {detector_model} (target class: {detector_target_class})")
         
         try:
             self.detector = YOLOv8Detector(
-                model_name="yolov8m.pt",  # YOLOv8m pre-trained on COCO
+                model_name=detector_model,
                 conf_threshold=detector_conf,
-                target_class=7,  # COCO class 7 = truck
+                target_class=detector_target_class,
                 device=detector_device
             )
-            print(f"✓ YOLOv8m detector initialized (truck detection only, class 7)")
+            
+            # Get actual class name from model for display
+            class_name = "unknown"
+            if hasattr(self.detector, 'class_names'):
+                class_name = self.detector.class_names.get(detector_target_class, f'class_{detector_target_class}')
+            
+            print(f"✓ YOLOv8 detector initialized")
+            print(f"  - Model: {detector_model}")
+            print(f"  - Target class: {detector_target_class} ({class_name})")
+            print(f"  - Confidence threshold: {detector_conf}")
         except Exception as e:
             print(f"Warning: Failed to initialize YOLOv8 detector: {e}")
+            import traceback
+            traceback.print_exc()
             self.detector = None
         
         # Initialize OCR - Priority: oLmOCR > EasyOCR > TrOCR > PaddleOCR English-only > Multilingual > Legacy CRNN
@@ -321,9 +365,20 @@ class TrailerVisionApp:
         globals_cfg = self.config.get('globals', {})
         track_thresh = globals_cfg.get('detector_conf', 0.20)
         
+        # Enhanced tracking parameters for stable detection:
+        # - track_buffer: 150 frames (5 seconds at 30fps) - keeps tracks alive longer
+        # - match_thresh: 0.5 - aggressive matching to reconnect tracks
+        # This ensures trucks maintain detection even when detector misses frames
+        track_buffer = globals_cfg.get('track_buffer', 150)  # Keep lost tracks for 150 frames
+        match_thresh = globals_cfg.get('track_match_thresh', 0.5)  # Aggressive matching
+        
         for camera in self.config.get('cameras', []):
             camera_id = camera['id']
-            self.trackers[camera_id] = ByteTrackWrapper(track_thresh=track_thresh)
+            self.trackers[camera_id] = ByteTrackWrapper(
+                track_thresh=track_thresh,
+                track_buffer=track_buffer,  # Keep tracks alive longer
+                match_thresh=match_thresh   # Aggressive matching
+            )
             self.camera_metrics[camera_id] = {
                 'frames_processed': 0,
                 'fps_ema': 0.0,
@@ -478,10 +533,59 @@ class TrailerVisionApp:
             # All detections from detector are trucks, so use them directly
             detections = all_detections
         
-        # Update tracker (now only contains trailer detections)
+        # Update tracker (now only contains truck detections)
+        # Tracker maintains tracks even when no detections come in (uses predicted positions)
         tracks = tracker.update(detections, frame)
         
-        # Process each track (all should be trailers now)
+        # Draw all tracks on frame for visualization (even lost tracks within buffer)
+        # This ensures stable detection display - trucks remain visible even when detector misses frames
+        display_frame = frame.copy()
+        for track in tracks:
+            track_id = track['track_id']
+            bbox = track['bbox']
+            conf = track.get('conf', 0.0)
+            state = track.get('state', 'tracked')
+            
+            x1, y1, x2, y2 = map(int, bbox)
+            
+            # Clip to frame bounds
+            h, w = frame.shape[:2]
+            x1 = max(0, min(x1, w - 1))
+            y1 = max(0, min(y1, h - 1))
+            x2 = max(0, min(x2, w - 1))
+            y2 = max(0, min(y2, h - 1))
+            
+            # Skip invalid bboxes
+            if x2 <= x1 or y2 <= y1:
+                continue
+            
+            # Draw bounding box - green for tracked, yellow for lost (predicted)
+            if state == 'tracked':
+                color = (0, 255, 0)  # Green for confirmed detections
+                thickness = 3
+            else:  # lost
+                color = (0, 255, 255)  # Yellow for predicted (lost but within buffer)
+                thickness = 2
+            
+            cv2.rectangle(display_frame, (x1, y1), (x2, y2), color, thickness)
+            
+            # Draw track ID and confidence
+            label = f"Track {track_id} ({conf:.2f})"
+            if state == 'lost':
+                label += " [PRED]"
+            
+            (text_width, text_height), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+            cv2.rectangle(display_frame, (x1, y1 - text_height - baseline - 5), 
+                         (x1 + text_width, y1), color, -1)
+            cv2.putText(display_frame, label, (x1, y1 - baseline - 2), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+        
+        # Update latest frame with visualizations (for video streaming/display)
+        with self.frame_lock:
+            self.latest_frames[camera_id] = display_frame
+        
+        # Process each track for OCR and events (all should be trucks now)
+        # Use original frame for processing, display_frame is just for visualization
         for track in tracks:
             track_id = track['track_id']
             bbox = track['bbox']

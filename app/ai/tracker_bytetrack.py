@@ -54,10 +54,21 @@ class KalmanFilter:
         """Predict next state."""
         self.state = self.F @ self.state
         self.covariance = self.F @ self.covariance @ self.F.T + self.Q
+        
+        # Validate state after prediction - clamp to reasonable values
+        self.state[2] = max(self.state[2], 1.0)  # Area must be positive
+        self.state[3] = max(min(self.state[3], 100.0), 0.01)  # Aspect ratio in reasonable range
+        # Ensure state values are finite
+        self.state = np.where(np.isfinite(self.state), self.state, 0.0)
     
     def update(self, bbox: List[float]):
         """Update with measurement [x1, y1, x2, y2]."""
         x1, y1, x2, y2 = bbox
+        
+        # Validate input bbox
+        if not all(np.isfinite(v) for v in bbox):
+            return  # Skip update if bbox contains NaN/Inf
+        
         cx = (x1 + x2) / 2.0
         cy = (y1 + y2) / 2.0
         w = x2 - x1
@@ -65,28 +76,76 @@ class KalmanFilter:
         s = w * h
         r = w / (h + 1e-6)
         
+        # Validate computed values
+        if not all(np.isfinite([cx, cy, s, r])) or s <= 0 or r <= 0:
+            return  # Skip update if computed values are invalid
+        
         z = np.array([cx, cy, s, r], dtype=np.float32)
         
         # Kalman update
-        y = z - self.H @ self.state  # Innovation
-        S = self.H @ self.covariance @ self.H.T + self.R  # Innovation covariance
-        K = self.covariance @ self.H.T @ np.linalg.inv(S)  # Kalman gain
-        
-        self.state = self.state + K @ y
-        self.covariance = (np.eye(8) - K @ self.H) @ self.covariance
+        try:
+            y = z - self.H @ self.state  # Innovation
+            S = self.H @ self.covariance @ self.H.T + self.R  # Innovation covariance
+            K = self.covariance @ self.H.T @ np.linalg.inv(S)  # Kalman gain
+            
+            self.state = self.state + K @ y
+            self.covariance = (np.eye(8) - K @ self.H) @ self.covariance
+            
+            # Validate state after update - clamp to reasonable values
+            self.state[2] = max(self.state[2], 1.0)  # Area must be positive
+            self.state[3] = max(min(self.state[3], 100.0), 0.01)  # Aspect ratio in reasonable range
+            # Ensure state values are finite
+            self.state = np.where(np.isfinite(self.state), self.state, 0.0)
+        except (np.linalg.LinAlgError, ValueError):
+            # If Kalman update fails, skip it
+            pass
     
     def get_bbox(self) -> List[float]:
         """Get predicted bounding box [x1, y1, x2, y2]."""
         cx, cy, s, r = self.state[0], self.state[1], self.state[2], self.state[3]
-        h = np.sqrt(s / (r + 1e-6))
-        w = s / (h + 1e-6)
+        
+        # Validate and clamp state values to prevent NaN
+        # Ensure area is positive and aspect ratio is reasonable
+        s = max(s, 1.0)  # Minimum area of 1 pixel
+        r = max(r, 0.01)  # Minimum aspect ratio (avoid division by very small values)
+        r = min(r, 100.0)  # Maximum aspect ratio (prevent extreme values)
+        
+        # Check for NaN or Inf in center coordinates
+        if not np.isfinite(cx) or not np.isfinite(cy):
+            # Return a default bbox if center is invalid
+            return [0.0, 0.0, 100.0, 100.0]
+        
+        # Compute height and width with validation
+        try:
+            h = np.sqrt(s / (r + 1e-6))
+            w = s / (h + 1e-6)
+            
+            # Validate computed dimensions
+            if not np.isfinite(h) or not np.isfinite(w) or h <= 0 or w <= 0:
+                # Fallback: use reasonable defaults based on area
+                h = np.sqrt(s)
+                w = h  # Square fallback
+        except (ValueError, ZeroDivisionError):
+            # Fallback if computation fails
+            h = np.sqrt(s)
+            w = h
+        
+        # Ensure dimensions are finite and positive
+        h = max(h, 1.0) if np.isfinite(h) else 100.0
+        w = max(w, 1.0) if np.isfinite(w) else 100.0
         
         x1 = cx - w / 2
         y1 = cy - h / 2
         x2 = cx + w / 2
         y2 = cy + h / 2
         
-        return [float(x1), float(y1), float(x2), float(y2)]
+        # Final validation: ensure all values are finite
+        bbox = [float(x1), float(y1), float(x2), float(y2)]
+        if any(not np.isfinite(v) for v in bbox):
+            # Return a default bbox if any value is invalid
+            return [0.0, 0.0, 100.0, 100.0]
+        
+        return bbox
 
 
 class ByteTrackWrapper:
@@ -234,15 +293,19 @@ class ByteTrackWrapper:
         for track_id in tracks_to_remove:
             del self.tracks[track_id]
         
-        # Return active tracks
+        # Return active tracks (both tracked and lost tracks within buffer)
+        # This ensures detections remain stable even when detector misses frames
         active_tracks = []
         for track_id, track in self.tracks.items():
-            if track['state'] == 'tracked':
+            # Include both 'tracked' and 'lost' tracks (lost tracks are still within buffer)
+            # Lost tracks use predicted positions from Kalman filter
+            if track['state'] in ['tracked', 'lost']:
                 active_tracks.append({
                     'track_id': track_id,
-                    'bbox': track['bbox'],
+                    'bbox': track['bbox'],  # Uses predicted position for lost tracks
                     'cls': track['cls'],
-                    'conf': track['conf']
+                    'conf': track['conf'],
+                    'state': track['state']  # Include state for visualization
                 })
         
         return active_tracks

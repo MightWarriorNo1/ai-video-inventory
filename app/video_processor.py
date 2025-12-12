@@ -52,7 +52,11 @@ class VideoProcessor:
             if hasattr(self.detector, 'model_name'):
                 print(f"[VideoProcessor] Detector model: {self.detector.model_name}")
             if hasattr(self.detector, 'target_class'):
-                print(f"[VideoProcessor] Detector target class: {self.detector.target_class} (truck)")
+                # Get actual class name from model
+                class_name = "unknown"
+                if hasattr(self.detector, 'class_names'):
+                    class_name = self.detector.class_names.get(self.detector.target_class, f'class_{self.detector.target_class}')
+                print(f"[VideoProcessor] Detector target class: {self.detector.target_class} ({class_name})")
         
         # Check if OCR is oLmOCR (needs GPU memory cleanup)
         self.is_olmocr = ocr is not None and 'OlmOCRRecognizer' in type(ocr).__name__
@@ -236,7 +240,27 @@ class VideoProcessor:
                     filtered_count = 0
                     for track in tracks:
                         bbox = track['bbox']
-                        x1, y1, x2, y2 = [int(v) for v in bbox]
+                        
+                        # Validate bbox before processing - skip if contains NaN or Inf
+                        if not bbox or len(bbox) != 4:
+                            filtered_count += 1
+                            continue
+                        
+                        # Check for NaN or Inf values
+                        if any(not np.isfinite(v) for v in bbox):
+                            filtered_count += 1
+                            if frame_count % 10 == 0:
+                                print(f"[VideoProcessor] Filtered Track {track['track_id']}: invalid bbox (NaN/Inf): {bbox}")
+                            continue
+                        
+                        try:
+                            x1, y1, x2, y2 = [int(v) for v in bbox]
+                        except (ValueError, OverflowError) as e:
+                            filtered_count += 1
+                            if frame_count % 10 == 0:
+                                print(f"[VideoProcessor] Filtered Track {track['track_id']}: cannot convert bbox to int: {bbox}, error: {e}")
+                            continue
+                        
                         width = x2 - x1
                         height = y2 - y1
                         area = width * height
@@ -280,7 +304,13 @@ class VideoProcessor:
                     max_y2 = -1
                     for track in tracks:
                         bbox = track['bbox']
-                        x1, y1, x2, y2 = [int(v) for v in bbox]
+                        # Validate bbox before processing
+                        if not bbox or len(bbox) != 4 or any(not np.isfinite(v) for v in bbox):
+                            continue
+                        try:
+                            x1, y1, x2, y2 = [int(v) for v in bbox]
+                        except (ValueError, OverflowError):
+                            continue
                         if x2 > x1 and y2 > y1:  # Valid bbox
                             if y2 > max_y2:
                                 max_y2 = y2
@@ -295,7 +325,14 @@ class VideoProcessor:
                         bbox = track['bbox']
                         # Get detection confidence from track
                         det_conf = track.get('conf', 0.0)
-                        x1, y1, x2, y2 = [int(v) for v in bbox]
+                        
+                        # Validate bbox before processing
+                        if not bbox or len(bbox) != 4 or any(not np.isfinite(v) for v in bbox):
+                            continue
+                        try:
+                            x1, y1, x2, y2 = [int(v) for v in bbox]
+                        except (ValueError, OverflowError):
+                            continue
                         
                         # Ensure bbox is valid
                         if x2 <= x1 or y2 <= y1:
@@ -332,16 +369,27 @@ class VideoProcessor:
                         width = orig_x2 - orig_x1
                         height = orig_y2 - orig_y1
                         
-                        # Draw green bounding box for ALL trailers (full YOLO detection)
+                        # Draw bounding box for ALL trucks (stable detection display)
                         is_nearest = (track_id == nearest_track_id)
+                        track_state = track.get('state', 'tracked')
                         
-                        # Draw bounding box in green for detected trailer rear face (thicker for better visibility)
+                        # Color coding:
+                        # - Green: Tracked (confirmed detection)
+                        # - Yellow: Lost but within buffer (predicted position - maintains stability)
+                        if track_state == 'tracked':
+                            box_color = (0, 255, 0)  # Green for confirmed
+                            thickness = 3
+                        else:  # lost
+                            box_color = (0, 255, 255)  # Yellow for predicted (maintains stability)
+                            thickness = 2
+                        
+                        # Draw bounding box (thicker for better visibility)
                         # Use display bbox (clipped) for drawing to prevent drawing errors
-                        cv2.rectangle(processed_frame, (display_x1, display_y1), (display_x2, display_y2), (0, 255, 0), 3)
+                        cv2.rectangle(processed_frame, (display_x1, display_y1), (display_x2, display_y2), box_color, thickness)
                             
-                        # Draw semi-transparent green overlay on the bounding box (for all trailers)
+                        # Draw semi-transparent overlay on the bounding box
                         overlay = processed_frame.copy()
-                        cv2.rectangle(overlay, (display_x1, display_y1), (display_x2, display_y2), (0, 255, 0), -1)
+                        cv2.rectangle(overlay, (display_x1, display_y1), (display_x2, display_y2), box_color, -1)
                         cv2.addWeighted(overlay, 0.1, processed_frame, 0.9, 0, processed_frame)
                         
                         # Draw detection confidence and track ID above the box
@@ -350,6 +398,10 @@ class VideoProcessor:
                             conf_text = f"Track {track_id} - {det_conf_percent:.1f}% [NEAREST]"
                         else:
                             conf_text = f"Track {track_id} - {det_conf_percent:.1f}%"
+                        
+                        # Add state indicator for lost tracks
+                        if track_state == 'lost':
+                            conf_text += " [PRED]"
                         text_size = cv2.getTextSize(conf_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
                         
                         # Draw black background for text
@@ -360,9 +412,10 @@ class VideoProcessor:
                                      (text_x + text_size[0] + 2, text_y + 2),
                                      (0, 0, 0), -1)
                         
-                        # Draw text (green for all trailers)
+                        # Draw text (use same color as box)
+                        text_color = box_color
                         cv2.putText(processed_frame, conf_text, (text_x, text_y),
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, text_color, 2)
                         
                         # Draw trailer size below track ID (only for nearest)
                         if is_nearest:
