@@ -5,10 +5,14 @@ Handles RTSP/USB camera capture using OpenCV.
 For Jetson production, use GStreamer pipeline for NVDEC hardware acceleration.
 """
 
+import os
+# Suppress OpenCV warnings at module level
+os.environ['OPENCV_LOG_LEVEL'] = 'ERROR'
+os.environ['OPENCV_VIDEOIO_DEBUG'] = '0'
+
 import cv2
 import numpy as np
 from typing import Optional, Generator, Tuple
-import os
 
 
 def build_gstreamer_pipeline(rtsp_url: str, width: int, height: int, fps: int = 30) -> str:
@@ -70,7 +74,8 @@ def open_stream(rtsp_url: str, width: int, height: int, fps_cap: int = 30, use_g
         cap = cv2.VideoCapture(rtsp_url)
     
     if not cap.isOpened():
-        print(f"Failed to open stream: {rtsp_url}")
+        # Don't print error - let caller handle it
+        # This is expected when checking camera availability
         return None
     
     return cap
@@ -98,6 +103,7 @@ def frame_generator(cap: cv2.VideoCapture) -> Generator[Tuple[bool, Optional[np.
 def test_stream(rtsp_url: str, width: int, height: int, use_gstreamer: bool = False) -> bool:
     """
     Test if a stream can be opened and read.
+    Suppresses OpenCV warnings during testing.
     
     Args:
         rtsp_url: RTSP URL or device index
@@ -108,12 +114,44 @@ def test_stream(rtsp_url: str, width: int, height: int, use_gstreamer: bool = Fa
     Returns:
         True if stream is accessible, False otherwise
     """
-    cap = open_stream(rtsp_url, width, height, use_gstreamer=use_gstreamer)
-    if cap is None:
+    try:
+        # Suppress OpenCV warnings using multiple methods
+        import os
+        import sys
+        from contextlib import redirect_stderr
+        
+        # Method 1: Set OpenCV log level to ERROR (suppress WARN and INFO)
+        try:
+            cv2.setLogLevel(1)  # 0=VERBOSE, 1=ERROR, 2=WARN, 3=INFO, 4=DEBUG, 5=SILENT
+        except:
+            pass  # Older OpenCV versions might not have this
+        
+        # Method 2: Redirect stderr to devnull
+        old_stderr = sys.stderr
+        try:
+            with open(os.devnull, 'w') as devnull:
+                sys.stderr = devnull
+                try:
+                    cap = open_stream(rtsp_url, width, height, use_gstreamer=use_gstreamer)
+                    if cap is None:
+                        return False
+                    
+                    ret, frame = cap.read()
+                    cap.release()
+                    return ret and frame is not None
+                finally:
+                    sys.stderr = old_stderr
+        except:
+            sys.stderr = old_stderr
+            return False
+    except Exception:
+        # Any exception means camera is not accessible
         return False
-    
-    ret, frame = cap.read()
-    cap.release()
-    return ret and frame is not None
+    finally:
+        # Restore OpenCV log level
+        try:
+            cv2.setLogLevel(2)  # Restore to WARN level
+        except:
+            pass
 
 

@@ -74,8 +74,22 @@ class MetricsServer:
     
     def _setup_error_handlers(self):
         """Setup Flask error handlers."""
+        from werkzeug.exceptions import NotFound
+        
+        @self.app.errorhandler(NotFound)
+        def handle_not_found(e):
+            """Handle 404 Not Found errors gracefully."""
+            # Don't log 404s for static files as errors - they're expected
+            return jsonify({'error': 'Not found'}), 404
+        
         @self.app.errorhandler(Exception)
         def handle_exception(e):
+            """Handle all other exceptions."""
+            # Skip logging for NotFound exceptions (already handled above)
+            from werkzeug.exceptions import NotFound
+            if isinstance(e, NotFound):
+                return jsonify({'error': 'Not found'}), 404
+            
             import traceback
             error_msg = str(e)
             traceback_str = traceback.format_exc()
@@ -86,17 +100,8 @@ class MetricsServer:
     def _setup_routes(self):
         """Setup Flask routes."""
         
-        @self.app.route('/')
-        def index():
-            """Serve dashboard index.html."""
-            web_dir = Path(__file__).parent.parent / 'web'
-            return send_from_directory(str(web_dir), 'index.html')
-        
-        @self.app.route('/<path:path>')
-        def static_files(path):
-            """Serve static files (JS, CSS)."""
-            web_dir = Path(__file__).parent.parent / 'web'
-            return send_from_directory(str(web_dir), path)
+        # API routes must be defined BEFORE catch-all routes
+        # to ensure they are matched first
         
         @self.app.route('/metrics.json')
         def metrics_json():
@@ -402,6 +407,555 @@ class MetricsServer:
                 self._generate_processed_mjpeg(),
                 mimetype='multipart/x-mixed-replace; boundary=frame'
             )
+        
+        @self.app.route('/api/dashboard/data', methods=['GET'])
+        def get_dashboard_data():
+            """Get dashboard data aggregated from combined_results.json files."""
+            try:
+                data = self._get_dashboard_data_from_json()
+                return jsonify(data)
+            except Exception as e:
+                print(f"[MetricsServer] Error getting dashboard data: {e}")
+                import traceback
+                traceback.print_exc()
+                return jsonify({'error': str(e)}), 500
+        
+        @self.app.route('/api/dashboard/events', methods=['GET'])
+        def get_dashboard_events():
+            """Get events from combined_results.json files."""
+            try:
+                limit = int(request.args.get('limit', 1000))
+                events = self._get_events_from_json(limit)
+                return jsonify({'events': events, 'count': len(events)})
+            except Exception as e:
+                print(f"[MetricsServer] Error getting dashboard events: {e}")
+                import traceback
+                traceback.print_exc()
+                return jsonify({'error': str(e)}), 500
+        
+        @self.app.route('/api/cameras', methods=['GET'])
+        def get_cameras():
+            """Get list of cameras from cameras.yaml with status."""
+            try:
+                # Check if force refresh is requested
+                force_check = request.args.get('force', 'false').lower() == 'true'
+                cameras = self._get_cameras_with_status(force_check=force_check)
+                return jsonify({'cameras': cameras})
+            except Exception as e:
+                print(f"[MetricsServer] Error getting cameras: {e}")
+                import traceback
+                traceback.print_exc()
+                return jsonify({'error': str(e)}), 500
+        
+        @self.app.route('/api/inventory', methods=['GET'])
+        def get_inventory():
+            """Get inventory data from combined_results.json files."""
+            try:
+                data = self._get_inventory_from_json()
+                return jsonify(data)
+            except Exception as e:
+                print(f"[MetricsServer] Error getting inventory data: {e}")
+                import traceback
+                traceback.print_exc()
+                return jsonify({'error': str(e)}), 500
+        
+        # Static file routes must be LAST (after all API routes)
+        # to avoid catching API requests
+        
+        @self.app.route('/')
+        def index():
+            """Serve dashboard index.html."""
+            web_dir = Path(__file__).parent.parent / 'web'
+            return send_from_directory(str(web_dir), 'index.html')
+        
+        @self.app.route('/<path:path>')
+        def static_files(path):
+            """Serve static files (JS, CSS). Excludes /api/* paths."""
+            # Don't serve API paths as static files
+            if path.startswith('api/'):
+                return jsonify({'error': 'API endpoint not found'}), 404
+            
+            web_dir = Path(__file__).parent.parent / 'web'
+            file_path = web_dir / path
+            
+            # Check if file exists before trying to serve it
+            if not file_path.exists() or not file_path.is_file():
+                # File doesn't exist - return 404 (this will be handled by NotFound handler)
+                from werkzeug.exceptions import NotFound
+                raise NotFound()
+            
+            # File exists - serve it
+            return send_from_directory(str(web_dir), path)
+    
+    def _get_dashboard_data_from_json(self) -> Dict:
+        """Get dashboard data aggregated from combined_results.json files."""
+        base_dir = Path(__file__).parent.parent / 'out' / 'crops' / 'test-video'
+        
+        # Find all combined_results.json files
+        combined_files = []
+        if base_dir.exists():
+            for folder in base_dir.iterdir():
+                if folder.is_dir():
+                    json_file = folder / 'combined_results.json'
+                    if json_file.exists():
+                        combined_files.append(json_file)
+        
+        if not combined_files:
+            # Return empty/default data structure
+            return {
+                'kpis': {
+                    'trailersOnYard': {'value': 0, 'change': '+0', 'icon': '🚛'},
+                    'newDetections24h': {'value': 0, 'ocrAccuracy': '0%', 'icon': '📈'},
+                    'anomalies': {'value': 0, 'description': 'No anomalies detected', 'icon': '⚠️'},
+                    'camerasOnline': {'value': 0, 'degraded': 0, 'icon': '📷'}
+                },
+                'queueStatus': {'ingestQ': 0, 'ocrQ': 0, 'pubQ': 0},
+                'accuracyChart': [],
+                'yardUtilization': [],
+                'cameraHealth': []
+            }
+        
+        # Read and aggregate all combined results
+        all_results = []
+        for json_file in combined_files:
+            try:
+                with open(json_file, 'r', encoding='utf-8') as f:
+                    results = json.load(f)
+                    if isinstance(results, list):
+                        all_results.extend(results)
+            except Exception as e:
+                print(f"[MetricsServer] Error reading {json_file}: {e}")
+                continue
+        
+        if not all_results:
+            return {
+                'kpis': {
+                    'trailersOnYard': {'value': 0, 'change': '+0', 'icon': '🚛'},
+                    'newDetections24h': {'value': 0, 'ocrAccuracy': '0%', 'icon': '📈'},
+                    'anomalies': {'value': 0, 'description': 'No anomalies detected', 'icon': '⚠️'},
+                    'camerasOnline': {'value': 0, 'degraded': 0, 'icon': '📷'}
+                },
+                'queueStatus': {'ingestQ': 0, 'ocrQ': 0, 'pubQ': 0},
+                'accuracyChart': [],
+                'yardUtilization': [],
+                'cameraHealth': []
+            }
+        
+        # Calculate KPIs
+        unique_tracks = set()
+        unique_spots = set()
+        ocr_successful = 0
+        total_detections = len(all_results)
+        low_conf_detections = 0
+        today = datetime.now().date()
+        
+        for result in all_results:
+            track_id = result.get('track_id')
+            if track_id:
+                unique_tracks.add(track_id)
+            
+            spot = result.get('spot', '')
+            if spot and spot != 'unknown':
+                unique_spots.add(spot)
+            
+            ocr_text = result.get('ocr_text', '')
+            if ocr_text and ocr_text.strip():
+                ocr_successful += 1
+            
+            det_conf = result.get('det_conf', 0.0)
+            if isinstance(det_conf, (int, float)) and det_conf < 0.5:
+                low_conf_detections += 1
+            
+            # Check if detection is from today
+            timestamp = result.get('timestamp', '')
+            if timestamp:
+                try:
+                    result_date = datetime.fromisoformat(timestamp.replace('Z', '+00:00')).date()
+                    if result_date == today:
+                        pass  # Could track today's detections here
+                except:
+                    pass
+        
+        # Calculate OCR accuracy
+        ocr_accuracy = (ocr_successful / total_detections * 100) if total_detections > 0 else 0
+        
+        # Get camera health
+        cameras = self._get_cameras_with_status()
+        online_cameras = sum(1 for c in cameras if c.get('status') == 'online')
+        degraded_cameras = sum(1 for c in cameras if c.get('status') == 'degraded')
+        
+        # Build accuracy chart data (today only)
+        accuracy_data = []
+        # Group by hour for chart, filter by today's date
+        from collections import defaultdict
+        hourly_data = defaultdict(lambda: {
+            'total': 0, 
+            'total_det_conf': 0.0,
+            'total_ocr_conf': 0.0,
+            'ocr_attempts': 0  # Count of detections where OCR was actually attempted
+        })
+        
+        today = datetime.now().date()
+        
+        for result in all_results:
+            timestamp = result.get('timestamp', '')
+            if timestamp:
+                try:
+                    dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                    result_date = dt.date()
+                    
+                    # Only include results from today
+                    if result_date != today:
+                        continue
+                    
+                    hour_key = dt.strftime('%H:00')
+                    hourly_data[hour_key]['total'] += 1
+                    
+                    # For detection accuracy, use the actual confidence value
+                    # Detection accuracy = average confidence of detections
+                    det_conf = result.get('det_conf', 0.0)
+                    if isinstance(det_conf, (int, float)):
+                        det_conf_float = float(det_conf)
+                        hourly_data[hour_key]['total_det_conf'] += det_conf_float
+                    
+                    # For OCR accuracy, use the OCR confidence value
+                    # Only count detections where OCR was actually attempted
+                    ocr_conf = result.get('ocr_conf', 0.0)
+                    if isinstance(ocr_conf, (int, float)):
+                        ocr_conf_float = float(ocr_conf)
+                        # Only count if OCR was attempted (confidence > 0 or text exists)
+                        ocr_text = result.get('ocr_text', '') or result.get('text', '')
+                        if ocr_conf_float > 0 or (ocr_text and ocr_text.strip()):
+                            hourly_data[hour_key]['total_ocr_conf'] += ocr_conf_float
+                            hourly_data[hour_key]['ocr_attempts'] += 1
+                except Exception as e:
+                    # Skip invalid timestamps
+                    continue
+        
+        # Generate data for all 24 hours of today (even if no data)
+        # This ensures the chart shows the full day
+        for hour in range(24):
+            hour_key = f"{hour:02d}:00"
+            data = hourly_data.get(hour_key, {
+                'total': 0, 
+                'total_det_conf': 0.0,
+                'total_ocr_conf': 0.0,
+                'ocr_attempts': 0
+            })
+            
+            # Calculate detection accuracy (average detection confidence * 100)
+            if data['total'] > 0:
+                avg_det_conf = data['total_det_conf'] / data['total']
+                detection_accuracy = avg_det_conf * 100
+            else:
+                detection_accuracy = 0
+            
+            # Calculate OCR accuracy (average OCR confidence * 100)
+            # Only average over detections where OCR was actually attempted
+            # This gives a more accurate representation of OCR quality
+            if data['ocr_attempts'] > 0:
+                avg_ocr_conf = data['total_ocr_conf'] / data['ocr_attempts']
+                ocr_accuracy = avg_ocr_conf * 100
+            elif data['total'] > 0:
+                # If there are detections but no OCR attempts, accuracy is 0%
+                ocr_accuracy = 0
+            else:
+                # No data for this hour
+                ocr_accuracy = 0
+            
+            accuracy_data.append({
+                'time': hour_key,
+                'detection': round(detection_accuracy, 1),
+                'ocr': round(ocr_accuracy, 1)
+            })
+        
+        # Build yard utilization data
+        spot_counts = defaultdict(int)
+        for result in all_results:
+            spot = result.get('spot', '')
+            if spot and spot != 'unknown':
+                spot_counts[spot] += 1
+        
+        utilization_data = []
+        for spot, count in sorted(spot_counts.items()):
+            utilization_data.append({
+                'lane': spot,
+                'utilization': count
+            })
+        
+        return {
+            'kpis': {
+                'trailersOnYard': {
+                    'value': len(unique_tracks),
+                    'change': f'+{len(unique_tracks)}',
+                    'icon': '🚛'
+                },
+                'newDetections24h': {
+                    'value': total_detections,
+                    'ocrAccuracy': f'{ocr_accuracy:.1f}%',
+                    'icon': '📈'
+                },
+                'anomalies': {
+                    'value': low_conf_detections,
+                    'description': f'{low_conf_detections} low confidence detections',
+                    'icon': '⚠️'
+                },
+                'camerasOnline': {
+                    'value': online_cameras,
+                    'degraded': degraded_cameras,
+                    'icon': '📷'
+                }
+            },
+            'queueStatus': {
+                'ingestQ': 0,
+                'ocrQ': 0,
+                'pubQ': 0
+            },
+            'accuracyChart': accuracy_data,  # Direct array, not wrapped in 'data'
+            'yardUtilization': utilization_data,  # Direct array, not wrapped in 'data'
+            'cameraHealth': cameras
+        }
+    
+    def _get_events_from_json(self, limit: int = 1000) -> List[Dict]:
+        """Get events from combined_results.json files."""
+        base_dir = Path(__file__).parent.parent / 'out' / 'crops' / 'test-video'
+        
+        # Find all combined_results.json files
+        combined_files = []
+        if base_dir.exists():
+            for folder in base_dir.iterdir():
+                if folder.is_dir():
+                    json_file = folder / 'combined_results.json'
+                    if json_file.exists():
+                        combined_files.append(json_file)
+        
+        all_events = []
+        for json_file in combined_files:
+            try:
+                with open(json_file, 'r', encoding='utf-8') as f:
+                    results = json.load(f)
+                    if isinstance(results, list):
+                        for result in results:
+                            # Transform to event format expected by frontend
+                            # Frontend expects 'text' for OCR text, not 'ocr_text'
+                            ocr_text = result.get('ocr_text', '') or result.get('text', '')
+                            event = {
+                                'ts_iso': result.get('timestamp', ''),
+                                'camera_id': result.get('camera_id', 'N/A'),
+                                'track_id': result.get('track_id', 'N/A'),
+                                'text': ocr_text,  # Frontend expects 'text' for OCR result
+                                'conf': result.get('det_conf', 0.0),
+                                'spot': result.get('spot', 'unknown'),
+                                'ocr_conf': result.get('ocr_conf', 0.0),
+                                'frame_count': result.get('frame_count', 0),
+                                'bbox': result.get('bbox', []),
+                                'world_coords': result.get('world_coords', {}),
+                                # Keep original fields for reference
+                                'ocr_text': ocr_text,
+                                'det_conf': result.get('det_conf', 0.0)
+                            }
+                            all_events.append(event)
+            except Exception as e:
+                print(f"[MetricsServer] Error reading {json_file}: {e}")
+                continue
+        
+        # Sort by timestamp (most recent first)
+        all_events.sort(key=lambda x: x.get('ts_iso', ''), reverse=True)
+        
+        # Return limited results
+        return all_events[:limit]
+    
+    def _get_inventory_from_json(self) -> Dict:
+        """Get inventory data from combined_results.json files."""
+        base_dir = Path(__file__).parent.parent / 'out' / 'crops' / 'test-video'
+        
+        # Find all combined_results.json files
+        combined_files = []
+        if base_dir.exists():
+            for folder in base_dir.iterdir():
+                if folder.is_dir():
+                    json_file = folder / 'combined_results.json'
+                    if json_file.exists():
+                        combined_files.append(json_file)
+        
+        if not combined_files:
+            return {
+                'trailers': [],
+                'stats': {
+                    'total': 0,
+                    'parked': 0,
+                    'inTransit': 0,
+                    'anomalies': 0
+                }
+            }
+        
+        # Read and aggregate all combined results
+        all_results = []
+        for json_file in combined_files:
+            try:
+                with open(json_file, 'r', encoding='utf-8') as f:
+                    results = json.load(f)
+                    if isinstance(results, list):
+                        all_results.extend(results)
+            except Exception as e:
+                print(f"[MetricsServer] Error reading {json_file}: {e}")
+                continue
+        
+        # Group by track_id to get unique trailers
+        from collections import defaultdict
+        trailers_by_track = defaultdict(list)
+        
+        for result in all_results:
+            track_id = result.get('track_id')
+            if track_id:
+                trailers_by_track[track_id].append(result)
+        
+        # Build trailer list (one per unique track_id)
+        trailers = []
+        for track_id, results_list in trailers_by_track.items():
+            # Get the most recent result for this track
+            most_recent = max(results_list, key=lambda x: x.get('timestamp', ''))
+            
+            ocr_text = most_recent.get('ocr_text', '') or most_recent.get('text', '')
+            spot = most_recent.get('spot', 'unknown')
+            timestamp = most_recent.get('timestamp', '')
+            ocr_conf = most_recent.get('ocr_conf', 0.0)
+            det_conf = most_recent.get('det_conf', 0.0)
+            
+            # Determine status based on spot and confidence
+            if spot == 'unknown' or not spot:
+                status = 'In Transit'
+            else:
+                status = 'Parked'
+            
+            # Use track_id as trailer ID, or generate one
+            trailer_id = f"T{track_id}" if track_id else f"T{len(trailers) + 1}"
+            
+            trailer = {
+                'id': trailer_id,
+                'plate': ocr_text if ocr_text.strip() else 'N/A',
+                'spot': spot if spot != 'unknown' else 'N/A',
+                'status': status,
+                'detectedAt': timestamp,
+                'ocrConfidence': float(ocr_conf) if ocr_conf else 0.0
+            }
+            
+            trailers.append(trailer)
+        
+        # Calculate stats
+        total = len(trailers)
+        parked = sum(1 for t in trailers if t['status'] == 'Parked')
+        in_transit = sum(1 for t in trailers if t['status'] == 'In Transit')
+        anomalies = sum(1 for r in all_results if r.get('det_conf', 1.0) < 0.5)
+        
+        return {
+            'trailers': trailers,
+            'stats': {
+                'total': total,
+                'parked': parked,
+                'inTransit': in_transit,
+                'anomalies': anomalies
+            }
+        }
+    
+    def _get_cameras_with_status(self, force_check: bool = False) -> List[Dict]:
+        """
+        Get cameras from cameras.yaml and check their status.
+        Uses caching to avoid testing cameras on every request.
+        
+        Args:
+            force_check: If True, force a fresh camera status check (bypass cache)
+        """
+        import yaml
+        import time
+        
+        # Cache camera status for 30 seconds to avoid repeated tests
+        if not hasattr(self, '_camera_cache'):
+            self._camera_cache = {'data': [], 'timestamp': 0}
+        
+        cache_ttl = 30  # Cache for 30 seconds
+        current_time = time.time()
+        
+        # Return cached data if still valid and not forcing a check
+        if not force_check and (current_time - self._camera_cache['timestamp']) < cache_ttl:
+            return self._camera_cache['data']
+        
+        config_path = Path(__file__).parent.parent / 'config' / 'cameras.yaml'
+        if not config_path.exists():
+            return []
+        
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                config = yaml.safe_load(f)
+        except Exception as e:
+            print(f"[MetricsServer] Error reading cameras.yaml: {e}")
+            return []
+        
+        cameras = config.get('cameras', [])
+        globals_cfg = config.get('globals', {})
+        use_gstreamer = globals_cfg.get('use_gstreamer', False)
+        
+        camera_list = []
+        for camera in cameras:
+            camera_id = camera.get('id', 'unknown')
+            rtsp_url = camera.get('rtsp_url', '')
+            width = camera.get('width', 1920)
+            height = camera.get('height', 1080)
+            fps_cap = camera.get('fps_cap', 30)
+            
+            # Determine camera type
+            if rtsp_url.isdigit() or rtsp_url == '0':
+                camera_type = 'USB'
+                device_index = int(rtsp_url)
+            elif rtsp_url.startswith('rtsp://'):
+                camera_type = 'RTSP'
+            else:
+                camera_type = 'Unknown'
+            
+            # Test camera connectivity (only if force_check or cache expired)
+            status = 'offline'
+            fps = 0
+            latency = 0
+            
+            try:
+                # Test camera connectivity (warnings are suppressed in test_stream)
+                from app.rtsp import test_stream
+                is_accessible = test_stream(rtsp_url, width, height, use_gstreamer)
+                
+                if is_accessible:
+                    status = 'online'
+                    fps = fps_cap  # Use configured FPS as default
+                    latency = 50  # Default latency estimate
+                else:
+                    status = 'offline'
+                    fps = 0
+                    latency = 0
+            except Exception:
+                # Camera is not accessible - mark as offline
+                # This is expected when cameras are not connected
+                status = 'offline'
+                fps = 0
+                latency = 0
+            
+            camera_info = {
+                'id': camera_id,
+                'name': camera_id,
+                'type': camera_type,
+                'rtsp_url': rtsp_url,
+                'status': status,
+                'fps': fps,
+                'latency': latency,
+                'width': width,
+                'height': height,
+                'fps_cap': fps_cap
+            }
+            
+            camera_list.append(camera_info)
+        
+        # Update cache
+        self._camera_cache = {'data': camera_list, 'timestamp': current_time}
+        
+        return camera_list
     
     def _get_metrics(self) -> Dict:
         """Get current metrics snapshot."""

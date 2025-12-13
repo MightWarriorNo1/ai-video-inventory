@@ -7,20 +7,27 @@ const Inventory = () => {
   const [data, setData] = useState(fallbackData)
   const [loading, setLoading] = useState(true)
 
-  useEffect(() => {
-    const loadData = async () => {
-      setLoading(true)
-      const inventoryData = await fetchInventoryData()
-      if (inventoryData) {
-        setData(inventoryData)
-      }
-      setLoading(false)
+  const loadData = async () => {
+    setLoading(true)
+    const inventoryData = await fetchInventoryData()
+    if (inventoryData) {
+      setData(inventoryData)
     }
-    
+    setLoading(false)
+  }
+
+  useEffect(() => {
     loadData()
-    // Refresh every 10 seconds
-    const interval = setInterval(loadData, 10000)
-    return () => clearInterval(interval)
+    
+    // Listen for refresh event from sync button
+    const handleRefresh = () => {
+      loadData()
+    }
+    window.addEventListener('refresh-data', handleRefresh)
+    
+    return () => {
+      window.removeEventListener('refresh-data', handleRefresh)
+    }
   }, [])
 
   if (loading) {
@@ -75,28 +82,47 @@ const Inventory = () => {
             </tr>
           </thead>
           <tbody>
-            {trailers.map((trailer) => (
-              <tr key={trailer.id}>
-                <td>{trailer.id}</td>
-                <td>{trailer.plate}</td>
-                <td>{trailer.spot}</td>
-                <td>
-                  <span className={`status-badge ${trailer.status.toLowerCase()}`}>
-                    {trailer.status}
-                  </span>
-                </td>
-                <td>{new Date(trailer.detectedAt).toLocaleString()}</td>
-                <td>
-                  <div className="confidence-bar">
-                    <div 
-                      className="confidence-fill" 
-                      style={{ width: `${trailer.ocrConfidence * 100}%` }}
-                    />
-                    <span>{(trailer.ocrConfidence * 100).toFixed(1)}%</span>
-                  </div>
+            {trailers.length === 0 ? (
+              <tr>
+                <td colSpan="6" className="no-data">
+                  No trailers found. Make sure combined_results.json files exist in out/crops/test-video/ folders.
                 </td>
               </tr>
-            ))}
+            ) : (
+              trailers.map((trailer) => {
+                let detectedAtStr = 'N/A'
+                try {
+                  if (trailer.detectedAt) {
+                    detectedAtStr = new Date(trailer.detectedAt).toLocaleString()
+                  }
+                } catch (e) {
+                  detectedAtStr = trailer.detectedAt || 'N/A'
+                }
+                
+                return (
+                  <tr key={trailer.id}>
+                    <td>{trailer.id}</td>
+                    <td>{trailer.plate || 'N/A'}</td>
+                    <td>{trailer.spot || 'N/A'}</td>
+                    <td>
+                      <span className={`status-badge ${(trailer.status || 'unknown').toLowerCase().replace(' ', '-')}`}>
+                        {trailer.status || 'Unknown'}
+                      </span>
+                    </td>
+                    <td>{detectedAtStr}</td>
+                    <td>
+                      <div className="confidence-bar">
+                        <div 
+                          className="confidence-fill" 
+                          style={{ width: `${(trailer.ocrConfidence || 0) * 100}%` }}
+                        />
+                        <span>{((trailer.ocrConfidence || 0) * 100).toFixed(1)}%</span>
+                      </div>
+                    </td>
+                  </tr>
+                )
+              })
+            )}
           </tbody>
         </table>
       </div>

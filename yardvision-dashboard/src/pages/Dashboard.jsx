@@ -17,30 +17,39 @@ const Dashboard = () => {
   const [loading, setLoading] = useState(true)
   const [selectedEvent, setSelectedEvent] = useState(null)
 
-  useEffect(() => {
-    const loadData = async () => {
-      setLoading(true)
-      const [dashboardData, camerasData] = await Promise.all([
-        fetchDashboardData(),
-        fetchCameras()
-      ])
-      
-      if (dashboardData) {
-        setData(dashboardData)
-      }
-      if (camerasData) {
-        setCameras(camerasData)
-      }
-      setLoading(false)
-    }
+  // Load data function that can be called manually
+  const loadData = async (forceRefresh = false) => {
+    setLoading(true)
+    const [dashboardData, camerasData] = await Promise.all([
+      fetchDashboardData(),
+      fetchCameras(forceRefresh)  // Force camera refresh when sync is clicked
+    ])
     
+    if (dashboardData) {
+      setData(dashboardData)
+    }
+    if (camerasData) {
+      setCameras(camerasData)
+    }
+    setLoading(false)
+  }
+
+  // Load data only once on mount
+  useEffect(() => {
     loadData()
-    // Refresh every 5 seconds
-    const interval = setInterval(loadData, 5000)
-    return () => clearInterval(interval)
+    
+    // Listen for refresh event from sync button
+    const handleRefresh = () => {
+      loadData(true)  // Force refresh when sync button is clicked
+    }
+    window.addEventListener('refresh-data', handleRefresh)
+    
+    return () => {
+      window.removeEventListener('refresh-data', handleRefresh)
+    }
   }, [])
 
-  const { kpis, queueStatus, accuracyChart, yardUtilization } = data
+  const { kpis = {}, queueStatus = {}, accuracyChart = [], yardUtilization = [] } = data
   
   // Use real camera data if available, otherwise use data from dashboard
   const cameraHealth = cameras.length > 0 ? cameras : data.cameraHealth
@@ -66,27 +75,27 @@ const Dashboard = () => {
       <div className="kpi-grid">
         <KPICard
           title="Trailers on Yard"
-          value={kpis.trailersOnYard.value}
-          subtitle={kpis.trailersOnYard.change}
-          icon={kpis.trailersOnYard.icon}
+          value={kpis.trailersOnYard?.value || 0}
+          subtitle={kpis.trailersOnYard?.change || '+0'}
+          icon={kpis.trailersOnYard?.icon || '🚛'}
         />
         <KPICard
           title="New Detections (24h)"
-          value={kpis.newDetections24h.value}
-          subtitle={`OCR=${kpis.newDetections24h.ocrAccuracy}`}
-          icon={kpis.newDetections24h.icon}
+          value={kpis.newDetections24h?.value || 0}
+          subtitle={`OCR=${kpis.newDetections24h?.ocrAccuracy || '0%'}`}
+          icon={kpis.newDetections24h?.icon || '📈'}
         />
         <KPICard
           title="Anomalies"
-          value={kpis.anomalies.value}
-          subtitle={kpis.anomalies.description}
-          icon={kpis.anomalies.icon}
+          value={kpis.anomalies?.value || 0}
+          subtitle={kpis.anomalies?.description || 'No anomalies detected'}
+          icon={kpis.anomalies?.icon || '⚠️'}
         />
         <KPICard
           title="Cameras Online"
           value={camerasOnlineCount}
           subtitle={`${camerasDegradedCount} degraded`}
-          icon={kpis.camerasOnline.icon}
+          icon={kpis.camerasOnline?.icon || '📷'}
         />
       </div>
 

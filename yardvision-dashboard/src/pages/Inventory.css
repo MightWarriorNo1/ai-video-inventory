@@ -135,3 +135,20 @@
   color: #6b7280;
 }
 
+.no-data {
+  text-align: center;
+  padding: 40px 20px;
+  color: #6b7280;
+  font-style: italic;
+}
+
+.status-badge.in-transit {
+  background-color: #dbeafe;
+  color: #1e40af;
+}
+
+.status-badge.unknown {
+  background-color: #f3f4f6;
+  color: #6b7280;
+}
+

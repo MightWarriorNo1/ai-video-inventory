@@ -6,7 +6,9 @@ import {
   Settings, 
   FileText, 
   SlidersHorizontal, 
-  BarChart3 
+  BarChart3,
+  RefreshCw,
+  Download
 } from 'lucide-react'
 import './Layout.css'
 
@@ -61,7 +63,13 @@ const Layout = ({ children }) => {
             </div>
           </div>
           <div className="header-actions">
-            <button className="btn-sync">
+            <button 
+              className="btn-sync"
+              onClick={() => {
+                // Trigger refresh event for all pages
+                window.dispatchEvent(new Event('refresh-data'))
+              }}
+            >
               <RefreshCw size={16} />
               Sync
             </button>

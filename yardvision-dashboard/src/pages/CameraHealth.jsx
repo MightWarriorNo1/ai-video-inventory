@@ -7,18 +7,25 @@ const CameraHealth = () => {
   const [cameras, setCameras] = useState([])
   const [loading, setLoading] = useState(true)
 
+  const loadCameras = async (forceRefresh = false) => {
+    setLoading(true)
+    const camerasData = await fetchCameras(forceRefresh)
+    setCameras(camerasData)
+    setLoading(false)
+  }
+
   useEffect(() => {
-    const loadCameras = async () => {
-      setLoading(true)
-      const camerasData = await fetchCameras()
-      setCameras(camerasData)
-      setLoading(false)
-    }
-    
     loadCameras()
-    // Refresh every 5 seconds
-    const interval = setInterval(loadCameras, 5000)
-    return () => clearInterval(interval)
+    
+    // Listen for refresh event from sync button
+    const handleRefresh = () => {
+      loadCameras(true)  // Force refresh when sync button is clicked
+    }
+    window.addEventListener('refresh-data', handleRefresh)
+    
+    return () => {
+      window.removeEventListener('refresh-data', handleRefresh)
+    }
   }, [])
 
   if (loading) {

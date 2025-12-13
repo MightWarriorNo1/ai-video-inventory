@@ -42,9 +42,12 @@ export const fetchInventoryData = async () => {
   }
 }
 
-export const fetchCameras = async () => {
+export const fetchCameras = async (forceRefresh = false) => {
   try {
-    const response = await fetch(`${API_BASE}/cameras`)
+    const url = forceRefresh 
+      ? `${API_BASE}/cameras?force=true`
+      : `${API_BASE}/cameras`
+    const response = await fetch(url)
     if (!response.ok) {
       throw new Error('Failed to fetch cameras')
     }
