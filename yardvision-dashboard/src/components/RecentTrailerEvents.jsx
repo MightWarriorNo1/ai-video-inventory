@@ -2,14 +2,14 @@ import { useState, useEffect } from 'react'
 import { fetchDashboardEvents } from '../services/api'
 import './RecentTrailerEvents.css'
 
-const RecentTrailerEvents = () => {
+const RecentTrailerEvents = ({ onEventSelect, selectedDate = null }) => {
   const [events, setEvents] = useState([])
   const [loading, setLoading] = useState(true)
   const [selectedEvent, setSelectedEvent] = useState(null)
 
-  const loadEvents = async () => {
+  const loadEvents = async (date = selectedDate) => {
     setLoading(true)
-    const eventsData = await fetchDashboardEvents(50) // Get last 50 events
+    const eventsData = await fetchDashboardEvents(1000, date) // Get all events for the date
     
     // Transform and sort by timestamp (most recent first)
     const transformedEvents = eventsData
@@ -20,33 +20,41 @@ const RecentTrailerEvents = () => {
         plate: event.text || 'N/A',
         spot: event.spot || 'unknown',
         conf: parseFloat(event.conf || 0) * 100,
-        ocr: parseFloat(event.conf || 0) * 100,
+        ocr: parseFloat(event.ocr_conf || event.conf || 0) * 100,
         source: event.camera_id || 'N/A',
         rawEvent: event
       }))
       .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp))
-      .slice(0, 10) // Show only last 10
     
     setEvents(transformedEvents)
-    if (transformedEvents.length > 0 && !selectedEvent) {
-      setSelectedEvent(transformedEvents[0])
+    if (transformedEvents.length > 0) {
+      const firstEvent = transformedEvents[0]
+      setSelectedEvent(firstEvent)
+      if (onEventSelect) {
+        onEventSelect(firstEvent)
+      }
+    } else {
+      setSelectedEvent(null)
+      if (onEventSelect) {
+        onEventSelect(null)
+      }
     }
     setLoading(false)
   }
 
   useEffect(() => {
-    loadEvents()
+    loadEvents(selectedDate)
     
     // Listen for refresh event from sync button
     const handleRefresh = () => {
-      loadEvents()
+      loadEvents(selectedDate)
     }
     window.addEventListener('refresh-data', handleRefresh)
     
     return () => {
       window.removeEventListener('refresh-data', handleRefresh)
     }
-  }, [])
+  }, [selectedDate])
 
   const formatTime = (timestamp) => {
     if (!timestamp) return 'N/A'
@@ -72,9 +80,24 @@ const RecentTrailerEvents = () => {
     )
   }
 
+  const formatDateTitle = (dateStr) => {
+    if (!dateStr) return 'Recent Trailer Events'
+    try {
+      const date = new Date(dateStr + 'T00:00:00')
+      const today = new Date()
+      today.setHours(0, 0, 0, 0)
+      if (date.getTime() === today.getTime()) {
+        return 'Recent Trailer Events (Today)'
+      }
+      return `Recent Trailer Events (${date.toLocaleDateString()})`
+    } catch {
+      return 'Recent Trailer Events'
+    }
+  }
+
   return (
     <div className="recent-trailer-events">
-      <h3>Recent Trailer Events</h3>
+      <h3>{formatDateTitle(selectedDate)}</h3>
       <div className="events-table-wrapper">
         <table className="events-table">
           <thead>
@@ -125,3 +148,4 @@ const RecentTrailerEvents = () => {
 }
 
 export default RecentTrailerEvents
+

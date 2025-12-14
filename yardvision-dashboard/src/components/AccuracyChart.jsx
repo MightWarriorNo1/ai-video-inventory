@@ -43,3 +43,4 @@ const AccuracyChart = ({ data }) => {
 
 export default AccuracyChart
 
+

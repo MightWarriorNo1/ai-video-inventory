@@ -27,3 +27,4 @@ const YardUtilizationChart = ({ data }) => {
 
 export default YardUtilizationChart
 
+

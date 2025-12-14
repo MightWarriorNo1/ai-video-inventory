@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { Search, ChevronDown } from 'lucide-react'
+import { Search, ChevronDown, Calendar } from 'lucide-react'
 import { fetchDashboardData, fetchCameras } from '../services/api'
 import { dashboardData as fallbackData } from '../data/mockData'
 import KPICard from '../components/KPICard'
@@ -16,12 +16,19 @@ const Dashboard = () => {
   const [cameras, setCameras] = useState([])
   const [loading, setLoading] = useState(true)
   const [selectedEvent, setSelectedEvent] = useState(null)
+  
+  // Get today's date in YYYY-MM-DD format for default
+  const getTodayDate = () => {
+    const today = new Date()
+    return today.toISOString().split('T')[0]
+  }
+  const [selectedDate, setSelectedDate] = useState(getTodayDate())
 
   // Load data function that can be called manually
-  const loadData = async (forceRefresh = false) => {
+  const loadData = async (forceRefresh = false, date = selectedDate) => {
     setLoading(true)
     const [dashboardData, camerasData] = await Promise.all([
-      fetchDashboardData(),
+      fetchDashboardData(date),
       fetchCameras(forceRefresh)  // Force camera refresh when sync is clicked
     ])
     
@@ -32,6 +39,13 @@ const Dashboard = () => {
       setCameras(camerasData)
     }
     setLoading(false)
+  }
+  
+  // Handle date change
+  const handleDateChange = (e) => {
+    const newDate = e.target.value
+    setSelectedDate(newDate)
+    loadData(false, newDate)
   }
 
   // Load data only once on mount
@@ -104,6 +118,16 @@ const Dashboard = () => {
           <Search className="search-icon" size={16} />
           <input type="text" placeholder="Search trailer, plate, spot..." />
         </div>
+        <div className="date-picker-wrapper">
+          <Calendar className="calendar-icon" size={16} />
+          <input 
+            type="date" 
+            value={selectedDate}
+            onChange={handleDateChange}
+            className="date-picker"
+            max={getTodayDate()}
+          />
+        </div>
         <div className="filter-dropdown">
           <button className="filter-btn">
             All events <ChevronDown size={14} />
@@ -114,7 +138,7 @@ const Dashboard = () => {
 
       <div className="charts-grid">
         <div className="chart-card">
-          <h3>Detection / OCR Accuracy (Today)</h3>
+          <h3>Detection / OCR Accuracy ({selectedDate === getTodayDate() ? 'Today' : selectedDate})</h3>
           <AccuracyChart data={accuracyChart} />
         </div>
         <div className="chart-card">
@@ -123,7 +147,7 @@ const Dashboard = () => {
         </div>
       </div>
 
-      <RecentTrailerEvents onEventSelect={setSelectedEvent} />
+      <RecentTrailerEvents onEventSelect={setSelectedEvent} selectedDate={selectedDate} />
 
       <YardMapSpotResolver selectedEvent={selectedEvent} />
 
@@ -142,4 +166,5 @@ const Dashboard = () => {
 }
 
 export default Dashboard
+
 

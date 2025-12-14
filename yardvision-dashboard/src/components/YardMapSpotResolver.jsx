@@ -81,3 +81,4 @@ const YardMapSpotResolver = ({ selectedEvent }) => {
 }
 
 export default YardMapSpotResolver
+

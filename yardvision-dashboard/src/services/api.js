@@ -2,9 +2,12 @@
 
 const API_BASE = '/api'
 
-export const fetchDashboardData = async () => {
+export const fetchDashboardData = async (date = null) => {
   try {
-    const response = await fetch(`${API_BASE}/dashboard/data`)
+    const url = date 
+      ? `${API_BASE}/dashboard/data?date=${date}`
+      : `${API_BASE}/dashboard/data`
+    const response = await fetch(url)
     if (!response.ok) {
       throw new Error('Failed to fetch dashboard data')
     }
@@ -15,9 +18,13 @@ export const fetchDashboardData = async () => {
   }
 }
 
-export const fetchDashboardEvents = async (limit = 1000) => {
+export const fetchDashboardEvents = async (limit = 1000, date = null) => {
   try {
-    const response = await fetch(`${API_BASE}/dashboard/events?limit=${limit}`)
+    let url = `${API_BASE}/dashboard/events?limit=${limit}`
+    if (date) {
+      url += `&date=${date}`
+    }
+    const response = await fetch(url)
     if (!response.ok) {
       throw new Error('Failed to fetch events')
     }
@@ -72,3 +79,4 @@ export const fetchEvents = async (limit = 100) => {
     return []
   }
 }
+

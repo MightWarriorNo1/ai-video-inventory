@@ -88,3 +88,4 @@ The dashboard uses:
 - The original dashboard remains unchanged and can still be used for video upload and processing
 - This React dashboard is designed to display results from YOLO and OCR processing
 
+

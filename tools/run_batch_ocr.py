@@ -52,17 +52,10 @@ def main():
         print(f"✗ Failed to initialize OCR: {e}")
         return
     
-    # Initialize preprocessor
+    # Initialize preprocessor (disabled - using oLmOCR's internal preprocessing instead)
     print("\nInitializing preprocessor...")
-    try:
-        preprocessor = ImagePreprocessor(
-            enable_ocr_preprocessing=True,
-            ocr_strategy="realworld"
-        )
-        print("✓ Preprocessor initialized")
-    except Exception as e:
-        print(f"✗ Failed to initialize preprocessor: {e}")
-        preprocessor = None
+    preprocessor = None  # Disable external preprocessing - use oLmOCR's internal preprocessing
+    print("✓ Preprocessor disabled (using oLmOCR's internal preprocessing)")
     
     # Process crops
     print("\n" + "=" * 60)
@@ -96,6 +89,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 

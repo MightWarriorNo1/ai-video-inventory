@@ -412,7 +412,8 @@ class MetricsServer:
         def get_dashboard_data():
             """Get dashboard data aggregated from combined_results.json files."""
             try:
-                data = self._get_dashboard_data_from_json()
+                date_str = request.args.get('date')
+                data = self._get_dashboard_data_from_json(date_str=date_str)
                 return jsonify(data)
             except Exception as e:
                 print(f"[MetricsServer] Error getting dashboard data: {e}")
@@ -425,7 +426,8 @@ class MetricsServer:
             """Get events from combined_results.json files."""
             try:
                 limit = int(request.args.get('limit', 1000))
-                events = self._get_events_from_json(limit)
+                date_str = request.args.get('date')
+                events = self._get_events_from_json(limit, date_str=date_str)
                 return jsonify({'events': events, 'count': len(events)})
             except Exception as e:
                 print(f"[MetricsServer] Error getting dashboard events: {e}")
@@ -487,9 +489,25 @@ class MetricsServer:
             # File exists - serve it
             return send_from_directory(str(web_dir), path)
     
-    def _get_dashboard_data_from_json(self) -> Dict:
-        """Get dashboard data aggregated from combined_results.json files."""
+    def _get_dashboard_data_from_json(self, date_str: str = None) -> Dict:
+        """Get dashboard data aggregated from combined_results.json files.
+        
+        Args:
+            date_str: Optional date string in YYYY-MM-DD format to filter by. 
+                     If None, defaults to today's date.
+        """
         base_dir = Path(__file__).parent.parent / 'out' / 'crops' / 'test-video'
+        
+        # Parse date filter
+        filter_date = None
+        if date_str:
+            try:
+                filter_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+            except ValueError:
+                print(f"[MetricsServer] Invalid date format: {date_str}, using today")
+                filter_date = datetime.now().date()
+        else:
+            filter_date = datetime.now().date()
         
         # Find all combined_results.json files
         combined_files = []
@@ -541,40 +559,50 @@ class MetricsServer:
                 'cameraHealth': []
             }
         
+        # Filter results by date if specified
+        filtered_results = []
+        for result in all_results:
+            timestamp = result.get('timestamp', '')
+            if timestamp:
+                try:
+                    result_date = datetime.fromisoformat(timestamp.replace('Z', '+00:00')).date()
+                    if result_date == filter_date:
+                        filtered_results.append(result)
+                except:
+                    # If we can't parse timestamp, skip this result when filtering by date
+                    if not date_str:
+                        filtered_results.append(result)
+            else:
+                # If no timestamp, only include when not filtering by date
+                if not date_str:
+                    filtered_results.append(result)
+        
+        # Use filtered results for calculations
+        all_results = filtered_results
+
         # Calculate KPIs
         unique_tracks = set()
         unique_spots = set()
         ocr_successful = 0
         total_detections = len(all_results)
         low_conf_detections = 0
-        today = datetime.now().date()
-        
+
         for result in all_results:
             track_id = result.get('track_id')
             if track_id:
                 unique_tracks.add(track_id)
-            
+
             spot = result.get('spot', '')
             if spot and spot != 'unknown':
                 unique_spots.add(spot)
-            
+
             ocr_text = result.get('ocr_text', '')
             if ocr_text and ocr_text.strip():
                 ocr_successful += 1
-            
+
             det_conf = result.get('det_conf', 0.0)
             if isinstance(det_conf, (int, float)) and det_conf < 0.5:
                 low_conf_detections += 1
-            
-            # Check if detection is from today
-            timestamp = result.get('timestamp', '')
-            if timestamp:
-                try:
-                    result_date = datetime.fromisoformat(timestamp.replace('Z', '+00:00')).date()
-                    if result_date == today:
-                        pass  # Could track today's detections here
-                except:
-                    pass
         
         # Calculate OCR accuracy
         ocr_accuracy = (ocr_successful / total_detections * 100) if total_detections > 0 else 0
@@ -584,9 +612,9 @@ class MetricsServer:
         online_cameras = sum(1 for c in cameras if c.get('status') == 'online')
         degraded_cameras = sum(1 for c in cameras if c.get('status') == 'degraded')
         
-        # Build accuracy chart data (today only)
+        # Build accuracy chart data (filtered by date)
         accuracy_data = []
-        # Group by hour for chart, filter by today's date
+        # Group by hour for chart, filter by selected date
         from collections import defaultdict
         hourly_data = defaultdict(lambda: {
             'total': 0, 
@@ -595,8 +623,6 @@ class MetricsServer:
             'ocr_attempts': 0  # Count of detections where OCR was actually attempted
         })
         
-        today = datetime.now().date()
-        
         for result in all_results:
             timestamp = result.get('timestamp', '')
             if timestamp:
@@ -604,8 +630,8 @@ class MetricsServer:
                     dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
                     result_date = dt.date()
                     
-                    # Only include results from today
-                    if result_date != today:
+                    # Only include results from the selected date (already filtered above, but double-check)
+                    if result_date != filter_date:
                         continue
                     
                     hour_key = dt.strftime('%H:00')
@@ -716,9 +742,24 @@ class MetricsServer:
             'cameraHealth': cameras
         }
     
-    def _get_events_from_json(self, limit: int = 1000) -> List[Dict]:
-        """Get events from combined_results.json files."""
+    def _get_events_from_json(self, limit: int = 1000, date_str: str = None) -> List[Dict]:
+        """Get events from combined_results.json files.
+        
+        Args:
+            limit: Maximum number of events to return
+            date_str: Optional date string in YYYY-MM-DD format to filter by.
+                     If None, returns all events (up to limit).
+        """
         base_dir = Path(__file__).parent.parent / 'out' / 'crops' / 'test-video'
+        
+        # Parse date filter
+        filter_date = None
+        if date_str:
+            try:
+                filter_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+            except ValueError:
+                print(f"[MetricsServer] Invalid date format: {date_str}, returning all events")
+                filter_date = None
         
         # Find all combined_results.json files
         combined_files = []
@@ -736,6 +777,19 @@ class MetricsServer:
                     results = json.load(f)
                     if isinstance(results, list):
                         for result in results:
+                            # Filter by date if specified
+                            if filter_date:
+                                timestamp = result.get('timestamp', '')
+                                if timestamp:
+                                    try:
+                                        result_date = datetime.fromisoformat(timestamp.replace('Z', '+00:00')).date()
+                                        if result_date != filter_date:
+                                            continue
+                                    except:
+                                        continue
+                                else:
+                                    continue  # Skip events without timestamp when filtering by date
+                            
                             # Transform to event format expected by frontend
                             # Frontend expects 'text' for OCR text, not 'ocr_text'
                             ocr_text = result.get('ocr_text', '') or result.get('text', '')

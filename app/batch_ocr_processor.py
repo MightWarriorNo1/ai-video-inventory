@@ -33,6 +33,15 @@ class BatchOCRProcessor:
         
         # Check if OCR is oLmOCR (needs GPU memory cleanup)
         self.is_olmocr = ocr is not None and 'OlmOCRRecognizer' in type(ocr).__name__
+        self.is_easyocr = ocr is not None and 'EasyOCRRecognizer' in type(ocr).__name__
+        
+        # IMPORTANT: Disable rotation in preprocessor if OCR handles rotation internally
+        # oLmOCR and EasyOCR both handle rotation automatically, so pre-rotating images
+        # causes double rotation issues and can reduce accuracy
+        if self.preprocessor and (self.is_olmocr or self.is_easyocr):
+            if self.preprocessor.enable_rotation:
+                print(f"[BatchOCRProcessor] Disabling rotation in preprocessor (OCR handles rotation internally)")
+                self.preprocessor.enable_rotation = False
     
     def process_crops_directory(self, crops_dir: str) -> Dict[str, Dict]:
         """
@@ -64,6 +73,9 @@ class BatchOCRProcessor:
             crop_path = Path(crop_meta['crop_path'])
             crop_filename = crop_meta['crop_filename']
             
+            # Log which crop is being processed
+            print(f"\n[BatchOCRProcessor] Processing crop {i+1}/{len(crops_metadata)}: {crop_filename}")
+            
             if not crop_path.exists():
                 print(f"[BatchOCRProcessor] Warning: Crop file not found: {crop_path}")
                 failed += 1
@@ -81,13 +93,14 @@ class BatchOCRProcessor:
                 # Use same logic as test script for consistency
                 h, w = crop_image.shape[:2]
                 is_full_image = max(h, w) > 800  # If image is larger than 800px, treat as full image
+                print(f"[BatchOCRProcessor] {crop_filename}: Image size {w}x{h}, is_full_image={is_full_image}")
                 
                 # OCR parameters matching test script for best results
                 # For cropped regions (trailer IDs): filter to alphanumeric, length 2-12
                 # For full images: return all text, try multiple preprocessing
                 base_ocr_params = {
                     'min_text_length': 2,
-                    'max_text_length': 12,
+                    'max_text_length': 40,
                     'allowlist': "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ",  # Alphanumeric only for trailer IDs
                 }
                 
@@ -114,11 +127,13 @@ class BatchOCRProcessor:
                         # Check if result is empty (might indicate GPU memory failure)
                         if not result.get('text', '').strip() and result.get('conf', 0.0) == 0.0:
                             # Empty result might be due to GPU memory error - try with resized image
-                            print(f"[BatchOCRProcessor] Empty OCR result for {crop_filename}, trying with resized image...")
+                            print(f"[BatchOCRProcessor] Empty OCR result for {crop_filename} (full image mode), trying with resized image...")
                             # Resize image to 50% to reduce memory usage
                             h, w = crop_image.shape[:2]
                             resized = cv2.resize(crop_image, (w // 2, h // 2), interpolation=cv2.INTER_AREA)
                             result = self.ocr.recognize(resized, **ocr_params)
+                            if not result.get('text', '').strip():
+                                print(f"[BatchOCRProcessor] Still empty after resize for {crop_filename}")
                     except RuntimeError as e:
                         error_str = str(e).lower()
                         if any(keyword in error_str for keyword in ["gpu", "memory", "cuda", "nvmap", "nvidia"]):
@@ -146,9 +161,15 @@ class BatchOCRProcessor:
                         except:
                             pass
                     
+                    final_text = result.get('text', '') if result else ''
+                    final_conf = result.get('conf', 0.0) if result else 0.0
+                    
+                    if not final_text.strip():
+                        print(f"[BatchOCRProcessor] Final result empty for {crop_filename} (full image mode)")
+                    
                     ocr_results[crop_filename] = {
-                        'text': result.get('text', '') if result else '',
-                        'conf': result.get('conf', 0.0) if result else 0.0,
+                        'text': final_text,
+                        'conf': final_conf,
                         'method': 'original' if not ocr_failed else 'error_retry'
                     }
                 elif self.preprocessor and self.preprocessor.enable_ocr_preprocessing:
@@ -162,18 +183,51 @@ class BatchOCRProcessor:
                     
                     # Try OCR on each preprocessed version with proper parameters
                     all_results = []
+                    failed_reasons = []
                     for prep in preprocessed_crops:
                         try:
                             # Use same parameters as test script
                             result = self.ocr.recognize(prep['image'], **ocr_params)
-                            if result.get('text', '').strip():
+                            
+                            # Debug: log full result dictionary to diagnose issues
+                            print(f"[BatchOCRProcessor] DEBUG {crop_filename}: {prep['method']} result dict: {result}")
+                            
+                            result_text = result.get('text', '').strip()
+                            result_conf = result.get('conf', 0.0)
+                            
+                            # Debug: log raw result to diagnose filtering issues
+                            if not result_text and result_conf > 0.0:
+                                print(f"[BatchOCRProcessor] DEBUG {crop_filename}: {prep['method']} returned conf={result_conf:.2f} but empty text - check OCR filtering")
+                            elif result_text:
+                                print(f"[BatchOCRProcessor] DEBUG {crop_filename}: {prep['method']} raw result: '{result_text[:50]}' (conf={result_conf:.2f}, len={len(result_text)})")
+                            
+                            if result_text:
                                 all_results.append({
-                                    'text': result.get('text', ''),
-                                    'conf': result.get('conf', 0.0),
+                                    'text': result_text,
+                                    'conf': result_conf,
                                     'method': prep['method']
                                 })
+                                print(f"[BatchOCRProcessor] {crop_filename}: {prep['method']} succeeded: '{result_text[:50]}' (conf={result_conf:.2f})")
+                            else:
+                                # Result was empty - could be filtered or OCR failed
+                                # Check if OCR actually ran but returned empty (might indicate filtering)
+                                if result_conf == 0.0:
+                                    failed_reasons.append(f"{prep['method']}: empty result (conf={result_conf:.2f})")
+                                else:
+                                    # Non-zero confidence but empty text suggests filtering
+                                    failed_reasons.append(f"{prep['method']}: text filtered out (conf={result_conf:.2f})")
                         except Exception as e:
-                            print(f"[BatchOCRProcessor] OCR error with {prep['method']}: {e}")
+                            error_msg = str(e)
+                            failed_reasons.append(f"{prep['method']}: exception - {error_msg[:100]}")
+                            print(f"[BatchOCRProcessor] {crop_filename}: OCR error with {prep['method']}: {e}")
+                    
+                    # Log summary of failures if no results
+                    if not all_results and failed_reasons:
+                        print(f"[BatchOCRProcessor] {crop_filename}: All preprocessing methods failed:")
+                        for reason in failed_reasons[:5]:  # Show first 5 failures
+                            print(f"  - {reason}")
+                        if len(failed_reasons) > 5:
+                            print(f"  ... and {len(failed_reasons) - 5} more failures")
                     
                     # Select best result
                     if all_results:
@@ -188,22 +242,65 @@ class BatchOCRProcessor:
                             'method': best_result.get('method', 'unknown')
                         }
                     else:
-                        ocr_results[crop_filename] = {
-                            'text': '',
-                            'conf': 0.0,
-                            'method': 'none'
-                        }
+                        # No results from any preprocessing method - try OCR's internal preprocessing as fallback
+                        print(f"[BatchOCRProcessor] No OCR results found for {crop_filename} after trying {len(preprocessed_crops)} preprocessing methods")
+                        print(f"[BatchOCRProcessor] Trying OCR's internal preprocessing (like test_olmocr.py)...")
+                        
+                        # Try with OCR's internal preprocessing (similar to test_olmocr.py)
+                        fallback_params = base_ocr_params.copy()
+                        fallback_params['try_multiple_preprocessing'] = True  # Use OCR's internal preprocessing
+                        try:
+                            print(f"[BatchOCRProcessor] DEBUG: Fallback params: {fallback_params}")
+                            fallback_result = self.ocr.recognize(crop_image, **fallback_params)
+                            print(f"[BatchOCRProcessor] DEBUG: Fallback result dict: {fallback_result}")
+                            fallback_text = fallback_result.get('text', '').strip()
+                            fallback_conf = fallback_result.get('conf', 0.0)
+                            
+                            if fallback_text:
+                                print(f"[BatchOCRProcessor] Fallback succeeded: '{fallback_text[:50]}' (conf={fallback_conf:.2f})")
+                                ocr_results[crop_filename] = {
+                                    'text': fallback_text,
+                                    'conf': fallback_conf,
+                                    'method': 'ocr_internal_preprocessing'
+                                }
+                            else:
+                                print(f"[BatchOCRProcessor] Fallback also returned empty result (conf={fallback_conf:.2f})")
+                                print(f"[BatchOCRProcessor] DEBUG: Full fallback result: {fallback_result}")
+                                ocr_results[crop_filename] = {
+                                    'text': '',
+                                    'conf': 0.0,
+                                    'method': 'none'
+                                }
+                        except Exception as e:
+                            print(f"[BatchOCRProcessor] Fallback failed: {e}")
+                            import traceback
+                            traceback.print_exc()
+                            ocr_results[crop_filename] = {
+                                'text': '',
+                                'conf': 0.0,
+                                'method': 'none'
+                            }
                 else:
                     # Cropped region: direct OCR without preprocessing, but with proper parameters
                     # For direct OCR on cropped regions, enable try_multiple_preprocessing for better results
                     ocr_params = base_ocr_params.copy()
                     ocr_params['try_multiple_preprocessing'] = True
-                    result = self.ocr.recognize(crop_image, **ocr_params)
-                    ocr_results[crop_filename] = {
-                        'text': result.get('text', ''),
-                        'conf': result.get('conf', 0.0),
-                        'method': 'original'
-                    }
+                    try:
+                        result = self.ocr.recognize(crop_image, **ocr_params)
+                        if not result.get('text', '').strip():
+                            print(f"[BatchOCRProcessor] Empty OCR result for {crop_filename} (direct OCR)")
+                        ocr_results[crop_filename] = {
+                            'text': result.get('text', ''),
+                            'conf': result.get('conf', 0.0),
+                            'method': 'original'
+                        }
+                    except Exception as e:
+                        print(f"[BatchOCRProcessor] OCR error for {crop_filename} (direct OCR): {e}")
+                        ocr_results[crop_filename] = {
+                            'text': '',
+                            'conf': 0.0,
+                            'method': 'error'
+                        }
                 
                 processed += 1
                 
@@ -229,6 +326,21 @@ class BatchOCRProcessor:
                 }
         
         print(f"[BatchOCRProcessor] Completed: {processed} processed, {failed} failed")
+        
+        # Generate summary of failed crops
+        failed_crops = []
+        for crop_filename, result in ocr_results.items():
+            if not result.get('text', '').strip():
+                failed_crops.append({
+                    'filename': crop_filename,
+                    'method': result.get('method', 'unknown'),
+                    'conf': result.get('conf', 0.0)
+                })
+        
+        if failed_crops:
+            print(f"\n[BatchOCRProcessor] Summary of failed crops ({len(failed_crops)}):")
+            for failed in failed_crops:
+                print(f"  - {failed['filename']}: method={failed['method']}, conf={failed['conf']}")
         
         # Save OCR results
         results_path = crops_path / "ocr_results.json"

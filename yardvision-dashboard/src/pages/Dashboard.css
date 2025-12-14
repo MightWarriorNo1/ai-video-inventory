@@ -46,6 +46,33 @@
   border-color: #3b82f6;
 }
 
+.date-picker-wrapper {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.calendar-icon {
+  position: absolute;
+  left: 12px;
+  color: #6b7280;
+  pointer-events: none;
+}
+
+.date-picker {
+  padding: 10px 12px 10px 36px;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  font-size: 14px;
+  background-color: white;
+  cursor: pointer;
+}
+
+.date-picker:focus {
+  outline: none;
+  border-color: #3b82f6;
+}
+
 .filter-dropdown {
   display: flex;
   align-items: center;
@@ -119,4 +146,5 @@
   font-size: 16px;
   color: #6b7280;
 }
+
 

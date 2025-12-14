@@ -470,8 +470,24 @@ class OlmOCRRecognizer:
                     "Do not skip any text, even if it appears faint or low-contrast."
                 )
             else:
-                # Simple prompt for cropped regions
-                prompt = "What text is in this image? Return only the text, no explanations."
+                # Enhanced prompt for cropped regions to focus on trailer IDs and company names
+                # Trailer IDs often have company prefixes (like "JBHU", "INYU") followed by numbers
+                # Company names (like "J.B. HUNT", "THERMO KING") should also be detected
+                # IMPORTANT: Extract ALL trailer IDs and company names if multiple are present
+                prompt = (
+                    "Extract ALL trailer identification codes and/or company names from this image. "
+                    "Trailer IDs can have these formats: "
+                    "1) Company prefix followed by numbers (e.g., 'JBHU 342345', 'INYU 500434', 'TSFZ 562124', 'HMKD 808154'), "
+                    "2) Alphanumeric codes (e.g., 'A96904', '538148', '53124'), "
+                    "3) Numbers only (e.g., '711538', '342345', '500434') - these are also valid trailer IDs. "
+                    "The company prefix is usually 2-6 letters (like 'JBHU', 'INYU', 'TSFZ', 'HMKD', 'NSPZ') followed by a space and numbers. "
+                    "Also extract company names if present (e.g., 'J.B. HUNT', 'THERMO KING', 'ADVANCE Pallet Inc.', 'DCLI'). "
+                    "CRITICAL: If multiple trailer IDs are present (e.g., 'INYU 500501' and 'TSFZ 562124'), extract ALL of them. "
+                    "CRITICAL: Look for numeric-only trailer IDs (like '711538') which may appear vertically or in different locations. "
+                    "Return all trailer identification codes and/or company names separated by spaces. "
+                    "Ignore logos, phone numbers, state codes, or other text that is not a trailer ID or company name. "
+                    "Return only the identification codes and/or company names, no explanations."
+                )
             
             # Calculate max_tokens before preprocessing
             model_name = getattr(self, 'model_name', '')
@@ -664,20 +680,25 @@ class OlmOCRRecognizer:
                     )
                 except (RuntimeError, Exception) as e:
                     error_str = str(e).lower()
-                    if any(keyword in error_str for keyword in ["out of memory", "cuda", "nvmap", "nvidia", "memory"]):
+                    if any(keyword in error_str for keyword in ["out of memory", "cuda", "nvmap", "nvidia", "memory", "alloc"]):
                         print(f"[oLmOCR] GPU memory error during generation: {e}")
                         print(f"[oLmOCR] Trying with reduced settings...")
                         
                         # Clear cache aggressively
                         if self.use_gpu:
                             try:
+                                torch.cuda.synchronize()  # Wait for operations to complete
                                 torch.cuda.empty_cache()
-                                torch.cuda.synchronize()
+                                import gc
+                                gc.collect()  # Force garbage collection
+                                torch.cuda.empty_cache()  # Clear again
+                                gc.collect()  # Second GC pass
+                                torch.cuda.empty_cache()  # Final clear
                             except:
                                 pass
                         
-                        # Try with fewer tokens and smaller batch
-                        generation_kwargs["max_new_tokens"] = min(max_tokens, 128)
+                        # Try with fewer tokens (more aggressive reduction)
+                        generation_kwargs["max_new_tokens"] = min(max_tokens, 64)  # Reduced from 128 to 64
                         
                         try:
                             generated_ids = self.model.generate(
@@ -687,6 +708,16 @@ class OlmOCRRecognizer:
                         except Exception as retry_error:
                             print(f"[oLmOCR] Retry also failed: {retry_error}")
                             print(f"[oLmOCR] Suggestion: Reduce image size or use CPU mode")
+                            
+                            # Clean up before raising error
+                            if self.use_gpu:
+                                try:
+                                    torch.cuda.empty_cache()
+                                    import gc
+                                    gc.collect()
+                                except:
+                                    pass
+                            
                             raise RuntimeError(f"GPU memory insufficient. Try: 1) Use smaller image, 2) Use CPU mode (use_gpu=False), 3) Use smaller model") from e
                     else:
                         raise
@@ -810,6 +841,41 @@ class OlmOCRRecognizer:
                 print(f"[oLmOCR] Warning: Model returned empty or very short output")
                 return {'text': '', 'conf': 0.0}
             
+            # Check for garbage outputs (repeated characters, etc.) BEFORE any processing
+            # This catches garbage patterns like 128 chars of the same character
+            text_for_garbage_check = output_text.strip()
+            
+            # Check if output is suspiciously long (likely hit token limit and started repeating)
+            # max_tokens often results in outputs of exactly that length or close to it when model repeats
+            if len(text_for_garbage_check) >= 60:  # Check longer outputs for garbage
+                # Check if text is mostly the same character (repeated character pattern)
+                alnum_chars = [c for c in text_for_garbage_check if c.isalnum()]
+                if len(alnum_chars) > 30:  # Only check if there are enough alnum chars
+                    char_counts = {}
+                    for char in alnum_chars:
+                        char_counts[char] = char_counts.get(char, 0) + 1
+                    
+                    if char_counts:
+                        max_count = max(char_counts.values())
+                        total_chars = len(alnum_chars)
+                        # If > 75% of characters are the same, it's likely garbage
+                        # (Lowered threshold from 0.8 to 0.75 to catch more cases)
+                        if max_count / total_chars > 0.75:
+                            print(f"[oLmOCR] Detected garbage output (repeated character pattern, {max_count}/{total_chars} same chars): '{text_for_garbage_check[:50]}...'")
+                            return {'text': '', 'conf': 0.0}
+                
+                # Check for suspiciously long outputs with very few unique characters
+                if len(text_for_garbage_check) > 80:
+                    unique_chars = len(set(c for c in text_for_garbage_check if c.isalnum()))
+                    # If very few unique characters in a long string, likely garbage
+                    # (More lenient for very long strings that might have more variation)
+                    if len(text_for_garbage_check) > 120 and unique_chars < 3:
+                        print(f"[oLmOCR] Detected garbage output (too few unique chars in long string, {unique_chars} unique): '{text_for_garbage_check[:50]}...'")
+                        return {'text': '', 'conf': 0.0}
+                    elif len(text_for_garbage_check) <= 120 and unique_chars < 5:
+                        print(f"[oLmOCR] Detected garbage output (too few unique chars, {unique_chars} unique): '{text_for_garbage_check[:50]}...'")
+                        return {'text': '', 'conf': 0.0}
+            
             # If output is suspiciously short (less than 10 chars), the model might have been cut off
             if len(output_text.strip()) < 10 and full_image_mode:
                 print(f"[oLmOCR] Warning: Output seems too short for a full image. Model might have stopped early.")
@@ -825,11 +891,19 @@ class OlmOCRRecognizer:
                 text_clean = re.sub(r'\s+', ' ', text_clean).strip()
                 text_to_validate = text_clean
             else:
-                # For single IDs, clean more aggressively
+                # For cropped regions, preserve spaces to allow multiple trailer IDs
+                # Clean text but preserve spaces between IDs (e.g., "INYU 500501 TSFZ 562124")
                 text_clean = ''.join(c for c in output_text if c.isalnum() or c in [' ', '-', '_'])
-                text_clean = ' '.join(text_clean.split())
-                text_clean_final = ''.join(c for c in text_clean if c.isalnum())
-                text_to_validate = text_clean_final if text_clean_final else text_clean
+                text_clean = ' '.join(text_clean.split())  # Normalize whitespace
+                # Keep spaces to preserve multiple IDs separated by spaces
+                # Only remove spaces if it's clearly a single ID (no spaces in original)
+                if ' ' in text_clean:
+                    # Multiple IDs detected - preserve spaces
+                    text_to_validate = text_clean
+                else:
+                    # Single ID - remove spaces for consistency
+                    text_clean_final = ''.join(c for c in text_clean if c.isalnum())
+                    text_to_validate = text_clean_final if text_clean_final else text_clean
             
             # In full_image_mode, return all text without length filtering
             if full_image_mode:
@@ -895,27 +969,54 @@ class OlmOCRRecognizer:
                     filtered_chars = [c for c in deduplicated_text if c.upper() in allowlist.upper() or c.isspace() or c in ['.', '-', '(', ')', '°', "'"]]
                     deduplicated_text = ''.join(filtered_chars)
                 
-                # Return deduplicated text
-                if len(deduplicated_text.strip()) >= min_text_length:
+                # Debug: log final text for full images
+                final_text = deduplicated_text.strip()
+                if final_text:
+                    print(f"[oLmOCR] Full image mode: Final text ({len(final_text)} chars): '{final_text[:100]}...'")
+                else:
+                    print(f"[oLmOCR] Full image mode: Text became empty after processing (had {len(text_clean)} chars before deduplication)")
+                
+                # Return deduplicated text (don't filter by max_text_length for full images)
+                # Even if text is shorter than min_text_length, return it if it exists
+                # (min_text_length is meant for single IDs, not full images)
+                if len(final_text) > 0:
                     return {
-                        'text': deduplicated_text.strip(),
+                        'text': final_text,
                         'conf': 0.90  # High confidence for full image detection
                     }
                 else:
                     return {'text': '', 'conf': 0.0}
             
-            # Normal mode: Filter by length (for single trailer IDs)
-            if len(text_to_validate) < min_text_length or len(text_to_validate) > max_text_length:
-                print(f"[oLmOCR] Debug: Text filtered by length: '{text_to_validate}' (len={len(text_to_validate)})")
+            # Normal mode: Filter by length (for single or multiple trailer IDs)
+            # For multiple IDs separated by spaces, check length without spaces
+            text_length = len(text_to_validate.replace(' ', ''))
+            if text_length < min_text_length or text_length > max_text_length:
+                print(f"[oLmOCR] Debug: Text filtered by length: '{text_to_validate}' (len={text_length} without spaces, min={min_text_length}, max={max_text_length})")
                 print(f"[oLmOCR] Hint: Use full_image_mode=True to return all text from full images")
                 return {'text': '', 'conf': 0.0}
             
+            # Debug: log final text for normal mode
+            if text_to_validate:
+                print(f"[oLmOCR] Normal mode: Final text ({len(text_to_validate)} chars): '{text_to_validate}'")
+            
             # Apply allowlist if provided (post-processing filter)
+            # Preserve spaces when multiple IDs are present (e.g., "INYU 500501 TSFZ 562124")
             if allowlist:
-                text_to_validate = ''.join(c for c in text_to_validate if c.upper() in allowlist.upper())
-                if len(text_to_validate) < min_text_length:
-                    print(f"[oLmOCR] Debug: Text filtered by allowlist: '{text_to_validate}'")
+                text_before_allowlist = text_to_validate
+                # Preserve spaces to allow multiple IDs separated by spaces
+                if ' ' in text_to_validate:
+                    # Multiple IDs - preserve spaces
+                    text_to_validate = ''.join(c for c in text_to_validate if c.upper() in allowlist.upper() or c == ' ')
+                    text_to_validate = ' '.join(text_to_validate.split())  # Normalize spaces
+                else:
+                    # Single ID - remove spaces
+                    text_to_validate = ''.join(c for c in text_to_validate if c.upper() in allowlist.upper())
+                
+                if len(text_to_validate.replace(' ', '')) < min_text_length:
+                    print(f"[oLmOCR] Debug: Text filtered by allowlist: '{text_before_allowlist}' -> '{text_to_validate}' (len={len(text_to_validate.replace(' ', ''))}, min={min_text_length})")
                     return {'text': '', 'conf': 0.0}
+                elif len(text_before_allowlist.replace(' ', '')) != len(text_to_validate.replace(' ', '')):
+                    print(f"[oLmOCR] Debug: Allowlist removed {len(text_before_allowlist.replace(' ', '')) - len(text_to_validate.replace(' ', ''))} chars: '{text_before_allowlist}' -> '{text_to_validate}'")
             
             # Use the validated text
             text_clean = text_to_validate
@@ -934,34 +1035,63 @@ class OlmOCRRecognizer:
                 conf = 0.80
             elif has_letters:
                 # Letters only - medium confidence (less common for trailer IDs)
+                # Many garbage patterns are letters-only (e.g., "JBHUNT", "APPS", "WI", "PR")
                 conf = 0.70
             else:
                 # Unknown pattern - low confidence
                 conf = 0.50
             
+            # Confidence-based filtering: reject only very low confidence text
+            # Company names are letters-only (conf=0.70) and should be allowed
+            # Garbage patterns are also letters-only, but we filter those separately via garbage patterns list
+            # Useful trailer IDs are typically alphanumeric (conf=0.85) or numeric (conf=0.80)
+            # Only reject very low confidence (conf=0.50) which indicates unknown patterns
+            MIN_CONFIDENCE_THRESHOLD = 0.60  # Reject only very low confidence text (allow company names at 0.70)
+            if not full_image_mode and conf < MIN_CONFIDENCE_THRESHOLD:
+                print(f"[oLmOCR] Debug: Text filtered by confidence threshold: '{text_clean}' (conf={conf:.2f} < {MIN_CONFIDENCE_THRESHOLD})")
+                return {'text': '', 'conf': 0.0}
+            
             # Reject obvious garbage patterns (only for single ID mode, not full images)
             # In full images, these might be legitimate text (e.g., "J.B. HUNT" contains "JBHUNT")
             if not full_image_mode:
                 text_upper = text_clean.upper()
-                garbage_patterns = [
+                # Garbage patterns that should be exact matches or whole-word matches
+                # Short patterns (2-3 chars) should only match if they're the entire text or at word boundaries
+                garbage_patterns_exact = [
                     'JBHUNT', 'JBHUN', 'JBHUNTAD', 'BHUNT',
                     'APPS', 'APPST', 'APPSI',
-                    'WVAN', 'WI', 'PR', 'IL', 'QT', 'LOU', 'MME',
-                    'ZIES', 'NH8T', 'PZ', 'IBUNF', 'JSDV', 'F1', 'L1',
+                    'WVAN', 'ZIES', 'NH8T', 'IBUNF', 'JSDV',
                 ]
+                # Short patterns that should only match if they're the entire text
+                garbage_patterns_short = ['WI', 'PR', 'IL', 'QT', 'LOU', 'MME', 'PZ', 'F1', 'L1']
                 
-                is_garbage = any(pattern in text_upper or text_upper == pattern for pattern in garbage_patterns)
+                # Check exact matches for longer patterns
+                is_garbage = any(pattern == text_upper or pattern in text_upper for pattern in garbage_patterns_exact)
+                
+                # For short patterns, only match if they're the entire text (to avoid false positives like "PZ" in "NSPZ")
+                if not is_garbage:
+                    is_garbage = any(pattern == text_upper for pattern in garbage_patterns_short)
+                
                 if is_garbage:
+                    print(f"[oLmOCR] Debug: Text filtered by garbage pattern: '{text_clean}'")
                     return {'text': '', 'conf': 0.0}
                 
                 # Validate trailer ID pattern (only for single ID mode)
+                # Use max_text_length instead of hardcoded 12 to respect user's length settings
                 is_valid_pattern = (
-                    (text_clean.isdigit() and 3 <= len(text_clean) <= 8) or
-                    (has_numbers and has_letters and 4 <= len(text_clean) <= 12)
+                    (text_clean.isdigit() and min_text_length <= len(text_clean) <= max_text_length) or
+                    (has_numbers and has_letters and min_text_length <= len(text_clean) <= max_text_length)
                 )
                 
                 if not is_valid_pattern:
+                    print(f"[oLmOCR] Debug: Text filtered by pattern validation: '{text_clean}' (len={len(text_clean)}, min={min_text_length}, max={max_text_length})")
                     return {'text': '', 'conf': 0.0}
+            
+            # Final debug: log what we're returning
+            if text_clean:
+                print(f"[oLmOCR] Debug: Returning text: '{text_clean}' (conf={conf:.2f}, len={len(text_clean)})")
+            else:
+                print(f"[oLmOCR] Debug: Returning empty text (conf={conf:.2f})")
             
             return {
                 'text': text_clean,
