@@ -1918,6 +1918,11 @@ class VideoProcessor:
                     self.unique_track_keys.remove(old_key)
                     self.unique_track_keys.add(new_key)
             
+            # NOTE: We do NOT consolidate tracks with different track_ids that end up in the same cluster.
+            # Multiple track_ids in the same cluster can represent different physical trailers in the same spot.
+            # The track_id from the tracker is the source of truth for distinguishing different trailers.
+            # Cluster merging only handles spatial proximity, not track identity.
+            
             if merged_into:
                 print(f"[VideoProcessor] Merged {len(merged_into)} clusters, remaining: {len(self.position_clusters)}")
                 if spot_cluster_updates:
@@ -2254,14 +2259,8 @@ class VideoProcessor:
             # Only include events for valid clusters (those that still exist)
             valid_cluster_ids = set(self.position_clusters.keys())
             deduplicated_events = {}
-            unique_track_ids = set()  # Track unique track_ids for accurate count
             
-            # First pass: collect all unique track_ids from all events (before filtering)
-            for track_key, event in self.unique_tracks.items():
-                if 'track_id' in event:
-                    unique_track_ids.add(event['track_id'])
-            
-            # Second pass: process events and filter by valid clusters
+            # Process events and filter by valid clusters
             for track_key, event in self.unique_tracks.items():
                 # Only include events for valid clusters (filter out deleted/merged clusters)
                 if "_cluster_" in track_key:
@@ -2269,7 +2268,8 @@ class VideoProcessor:
                     parts = track_key.split("_cluster_")
                     if len(parts) == 2:
                         try:
-                            cluster_id = int(parts[1])
+                            cluster_part = parts[1].split("_track_")[0] if "_track_" in parts[1] else parts[1]
+                            cluster_id = int(cluster_part)
                             # Skip if cluster was filtered out or merged
                             if cluster_id not in valid_cluster_ids:
                                 continue
@@ -2294,8 +2294,51 @@ class VideoProcessor:
                     if new_ts > existing_ts:
                         deduplicated_events[track_key] = event
             
-            # Count unique track_ids (this is the accurate count of different trailers detected)
-            unique_tracks_count = len(unique_track_ids) if unique_track_ids else len(self.position_clusters)
+            # Count unique track_ids based on saved crops (matches the crop saving logic)
+            # This ensures the track count matches the number of crops saved (one per unique track_id)
+            # After cleanup, saved_crops contains the final crops that were kept
+            unique_tracks_count = 0
+            if hasattr(self, 'saved_crops') and self.saved_crops:
+                # Count unique track_ids from saved crops (after cleanup)
+                unique_track_ids_from_crops = set()
+                for crop_meta in self.saved_crops:
+                    track_id = crop_meta.get('track_id')
+                    # Fallback: extract track_id from track_key if not in metadata
+                    if track_id is None:
+                        track_key = crop_meta.get('track_key', '')
+                        if '_track_' in track_key:
+                            try:
+                                # Extract track_id from track_key (format: spot_cluster_id_track_trackid)
+                                parts = track_key.split('_track_')
+                                if len(parts) >= 2:
+                                    track_id = int(parts[-1])  # Last part is track_id
+                            except (ValueError, IndexError):
+                                pass
+                    if track_id is not None:
+                        unique_track_ids_from_crops.add(track_id)
+                unique_tracks_count = len(unique_track_ids_from_crops)
+            elif hasattr(self, 'crop_deduplication') and self.crop_deduplication:
+                # Fallback: count from crop_deduplication if saved_crops not available
+                # Extract track_ids from track_keys in crop_deduplication
+                unique_track_ids_from_crops = set()
+                for track_key in self.crop_deduplication.keys():
+                    if '_track_' in track_key:
+                        try:
+                            # Extract track_id from track_key (format: spot_cluster_id_track_trackid)
+                            parts = track_key.split('_track_')
+                            if len(parts) >= 2:
+                                track_id = int(parts[-1])  # Last part is track_id
+                                unique_track_ids_from_crops.add(track_id)
+                        except (ValueError, IndexError):
+                            pass
+                unique_tracks_count = len(unique_track_ids_from_crops)
+            else:
+                # Fallback: count from deduplicated events if no crops saved
+                unique_track_ids = set()
+                for event in deduplicated_events.values():
+                    if 'track_id' in event:
+                        unique_track_ids.add(event['track_id'])
+                unique_tracks_count = len(unique_track_ids) if unique_track_ids else len(deduplicated_events)
             
             # Convert to list and sort by timestamp (most recent first)
             unique_events = list(deduplicated_events.values())

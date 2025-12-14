@@ -263,65 +263,30 @@ class MetricsServer:
                         print(f"[MetricsServer] Video processing completed: {frame_count} frames processed")
                         print(f"[MetricsServer] Final results: {final_results}")
                         
-                        # Update status: video processing complete
-                        with self.status_lock:
-                            self.processing_status['status'] = 'processing_ocr'
-                            self.processing_status['message'] = 'Video processing completed. Running OCR on cropped images...'
-                            self.processing_status['video_processing_complete'] = True
-                        
-                        # Stage 2: Run OCR on cropped images
-                        if self.video_processor.ocr is not None and self.video_processor.crops_dir is not None:
-                            crops_dir = self.video_processor.crops_dir
-                            # Ensure crops_dir is a Path object
-                            from pathlib import Path
-                            if not isinstance(crops_dir, Path):
-                                crops_dir = Path(crops_dir)
-                            if crops_dir.exists() and (crops_dir / "crops_metadata.json").exists():
-                                print(f"[MetricsServer] Starting OCR processing on crops in: {crops_dir}")
-                                try:
-                                    from app.batch_ocr_processor import BatchOCRProcessor
-                                    
-                                    # Create batch OCR processor
-                                    batch_ocr = BatchOCRProcessor(
-                                        self.video_processor.ocr,
-                                        self.video_processor.preprocessor
-                                    )
-                                    
-                                    # Process all crops (convert Path to string)
-                                    crops_dir_str = str(crops_dir)
-                                    ocr_results = batch_ocr.process_crops_directory(crops_dir_str)
-                                    
-                                    # Match OCR results back to detections
-                                    combined_results = batch_ocr.match_ocr_to_detections(crops_dir_str, ocr_results)
-                                    
-                                    print(f"[MetricsServer] OCR processing completed: {len(ocr_results)} crops processed")
-                                    
-                                    # Update status: OCR complete
-                                    with self.status_lock:
-                                        self.processing_status['status'] = 'completed'
-                                        self.processing_status['message'] = 'All the processes completed on the video:'
-                                        self.processing_status['ocr_processing_complete'] = True
-                                    
-                                except Exception as ocr_error:
-                                    print(f"[MetricsServer] Error during OCR processing: {ocr_error}")
-                                    import traceback
-                                    traceback.print_exc()
-                                    with self.status_lock:
-                                        self.processing_status['status'] = 'error'
-                                        self.processing_status['message'] = f'Video processing completed, but OCR failed: {str(ocr_error)}'
-                                        self.processing_status['ocr_processing_complete'] = False
-                            else:
-                                print(f"[MetricsServer] No crops directory or metadata found, skipping OCR")
-                                with self.status_lock:
-                                    self.processing_status['status'] = 'completed'
-                                    self.processing_status['message'] = 'Video processing completed (no crops to process)'
-                                    self.processing_status['ocr_processing_complete'] = True
+                        # Unload YOLO detector to free GPU memory
+                        print(f"[MetricsServer] Unloading YOLO detector to free GPU memory...")
+                        if self.frame_storage is not None:
+                            try:
+                                # Unload YOLO detector
+                                self.frame_storage._unload_detector()
+                                print(f"[MetricsServer] YOLO detector unloaded successfully")
+                            except Exception as e:
+                                print(f"[MetricsServer] Warning: Error unloading YOLO detector: {e}")
+                                import traceback
+                                traceback.print_exc()
                         else:
-                            print(f"[MetricsServer] OCR not available or crops not saved, skipping OCR processing")
-                            with self.status_lock:
-                                self.processing_status['status'] = 'completed'
-                                self.processing_status['message'] = 'Video processing completed (OCR not available)'
-                                self.processing_status['ocr_processing_complete'] = True
+                            print(f"[MetricsServer] Warning: frame_storage not available, cannot unload YOLO")
+                        
+                        # Update status: video processing complete
+                        # OCR will not be loaded automatically - user must trigger it manually if needed
+                        with self.status_lock:
+                            self.processing_status['status'] = 'completed'
+                            self.processing_status['message'] = 'Video processing completed. Crops saved. OCR processing available on demand.'
+                            self.processing_status['video_processing_complete'] = True
+                            self.processing_status['ocr_processing_complete'] = False  # OCR not run automatically
+                        
+                        print(f"[MetricsServer] Video processing complete. Crops saved to: {self.video_processor.crops_dir if self.video_processor.crops_dir else 'N/A'}")
+                        print(f"[MetricsServer] OCR processing is available on demand (not run automatically)")
                         
                     except Exception as e:
                         print(f"[MetricsServer] Error processing video: {e}")

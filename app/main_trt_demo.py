@@ -157,113 +157,12 @@ class TrailerVisionApp:
             print(f"  - Fine-tuned model: {fine_tuned_model_path}")
             print(f"  - TensorRT engine: {engine_path}")
         
-        # Initialize OCR - Priority: oLmOCR > EasyOCR > TrOCR > PaddleOCR English-only > Multilingual > Legacy CRNN
-        # oLmOCR (Qwen3-VL/Qwen2.5-VL) is recommended for best accuracy, especially for vertical text and complex layouts
+        # Initialize OCR - Lazy loading: Don't load OCR initially to save memory
+        # OCR will be loaded on-demand when explicitly requested (not automatically)
+        # This prevents memory issues when processing large videos
         self.ocr = None
-        
-        # Try oLmOCR first (best accuracy for vertical text, complex layouts, and multi-language support)
-        try:
-            from app.ocr.olmocr_recognizer import OlmOCRRecognizer
-            # Use Qwen3-VL-4B-Instruct for best OCR performance (32 languages, 4B params)
-            # For edge devices with limited memory, consider Qwen2.5-VL-3B-Instruct
-            # OPTIMIZATION: Enable fast preprocessing for better speed
-            # Set fast_preprocessing=True for 2-3x faster preprocessing (slightly less enhancement)
-            self.ocr = OlmOCRRecognizer(
-                model_name="Qwen/Qwen3-VL-4B-Instruct",
-                use_gpu=True,
-                fast_preprocessing=globals_cfg.get('ocr_fast_preprocessing', False)  # Enable via config
-            )
-            self.is_olmocr = True  # Mark as oLmOCR for GPU memory cleanup
-            print(f"✓ Using oLmOCR (Qwen3-VL-4B-Instruct) - recommended for high accuracy, especially vertical text")
-        except ImportError:
-            print("oLmOCR not available (pip3 install transformers torch qwen-vl-utils), trying EasyOCR...")
-        except Exception as e:
-            print(f"oLmOCR initialization failed: {e}, trying EasyOCR...")
-        
-        # Try EasyOCR if oLmOCR failed (self.ocr is still None)
-        if self.ocr is None:
-            try:
-                from app.ocr.easyocr_recognizer import EasyOCRRecognizer
-                self.ocr = EasyOCRRecognizer(languages=['en'], gpu=True)
-                print(f"✓ Using EasyOCR (fallback - good accuracy for printed text)")
-            except ImportError:
-                print("EasyOCR not available (pip3 install easyocr), trying TrOCR...")
-            except Exception as e:
-                print(f"EasyOCR initialization failed: {e}, trying TrOCR...")
-        
-        # Only try TrOCR if oLmOCR and EasyOCR failed (self.ocr is still None)
-        if self.ocr is None:
-            # Try TrOCR (transformer-based, good accuracy for printed text)
-            # Check for full TrOCR model first, then encoder-only
-            trocr_engine_paths = [
-                "models/trocr_full.engine",  # Full encoder-decoder model (preferred)
-                "models/trocr.engine",        # Encoder-only or full model
-            ]
-            
-            trocr_loaded = False
-            for trocr_path in trocr_engine_paths:
-                if os.path.exists(trocr_path):
-                    try:
-                        from app.ocr.trocr_recognizer import TrOCRRecognizer
-                        # Try to find tokenizer in standard locations
-                        tokenizer_paths = [
-                            "models/trocr_base_printed",
-                            "models/trocr-base-printed",
-                        ]
-                        model_dir = None
-                        for path in tokenizer_paths:
-                            if os.path.exists(path):
-                                model_dir = path
-                                break
-                        
-                        self.ocr = TrOCRRecognizer(trocr_path, model_dir=model_dir)
-                        print(f"✓ Using TrOCR model: {trocr_path} (fallback - oLmOCR/EasyOCR not available)")
-                        trocr_loaded = True
-                        break
-                    except ImportError:
-                        print("TrOCR not available (transformers not installed), trying other OCR models...")
-                        break
-                    except Exception as e:
-                        print(f"TrOCR initialization failed ({trocr_path}): {e}, trying other OCR models...")
-                        continue
-        
-        # Fallback to PaddleOCR models if oLmOCR, EasyOCR, and TrOCR not available
-        if self.ocr is None:
-            ocr_path = None
-            alphabet_path = None
-            input_size = (320, 48)
-            
-            # Try PaddleOCR English-only (best for English/number text)
-            if os.path.exists("models/paddleocr_rec_english.engine") and os.path.exists("app/ocr/ppocr_keys_en.txt"):
-                ocr_path = "models/paddleocr_rec_english.engine"
-                alphabet_path = "app/ocr/ppocr_keys_en.txt"
-                print("Using PaddleOCR English-only model (fallback)")
-            # Fallback to PaddleOCR multilingual
-            elif os.path.exists("models/paddleocr_rec.engine") and os.path.exists("app/ocr/ppocr_keys_v1.txt"):
-                ocr_path = "models/paddleocr_rec.engine"
-                alphabet_path = "app/ocr/ppocr_keys_v1.txt"
-                print("Using PaddleOCR multilingual model (fallback)")
-            # Fallback to legacy CRNN engine
-            elif os.path.exists("models/ocr_crnn.engine") and os.path.exists("app/ocr/alphabet.txt"):
-                ocr_path = "models/ocr_crnn.engine"
-                alphabet_path = "app/ocr/alphabet.txt"
-                input_size = None  # CRNN uses default size
-                print("Using legacy CRNN model (fallback)")
-            
-            if ocr_path and alphabet_path:
-                if "paddleocr" in ocr_path.lower():
-                    self.ocr = PlateRecognizer(ocr_path, alphabet_path, input_size=input_size)
-                else:
-                    self.ocr = PlateRecognizer(ocr_path, alphabet_path)
-                print(f"Loaded OCR engine: {ocr_path} with alphabet: {alphabet_path}")
-        if self.ocr is None:
-            print(f"Warning: No OCR engine found. Tried:")
-            print(f"  - oLmOCR (recommended - install: pip3 install transformers torch qwen-vl-utils)")
-            print(f"  - EasyOCR (fallback - install: pip3 install easyocr)")
-            print(f"  - models/trocr.engine (TrOCR)")
-            print(f"  - models/paddleocr_rec_english.engine (English-only)")
-            print(f"  - models/paddleocr_rec.engine (multilingual)")
-            print(f"  - models/ocr_crnn.engine (legacy)")
+        self.is_olmocr = False
+        print(f"[TrailerVisionApp] OCR loading deferred - will be loaded on-demand when requested")
         
         # Initialize spot resolver
         spots_path = "config/spots.geojson"
@@ -459,6 +358,184 @@ class TrailerVisionApp:
             except Exception:
                 # Silently fail - don't interrupt frame processing
                 pass
+    
+    def _initialize_ocr(self):
+        """
+        Initialize OCR model (lazy loading).
+        This is called after YOLO video processing is complete to save memory.
+        """
+        if self.ocr is not None:
+            print(f"[TrailerVisionApp] OCR already initialized, skipping...")
+            return
+        
+        globals_cfg = self.config.get('globals', {})
+        
+        print(f"[TrailerVisionApp] Initializing OCR...")
+        
+        # Initialize OCR - Priority: oLmOCR > EasyOCR > TrOCR > PaddleOCR English-only > Multilingual > Legacy CRNN
+        # oLmOCR (Qwen3-VL/Qwen2.5-VL) is recommended for best accuracy, especially for vertical text and complex layouts
+        self.ocr = None
+        
+        # Try oLmOCR first (best accuracy for vertical text, complex layouts, and multi-language support)
+        try:
+            from app.ocr.olmocr_recognizer import OlmOCRRecognizer
+            # Use Qwen3-VL-4B-Instruct for best OCR performance (32 languages, 4B params)
+            # For edge devices with limited memory, consider Qwen2.5-VL-3B-Instruct
+            # OPTIMIZATION: Enable fast preprocessing for better speed
+            # Set fast_preprocessing=True for 2-3x faster preprocessing (slightly less enhancement)
+            self.ocr = OlmOCRRecognizer(
+                model_name="Qwen/Qwen3-VL-4B-Instruct",
+                use_gpu=True,
+                fast_preprocessing=globals_cfg.get('ocr_fast_preprocessing', False)  # Enable via config
+            )
+            self.is_olmocr = True  # Mark as oLmOCR for GPU memory cleanup
+            print(f"✓ Using oLmOCR (Qwen3-VL-4B-Instruct) - recommended for high accuracy, especially vertical text")
+        except ImportError:
+            print("oLmOCR not available (pip3 install transformers torch qwen-vl-utils), trying EasyOCR...")
+        except Exception as e:
+            print(f"oLmOCR initialization failed: {e}, trying EasyOCR...")
+        
+        # Try EasyOCR if oLmOCR failed (self.ocr is still None)
+        if self.ocr is None:
+            try:
+                from app.ocr.easyocr_recognizer import EasyOCRRecognizer
+                self.ocr = EasyOCRRecognizer(languages=['en'], gpu=True)
+                print(f"✓ Using EasyOCR (fallback - good accuracy for printed text)")
+            except ImportError:
+                print("EasyOCR not available (pip3 install easyocr), trying TrOCR...")
+            except Exception as e:
+                print(f"EasyOCR initialization failed: {e}, trying TrOCR...")
+        
+        # Only try TrOCR if oLmOCR and EasyOCR failed (self.ocr is still None)
+        if self.ocr is None:
+            # Try TrOCR (transformer-based, good accuracy for printed text)
+            # Check for full TrOCR model first, then encoder-only
+            trocr_engine_paths = [
+                "models/trocr_full.engine",  # Full encoder-decoder model (preferred)
+                "models/trocr.engine",        # Encoder-only or full model
+            ]
+            
+            trocr_loaded = False
+            for trocr_path in trocr_engine_paths:
+                if os.path.exists(trocr_path):
+                    try:
+                        from app.ocr.trocr_recognizer import TrOCRRecognizer
+                        # Try to find tokenizer in standard locations
+                        tokenizer_paths = [
+                            "models/trocr_base_printed",
+                            "models/trocr-base-printed",
+                        ]
+                        model_dir = None
+                        for path in tokenizer_paths:
+                            if os.path.exists(path):
+                                model_dir = path
+                                break
+                        
+                        self.ocr = TrOCRRecognizer(trocr_path, model_dir=model_dir)
+                        print(f"✓ Using TrOCR model: {trocr_path} (fallback - oLmOCR/EasyOCR not available)")
+                        trocr_loaded = True
+                        break
+                    except ImportError:
+                        print("TrOCR not available (transformers not installed), trying other OCR models...")
+                        break
+                    except Exception as e:
+                        print(f"TrOCR initialization failed ({trocr_path}): {e}, trying other OCR models...")
+                        continue
+        
+        # Fallback to PaddleOCR models if oLmOCR, EasyOCR, and TrOCR not available
+        if self.ocr is None:
+            ocr_path = None
+            alphabet_path = None
+            input_size = (320, 48)
+            
+            # Try PaddleOCR English-only (best for English/number text)
+            if os.path.exists("models/paddleocr_rec_english.engine") and os.path.exists("app/ocr/ppocr_keys_en.txt"):
+                ocr_path = "models/paddleocr_rec_english.engine"
+                alphabet_path = "app/ocr/ppocr_keys_en.txt"
+                print("Using PaddleOCR English-only model (fallback)")
+            # Fallback to PaddleOCR multilingual
+            elif os.path.exists("models/paddleocr_rec.engine") and os.path.exists("app/ocr/ppocr_keys_v1.txt"):
+                ocr_path = "models/paddleocr_rec.engine"
+                alphabet_path = "app/ocr/ppocr_keys_v1.txt"
+                print("Using PaddleOCR multilingual model (fallback)")
+            # Fallback to legacy CRNN engine
+            elif os.path.exists("models/ocr_crnn.engine") and os.path.exists("app/ocr/alphabet.txt"):
+                ocr_path = "models/ocr_crnn.engine"
+                alphabet_path = "app/ocr/alphabet.txt"
+                input_size = None  # CRNN uses default size
+                print("Using legacy CRNN model (fallback)")
+            
+            if ocr_path and alphabet_path:
+                if "paddleocr" in ocr_path.lower():
+                    self.ocr = PlateRecognizer(ocr_path, alphabet_path, input_size=input_size)
+                else:
+                    self.ocr = PlateRecognizer(ocr_path, alphabet_path)
+                print(f"Loaded OCR engine: {ocr_path} with alphabet: {alphabet_path}")
+        
+        if self.ocr is None:
+            print(f"Warning: No OCR engine found. Tried:")
+            print(f"  - oLmOCR (recommended - install: pip3 install transformers torch qwen-vl-utils)")
+            print(f"  - EasyOCR (fallback - install: pip3 install easyocr)")
+            print(f"  - models/trocr.engine (TrOCR)")
+            print(f"  - models/paddleocr_rec_english.engine (English-only)")
+            print(f"  - models/paddleocr_rec.engine (multilingual)")
+            print(f"  - models/ocr_crnn.engine (legacy)")
+        else:
+            # Update video processor OCR if it exists
+            if hasattr(self, 'video_processor') and self.video_processor is not None:
+                self.video_processor.ocr = self.ocr
+                # Update is_olmocr flag in video processor
+                self.video_processor.is_olmocr = self.is_olmocr
+                print(f"[TrailerVisionApp] Updated video processor with OCR")
+    
+    def _unload_detector(self):
+        """
+        Unload YOLO detector to free GPU memory.
+        This is called after YOLO video processing is complete.
+        """
+        if self.detector is None:
+            print(f"[TrailerVisionApp] Detector already unloaded, skipping...")
+            return
+        
+        print(f"[TrailerVisionApp] Unloading YOLO detector to free GPU memory...")
+        
+        # Clean up detector based on type
+        detector_type = type(self.detector).__name__
+        
+        if detector_type == "YOLOv8Detector":
+            # YOLOv8 uses PyTorch/Ultralytics
+            try:
+                if hasattr(self.detector, 'model'):
+                    # Move model to CPU and delete
+                    if hasattr(self.detector.model, 'to'):
+                        self.detector.model = self.detector.model.to('cpu')
+                    del self.detector.model
+                del self.detector
+            except Exception as e:
+                print(f"[TrailerVisionApp] Warning: Error unloading YOLOv8 detector: {e}")
+        elif detector_type == "TrtEngineYOLO":
+            # TensorRT engine - delete the engine
+            try:
+                if hasattr(self.detector, 'engine'):
+                    del self.detector.engine
+                if hasattr(self.detector, 'context'):
+                    del self.detector.context
+                del self.detector
+            except Exception as e:
+                print(f"[TrailerVisionApp] Warning: Error unloading TensorRT detector: {e}")
+        
+        self.detector = None
+        
+        # Clean up GPU memory
+        if TORCH_AVAILABLE and torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+                gc.collect()
+                torch.cuda.empty_cache()
+            except Exception as e:
+                print(f"[TrailerVisionApp] Warning: Error cleaning GPU memory: {e}")
+        
+        print(f"[TrailerVisionApp] YOLO detector unloaded successfully")
     
     def _process_frame(self, camera_id: str, frame: np.ndarray, frame_count: int) -> None:
         """

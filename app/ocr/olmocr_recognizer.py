@@ -463,7 +463,7 @@ class OlmOCRRecognizer:
                     "Scan the entire image systematically: left side, center, right side. "
                     "Include ALL text elements: company names (like 'J.B. HUNT', 'ADVANCE Pallet Inc.'), "
                     "trailer identification numbers in BOTH horizontal AND vertical orientations "
-                    "(examples: 'A96904', '538148', 'HMKD 808154', '53124'), "
+                    "(examples: 'A96904', '538148', 'HMKD 808154','3000R7560', '53124'), "
                     "phone numbers, and any other visible text. "
                     "For vertical text, read each character from top to bottom. "
                     "List each unique text element only once, separated by spaces. "
@@ -477,13 +477,17 @@ class OlmOCRRecognizer:
                 prompt = (
                     "Extract ALL trailer identification codes and/or company names from this image. "
                     "Trailer IDs can have these formats: "
-                    "1) Company prefix followed by numbers (e.g., 'JBHU 342345', 'INYU 500434', 'TSFZ 562124', 'HMKD 808154'), "
+                    "1) Company prefix followed by numbers (e.g., 'JBHU 342345', 'INYU 500434','3000R7560','TSFZ 562124', 'HMKD 808154'), "
                     "2) Alphanumeric codes (e.g., 'A96904', '538148', '53124'), "
-                    "3) Numbers only (e.g., '711538', '342345', '500434') - these are also valid trailer IDs. "
+                    "3) Numbers only (e.g., '711538', '342345', '500434', '372') - these are also valid trailer IDs. "
                     "The company prefix is usually 2-6 letters (like 'JBHU', 'INYU', 'TSFZ', 'HMKD', 'NSPZ') followed by a space and numbers. "
                     "Also extract company names if present (e.g., 'J.B. HUNT', 'THERMO KING', 'ADVANCE Pallet Inc.', 'DCLI'). "
                     "CRITICAL: If multiple trailer IDs are present (e.g., 'INYU 500501' and 'TSFZ 562124'), extract ALL of them. "
-                    "CRITICAL: Look for numeric-only trailer IDs (like '711538') which may appear vertically or in different locations. "
+                    "CRITICAL: Look for numeric-only trailer IDs (like '711538', '372') which may appear vertically or in different locations. "
+                    "CRITICAL: For numeric trailer IDs that appear in multiple parts (e.g., digits on left and right sides), "
+                    "read them in the correct order to form a complete number. If a single digit appears vertically on the right side "
+                    "and multi-digit text appears horizontally on the left, the single digit may need to be read FIRST to form the complete number "
+                    "(e.g., if you see '72' on left and '3' vertically on right, the correct reading is likely '372', not '72 3'). "
                     "Return all trailer identification codes and/or company names separated by spaces. "
                     "Ignore logos, phone numbers, state codes, or other text that is not a trailer ID or company name. "
                     "Return only the identification codes and/or company names, no explanations."
@@ -587,6 +591,113 @@ class OlmOCRRecognizer:
         except Exception as e:
             print(f"[oLmOCR] Recognition error: {e}")
             return {'text': '', 'conf': 0.0}
+    
+    def _reorder_numeric_fragments(self, text: str, min_text_length: int, max_text_length: int) -> str:
+        """
+        Reorder spatially separated numeric fragments to form valid numbers.
+        
+        Handles cases like "72 3" -> "372" where fragments are detected in wrong order
+        due to spatial separation (e.g., vertical text on right, horizontal on left).
+        
+        Args:
+            text: Text with potential space-separated numeric fragments
+            min_text_length: Minimum text length
+            max_text_length: Maximum text length
+            
+        Returns:
+            Reordered text, or original if no reordering needed/applicable
+        """
+        if not text or ' ' not in text:
+            return text
+        
+        # Split into fragments
+        fragments = text.split()
+        
+        # Only process if we have 2-3 fragments and all are numeric
+        if len(fragments) < 2 or len(fragments) > 3:
+            return text
+        
+        # Check if all fragments are numeric (digits only)
+        all_numeric = all(frag.isdigit() for frag in fragments)
+        if not all_numeric:
+            return text
+        
+        # Calculate total length
+        total_length = sum(len(f) for f in fragments)
+        
+        # Only process if total length is within valid range
+        if total_length < min_text_length or total_length > max_text_length:
+            return text
+        
+        # Try different orderings
+        # Strategy: If one fragment is a single digit, try placing it at the beginning
+        # (common case: vertical single digit on right should be read first)
+        single_digit_frags = [f for f in fragments if len(f) == 1]
+        multi_digit_frags = [f for f in fragments if len(f) > 1]
+        
+        candidates = []
+        
+        if single_digit_frags and multi_digit_frags:
+            # Case: "72 3" -> try "372", "723", "372"
+            single = single_digit_frags[0]
+            multi = ''.join(multi_digit_frags)
+            
+            # Try single digit at beginning
+            candidate1 = single + multi
+            if min_text_length <= len(candidate1) <= max_text_length:
+                candidates.append(candidate1)
+            
+            # Try single digit at end
+            candidate2 = multi + single
+            if min_text_length <= len(candidate2) <= max_text_length:
+                candidates.append(candidate2)
+            
+            # Try original order (no spaces)
+            candidate3 = ''.join(fragments)
+            if min_text_length <= len(candidate3) <= max_text_length:
+                candidates.append(candidate3)
+        else:
+            # All fragments are multi-digit or all single-digit
+            # Try original order (no spaces)
+            candidate = ''.join(fragments)
+            if min_text_length <= len(candidate) <= max_text_length:
+                candidates.append(candidate)
+        
+        # If we have candidates, prefer the one that's most likely a valid trailer ID
+        # Prefer longer numbers (3+ digits) and avoid very short ones
+        if candidates:
+            # Score candidates: prefer 3-6 digit numbers (common trailer ID length)
+            # Also prefer single-digit-at-beginning when we have that pattern
+            scored = []
+            for i, cand in enumerate(candidates):
+                score = 0
+                length = len(cand)
+                if 3 <= length <= 6:
+                    score = 10  # Best range for trailer IDs
+                elif length == 2:
+                    score = 5   # Acceptable but less common
+                elif 7 <= length <= 8:
+                    score = 8   # Longer but still valid
+                else:
+                    score = 3   # Less common
+                
+                # Bonus for single-digit-at-beginning (common pattern for vertical text on right)
+                # This helps prefer "372" over "723" when both are valid
+                if single_digit_frags and cand.startswith(single_digit_frags[0]):
+                    score += 2  # Small bonus for single digit at beginning
+                
+                scored.append((score, i, cand))  # Include index to preserve order for tie-breaking
+            
+            # Sort by score (descending), then by index (ascending) to prefer earlier candidates
+            scored.sort(key=lambda x: (-x[0], x[1]))
+            best = scored[0][2]
+            
+            if best != ''.join(fragments):  # Only log if we changed something
+                print(f"[oLmOCR] Reordered numeric fragments: '{text}' -> '{best}'")
+            
+            return best
+        
+        return text
     
     def _recognize_single_image(self, pil_image: Image.Image, prompt: str, 
                                 full_image_mode: bool, max_tokens: int,
@@ -1021,6 +1132,11 @@ class OlmOCRRecognizer:
             # Use the validated text
             text_clean = text_to_validate
             
+            # Handle spatial reordering of numeric fragments (e.g., "72 3" -> "372")
+            # This handles cases where fragments are detected in wrong order due to spatial separation
+            if not full_image_mode:
+                text_clean = self._reorder_numeric_fragments(text_clean, min_text_length, max_text_length)
+            
             # oLmOCR doesn't provide confidence scores directly
             # Use a heuristic: if text was extracted and matches expected pattern, assign high confidence
             # For trailer IDs, alphanumeric patterns are more reliable
@@ -1076,15 +1192,67 @@ class OlmOCRRecognizer:
                     print(f"[oLmOCR] Debug: Text filtered by garbage pattern: '{text_clean}'")
                     return {'text': '', 'conf': 0.0}
                 
+                # Remove obvious word-level repetitions before validation
+                # This helps with cases like "JB HUNT JBHU 249646 249646 53 STEEL JBHU 249646"
+                # where words/phrases are repeated
+                # Always deduplicate text with spaces, regardless of length
+                if ' ' in text_clean:
+                    words = text_clean.split()
+                    # Remove consecutive duplicate words first
+                    deduplicated_words = []
+                    for word in words:
+                        # Skip if this word was just added (consecutive duplicate)
+                        if not deduplicated_words or word != deduplicated_words[-1]:
+                            deduplicated_words.append(word)
+                    
+                    # Now check for phrase repetitions (2-word phrases)
+                    # Look for patterns like "JBHU 249646" appearing multiple times
+                    # Track seen 2-word phrases to catch non-consecutive repetitions
+                    seen_phrases = set()
+                    final_words = []
+                    i = 0
+                    while i < len(deduplicated_words):
+                        word = deduplicated_words[i]
+                        
+                        # Check if adding this word would create a repeated 2-word phrase
+                        if len(final_words) >= 1 and i < len(deduplicated_words) - 1:
+                            # We have at least one word already, check if next 2 words form a phrase we've seen
+                            potential_phrase = ' '.join([word, deduplicated_words[i + 1]])
+                            if potential_phrase in seen_phrases:
+                                # This phrase was already seen, skip it
+                                i += 2
+                                continue
+                        
+                        # Add the word and update seen phrases
+                        final_words.append(word)
+                        if len(final_words) >= 2:
+                            # Track the last 2-word phrase
+                            last_phrase = ' '.join(final_words[-2:])
+                            seen_phrases.add(last_phrase)
+                        i += 1
+                    
+                    # Only update text_clean if deduplication actually removed something
+                    deduplicated_text = ' '.join(final_words)
+                    if len(deduplicated_text) < len(text_clean):
+                        text_clean = deduplicated_text
+                        # Recalculate has_letters and has_numbers after deduplication
+                        has_letters = any(c.isalpha() for c in text_clean)
+                        has_numbers = any(c.isdigit() for c in text_clean)
+                
                 # Validate trailer ID pattern (only for single ID mode)
                 # Use max_text_length instead of hardcoded 12 to respect user's length settings
+                # Accept:
+                # 1. All digits (numeric trailer IDs)
+                # 2. Alphanumeric (trailer IDs with letters and numbers)
+                # 3. Letters-only with sufficient confidence (company names like "MARJON", "THERMO KING")
                 is_valid_pattern = (
                     (text_clean.isdigit() and min_text_length <= len(text_clean) <= max_text_length) or
-                    (has_numbers and has_letters and min_text_length <= len(text_clean) <= max_text_length)
+                    (has_numbers and has_letters and min_text_length <= len(text_clean) <= max_text_length) or
+                    (has_letters and not has_numbers and conf >= 0.70 and min_text_length <= len(text_clean) <= max_text_length)
                 )
                 
                 if not is_valid_pattern:
-                    print(f"[oLmOCR] Debug: Text filtered by pattern validation: '{text_clean}' (len={len(text_clean)}, min={min_text_length}, max={max_text_length})")
+                    print(f"[oLmOCR] Debug: Text filtered by pattern validation: '{text_clean}' (len={len(text_clean)}, min={min_text_length}, max={max_text_length}, conf={conf:.2f})")
                     return {'text': '', 'conf': 0.0}
             
             # Final debug: log what we're returning

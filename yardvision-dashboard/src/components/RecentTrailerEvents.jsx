@@ -149,3 +149,4 @@ const RecentTrailerEvents = ({ onEventSelect, selectedDate = null }) => {
 
 export default RecentTrailerEvents
 
+

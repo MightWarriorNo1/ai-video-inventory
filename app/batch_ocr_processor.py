@@ -100,7 +100,7 @@ class BatchOCRProcessor:
                 # For full images: return all text, try multiple preprocessing
                 base_ocr_params = {
                     'min_text_length': 2,
-                    'max_text_length': 40,
+                    'max_text_length': 50,  # Increased from 40 to accommodate longer trailer IDs with company names
                     'allowlist': "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ",  # Alphanumeric only for trailer IDs
                 }
                 

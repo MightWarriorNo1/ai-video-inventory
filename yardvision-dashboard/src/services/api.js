@@ -80,3 +80,4 @@ export const fetchEvents = async (limit = 100) => {
   }
 }
 
+
