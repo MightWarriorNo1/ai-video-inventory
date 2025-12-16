@@ -1,8 +1,8 @@
 """
 Homography Calibration Tool
 
-Interactive tool for calibrating camera homography (image -> world coordinates).
-Click 4+ landmark points on an image and enter corresponding world coordinates.
+Interactive tool for calibrating camera homography (image -> GPS coordinates).
+Click 4+ landmark points on an image and enter corresponding GPS coordinates.
 """
 
 import cv2
@@ -10,6 +10,12 @@ import numpy as np
 import json
 import argparse
 from pathlib import Path
+import sys
+import os
+
+# Add parent directory to path to import gps_utils
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+from app.gps_utils import gps_to_meters, validate_gps_coordinate
 
 
 class HomographyCalibrator:
@@ -17,21 +23,26 @@ class HomographyCalibrator:
     Interactive homography calibration tool.
     """
     
-    def __init__(self, image_path: str):
+    def __init__(self, image_path: str, use_gps: bool = True):
         """
         Initialize calibrator.
         
         Args:
             image_path: Path to calibration image
+            use_gps: If True, accept GPS coordinates (lat/lon). If False, use local meters.
         """
         self.image_path = image_path
         self.image = cv2.imread(image_path)
+        self.use_gps = use_gps
         
         if self.image is None:
             raise ValueError(f"Failed to load image: {image_path}")
         
         self.image_points = []
-        self.world_points = []
+        self.world_points = []  # Will store GPS coords if use_gps=True, else meters
+        self.gps_points = []  # Always store GPS coords for reference
+        self.ref_lat = None
+        self.ref_lon = None
         self.window_name = "Homography Calibration - Click 4+ points, press 'q' when done"
     
     def mouse_callback(self, event, x, y, flags, param):
@@ -40,12 +51,36 @@ class HomographyCalibrator:
             self.image_points.append([x, y])
             print(f"Point {len(self.image_points)}: Image ({x}, {y})")
             
-            # Prompt for world coordinates
+            # Prompt for coordinates
             try:
-                world_x = float(input(f"  Enter world X (meters): "))
-                world_y = float(input(f"  Enter world Y (meters): "))
-                self.world_points.append([world_x, world_y])
-                print(f"  World ({world_x}, {world_y})")
+                if self.use_gps:
+                    lat = float(input(f"  Enter GPS Latitude (degrees, e.g., 40.7128): "))
+                    lon = float(input(f"  Enter GPS Longitude (degrees, e.g., -74.0060): "))
+                    
+                    if not validate_gps_coordinate(lat, lon):
+                        print("  Invalid GPS coordinates! Latitude must be -90 to 90, Longitude -180 to 180")
+                        self.image_points.pop()
+                        return
+                    
+                    # Store GPS coordinates
+                    self.gps_points.append([lat, lon])
+                    
+                    # Set reference point from first GPS coordinate
+                    if self.ref_lat is None:
+                        self.ref_lat = lat
+                        self.ref_lon = lon
+                        print(f"  Reference point set: ({lat}, {lon})")
+                    
+                    # Convert GPS to local meters for homography calculation
+                    x_meters, y_meters = gps_to_meters(lat, lon, self.ref_lat, self.ref_lon)
+                    self.world_points.append([x_meters, y_meters])
+                    print(f"  GPS ({lat:.6f}, {lon:.6f}) -> Local ({x_meters:.2f}m, {y_meters:.2f}m)")
+                else:
+                    world_x = float(input(f"  Enter world X (meters): "))
+                    world_y = float(input(f"  Enter world Y (meters): "))
+                    self.world_points.append([world_x, world_y])
+                    self.gps_points.append([None, None])  # No GPS data
+                    print(f"  World ({world_x}, {world_y})")
             except ValueError:
                 print("  Invalid input, skipping point")
                 self.image_points.pop()
@@ -72,11 +107,23 @@ class HomographyCalibrator:
             Tuple of (homography_matrix, rmse)
         """
         print("\n=== Homography Calibration ===")
-        print("Instructions:")
-        print("1. Click 4+ landmark points on the image")
-        print("2. Enter corresponding world coordinates (in meters)")
-        print("3. Press 'q' when done (minimum 4 points required)")
-        print()
+        if self.use_gps:
+            print("Instructions:")
+            print("1. Click 4+ landmark points on the image")
+            print("2. Enter corresponding GPS coordinates (latitude, longitude)")
+            print("   Example: Latitude: 40.7128, Longitude: -74.0060")
+            print("   Tip: Use Google Maps to get GPS coordinates for each point")
+            print("3. Press 'q' when done (minimum 4 points required)")
+            print()
+            print("NOTE: The first GPS point will be used as the reference origin (0,0)")
+            print("      All other points will be converted relative to this reference.")
+            print()
+        else:
+            print("Instructions:")
+            print("1. Click 4+ landmark points on the image")
+            print("2. Enter corresponding world coordinates (in meters)")
+            print("3. Press 'q' when done (minimum 4 points required)")
+            print()
         
         # Create window and set mouse callback
         cv2.namedWindow(self.window_name)
@@ -132,8 +179,18 @@ class HomographyCalibrator:
             'rmse': float(rmse),
             'image_points': self.image_points,
             'world_points': self.world_points,
-            'image_path': str(self.image_path)
+            'image_path': str(self.image_path),
+            'use_gps': self.use_gps
         }
+        
+        # Add GPS reference if using GPS
+        if self.use_gps and self.ref_lat is not None and self.ref_lon is not None:
+            calib_data['gps_reference'] = {
+                'lat': float(self.ref_lat),
+                'lon': float(self.ref_lon),
+                'description': 'Reference GPS point corresponding to homography origin (0,0)'
+            }
+            calib_data['gps_points'] = self.gps_points
         
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -143,6 +200,8 @@ class HomographyCalibrator:
         
         print(f"\nCalibration saved to: {output_path}")
         print(f"RMSE: {rmse:.3f} meters")
+        if self.use_gps and self.ref_lat is not None:
+            print(f"GPS Reference: ({self.ref_lat:.6f}, {self.ref_lon:.6f})")
         if rmse > 1.5:
             print("Warning: RMSE > 1.5m, consider recalibrating with more points")
 
@@ -152,17 +211,24 @@ def main():
     parser = argparse.ArgumentParser(description='Homography Calibration Tool')
     parser.add_argument('--image', required=True, help='Path to calibration image')
     parser.add_argument('--save', required=True, help='Output JSON file path (e.g., config/calib/camera-id_h.json)')
+    parser.add_argument('--use-meters', action='store_true', help='Use local meters instead of GPS coordinates (legacy mode)')
     
     args = parser.parse_args()
     
     try:
-        calibrator = HomographyCalibrator(args.image)
+        use_gps = not args.use_meters  # Default to GPS mode
+        calibrator = HomographyCalibrator(args.image, use_gps=use_gps)
         H, rmse = calibrator.calibrate()
         calibrator.save(args.save, H, rmse)
         
         print("\nCalibration complete!")
+        if use_gps:
+            print("\nGPS coordinates will be output for all detections.")
+            print("You can copy-paste these coordinates directly into Google Maps!")
     except Exception as e:
         print(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
         return 1
     
     return 0

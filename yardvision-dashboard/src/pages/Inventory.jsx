@@ -77,6 +77,7 @@ const Inventory = () => {
               <th>Plate Number</th>
               <th>Spot</th>
               <th>Status</th>
+              <th>GPS Coordinates</th>
               <th>Detected At</th>
               <th>OCR Confidence</th>
             </tr>
@@ -84,7 +85,7 @@ const Inventory = () => {
           <tbody>
             {trailers.length === 0 ? (
               <tr>
-                <td colSpan="6" className="no-data">
+                <td colSpan="7" className="no-data">
                   No trailers found. Make sure combined_results.json files exist in out/crops/test-video/ folders.
                 </td>
               </tr>
@@ -99,6 +100,13 @@ const Inventory = () => {
                   detectedAtStr = trailer.detectedAt || 'N/A'
                 }
                 
+                const formatGPS = (lat, lon) => {
+                  if (lat != null && lon != null) {
+                    return `${lat.toFixed(6)}, ${lon.toFixed(6)}`
+                  }
+                  return 'N/A'
+                }
+                
                 return (
                   <tr key={trailer.id}>
                     <td>{trailer.id}</td>
@@ -109,6 +117,7 @@ const Inventory = () => {
                         {trailer.status || 'Unknown'}
                       </span>
                     </td>
+                    <td className="gps-coords">{formatGPS(trailer.lat, trailer.lon)}</td>
                     <td>{detectedAtStr}</td>
                     <td>
                       <div className="confidence-bar">
@@ -131,6 +140,11 @@ const Inventory = () => {
 }
 
 export default Inventory
+
+
+
+
+
 
 
 

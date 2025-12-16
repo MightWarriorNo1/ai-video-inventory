@@ -229,6 +229,7 @@ class TrailerVisionApp:
         print(f"  Rotation: {rotation_msg}")
         
         # Load homographies for each camera
+        self.gps_references = {}  # Store GPS reference for each camera
         for camera in self.config.get('cameras', []):
             camera_id = camera['id']
             calib_path = f"config/calib/{camera_id}_h.json"
@@ -236,7 +237,17 @@ class TrailerVisionApp:
                 with open(calib_path, 'r') as f:
                     calib_data = json.load(f)
                     self.homographies[camera_id] = np.array(calib_data['H'])
-                print(f"Loaded homography for {camera_id}")
+                    
+                    # Load GPS reference if available
+                    if 'gps_reference' in calib_data:
+                        gps_ref = calib_data['gps_reference']
+                        self.gps_references[camera_id] = {
+                            'lat': gps_ref['lat'],
+                            'lon': gps_ref['lon']
+                        }
+                        print(f"Loaded homography for {camera_id} with GPS reference: ({gps_ref['lat']:.6f}, {gps_ref['lon']:.6f})")
+                    else:
+                        print(f"Loaded homography for {camera_id} (no GPS reference - using local meters)")
             else:
                 print(f"Warning: Homography not found for {camera_id}: {calib_path}")
         
@@ -258,19 +269,24 @@ class TrailerVisionApp:
         def create_tracker():
             return ByteTrackWrapper(track_thresh=track_thresh)
         
-        # Get homography for first camera (or None) for video processing
+        # Get homography and GPS reference for first camera (or None) for video processing
         test_homography = None
+        test_gps_reference = None
         cameras_list = self.config.get('cameras', [])
         if cameras_list:
             first_camera_id = cameras_list[0]['id']
             if first_camera_id in self.homographies:
                 test_homography = self.homographies[first_camera_id]
+                if first_camera_id in self.gps_references:
+                    test_gps_reference = self.gps_references[first_camera_id]
         
         print(f"[TrailerVisionApp] Initializing video processor:")
         print(f"  - Detector: {'Available' if self.detector else 'NOT AVAILABLE'}")
         print(f"  - OCR: {'Available' if self.ocr else 'NOT AVAILABLE'}")
         print(f"  - Spot Resolver: {'Available' if self.spot_resolver else 'NOT AVAILABLE'}")
         print(f"  - Homography: {'Available' if test_homography is not None else 'NOT AVAILABLE'}")
+        if test_gps_reference:
+            print(f"  - GPS Reference: ({test_gps_reference['lat']:.6f}, {test_gps_reference['lon']:.6f})")
         
         try:
             self.video_processor = VideoProcessor(
@@ -279,7 +295,8 @@ class TrailerVisionApp:
                 ocr=self.ocr,
                 tracker_factory=create_tracker,
                 spot_resolver=self.spot_resolver,
-                homography=test_homography
+                homography=test_homography,
+                gps_reference=test_gps_reference
             )
             print(f"[TrailerVisionApp] Video processor created successfully")
         except Exception as e:
@@ -296,7 +313,7 @@ class TrailerVisionApp:
         else:
             print(f"[TrailerVisionApp] ERROR: Metrics server not initialized!")
     
-    def _project_to_world(self, camera_id: str, x_img: float, y_img: float) -> Optional[tuple]:
+    def _project_to_world(self, camera_id: str, x_img: float, y_img: float, return_gps: bool = True) -> Optional[tuple]:
         """
         Project image coordinates to world coordinates using homography.
         
@@ -304,9 +321,13 @@ class TrailerVisionApp:
             camera_id: Camera identifier
             x_img: Image X coordinate
             y_img: Image Y coordinate
+            return_gps: If True and GPS reference available, return GPS coordinates (lat, lon).
+                       If False or no GPS reference, return local meters (x, y).
             
         Returns:
-            Tuple of (x_world, y_world) or None if homography not available
+            Tuple of (lat, lon) if return_gps=True and GPS reference available,
+            Tuple of (x_world, y_world) in meters otherwise,
+            or None if homography not available
         """
         if camera_id not in self.homographies:
             return None
@@ -315,9 +336,16 @@ class TrailerVisionApp:
         point = np.array([[x_img, y_img]], dtype=np.float32)
         point = np.array([point])
         
-        # Project using homography
+        # Project using homography (gives local meters)
         projected = cv2.perspectiveTransform(point, H)
         x_world, y_world = projected[0][0]
+        
+        # Convert to GPS if requested and reference available
+        if return_gps and camera_id in self.gps_references:
+            from app.gps_utils import meters_to_gps
+            gps_ref = self.gps_references[camera_id]
+            lat, lon = meters_to_gps(x_world, y_world, gps_ref['lat'], gps_ref['lon'])
+            return (float(lat), float(lon))
         
         return (float(x_world), float(y_world))
     
@@ -762,16 +790,30 @@ class TrailerVisionApp:
             # Project center to world coordinates
             center_x = (x1 + x2) / 2.0
             center_y = (y1 + y2) / 2.0
-            world_coords = self._project_to_world(camera_id, center_x, center_y)
             
-            # Resolve parking spot
+            # Get world coordinates in meters first (for spot resolution)
+            world_coords_meters = self._project_to_world(camera_id, center_x, center_y, return_gps=False)
+            
+            # Resolve parking spot (uses meters, same as GeoJSON)
             spot = "unknown"
             method = "no-calibration"
-            if world_coords and self.spot_resolver:
-                x_world, y_world = world_coords
+            if world_coords_meters and self.spot_resolver:
+                x_world, y_world = world_coords_meters
                 spot_result = self.spot_resolver.resolve(x_world, y_world)
                 spot = spot_result['spot']
                 method = spot_result['method']
+            
+            # Convert to GPS coordinates for output (if GPS reference available)
+            world_coords_gps = None
+            if world_coords_meters and camera_id in self.gps_references:
+                from app.gps_utils import meters_to_gps
+                gps_ref = self.gps_references[camera_id]
+                x_meters, y_meters = world_coords_meters
+                lat, lon = meters_to_gps(x_meters, y_meters, gps_ref['lat'], gps_ref['lon'])
+                world_coords_gps = (lat, lon)
+            
+            # Use GPS coordinates if available, otherwise use meters
+            world_coords_output = world_coords_gps if world_coords_gps else world_coords_meters
             
             # Create event
             event = {
@@ -782,8 +824,10 @@ class TrailerVisionApp:
                 'text': text,
                 'conf': conf_ocr,
                 'ocr_method': ocr_method,  # Track which preprocessing method was used
-                'x_world': world_coords[0] if world_coords else None,
-                'y_world': world_coords[1] if world_coords else None,
+                'x_world': world_coords_output[0] if world_coords_output else None,
+                'y_world': world_coords_output[1] if world_coords_output else None,
+                'lat': world_coords_gps[0] if world_coords_gps else None,  # GPS latitude
+                'lon': world_coords_gps[1] if world_coords_gps else None,  # GPS longitude
                 'spot': spot,
                 'method': method
             }

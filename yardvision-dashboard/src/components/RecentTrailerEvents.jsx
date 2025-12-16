@@ -22,6 +22,8 @@ const RecentTrailerEvents = ({ onEventSelect, selectedDate = null }) => {
         conf: parseFloat(event.conf || 0) * 100,
         ocr: parseFloat(event.ocr_conf || event.conf || 0) * 100,
         source: event.camera_id || 'N/A',
+        lat: event.lat,
+        lon: event.lon,
         rawEvent: event
       }))
       .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp))
@@ -95,6 +97,13 @@ const RecentTrailerEvents = ({ onEventSelect, selectedDate = null }) => {
     }
   }
 
+  const formatGPS = (lat, lon) => {
+    if (lat != null && lon != null) {
+      return `${lat.toFixed(6)}, ${lon.toFixed(6)}`
+    }
+    return 'N/A'
+  }
+
   return (
     <div className="recent-trailer-events">
       <h3>{formatDateTitle(selectedDate)}</h3>
@@ -106,6 +115,7 @@ const RecentTrailerEvents = ({ onEventSelect, selectedDate = null }) => {
               <th>Trailer</th>
               <th>Plate</th>
               <th>Spot</th>
+              <th>GPS Coordinates</th>
               <th>Conf</th>
               <th>OCR</th>
               <th>Source</th>
@@ -114,7 +124,7 @@ const RecentTrailerEvents = ({ onEventSelect, selectedDate = null }) => {
           <tbody>
             {events.length === 0 ? (
               <tr>
-                <td colSpan="7" className="no-events">No events found</td>
+                <td colSpan="8" className="no-events">No events found</td>
               </tr>
             ) : (
               events.map((event) => (
@@ -134,6 +144,7 @@ const RecentTrailerEvents = ({ onEventSelect, selectedDate = null }) => {
                   <td>
                     <span className="spot-badge">{event.spot}</span>
                   </td>
+                  <td className="gps-coords">{formatGPS(event.lat, event.lon)}</td>
                   <td>{event.conf.toFixed(0)}%</td>
                   <td>{event.ocr.toFixed(0)}%</td>
                   <td>{event.source}</td>

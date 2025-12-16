@@ -263,22 +263,9 @@ class MetricsServer:
                         print(f"[MetricsServer] Video processing completed: {frame_count} frames processed")
                         print(f"[MetricsServer] Final results: {final_results}")
                         
-                        # Unload YOLO detector to free GPU memory
-                        print(f"[MetricsServer] Unloading YOLO detector to free GPU memory...")
-                        if self.frame_storage is not None:
-                            try:
-                                # Unload YOLO detector
-                                self.frame_storage._unload_detector()
-                                print(f"[MetricsServer] YOLO detector unloaded successfully")
-                            except Exception as e:
-                                print(f"[MetricsServer] Warning: Error unloading YOLO detector: {e}")
-                                import traceback
-                                traceback.print_exc()
-                        else:
-                            print(f"[MetricsServer] Warning: frame_storage not available, cannot unload YOLO")
-                        
                         # Update status: video processing complete
                         # OCR will not be loaded automatically - user must trigger it manually if needed
+                        # YOLO detector is kept loaded (not unloaded automatically)
                         with self.status_lock:
                             self.processing_status['status'] = 'completed'
                             self.processing_status['message'] = 'Video processing completed. Crops saved. OCR processing available on demand.'
@@ -758,6 +745,32 @@ class MetricsServer:
                             # Transform to event format expected by frontend
                             # Frontend expects 'text' for OCR text, not 'ocr_text'
                             ocr_text = result.get('ocr_text', '') or result.get('text', '')
+                            
+                            # Extract GPS coordinates - check direct fields first, then world_coords
+                            lat = result.get('lat')
+                            lon = result.get('lon')
+                            world_coords = result.get('world_coords')
+                            
+                            # Extract from world_coords if lat/lon not directly available
+                            # world_coords format: [lat, lon] when GPS coordinates are available
+                            if (lat is None or lon is None) and world_coords:
+                                if isinstance(world_coords, (list, tuple)) and len(world_coords) >= 2:
+                                    try:
+                                        coord1, coord2 = float(world_coords[0]), float(world_coords[1])
+                                        # Check if coordinates look like GPS (lat/lon) vs meters
+                                        # GPS: lat is -90 to 90, lon is -180 to 180
+                                        # Meters: typically much larger values (hundreds or thousands)
+                                        if -90.0 <= coord1 <= 90.0 and -180.0 <= coord2 <= 180.0:
+                                            lat = coord1
+                                            lon = coord2
+                                        # Also check if world_coords might be stored as [lon, lat] (less common)
+                                        elif -90.0 <= coord2 <= 90.0 and -180.0 <= coord1 <= 180.0:
+                                            lat = coord2
+                                            lon = coord1
+                                    except (ValueError, TypeError) as e:
+                                        # If conversion fails, leave lat/lon as None
+                                        pass
+                            
                             event = {
                                 'ts_iso': result.get('timestamp', ''),
                                 'camera_id': result.get('camera_id', 'N/A'),
@@ -768,7 +781,9 @@ class MetricsServer:
                                 'ocr_conf': result.get('ocr_conf', 0.0),
                                 'frame_count': result.get('frame_count', 0),
                                 'bbox': result.get('bbox', []),
-                                'world_coords': result.get('world_coords', {}),
+                                'world_coords': world_coords,
+                                'lat': lat,
+                                'lon': lon,
                                 # Keep original fields for reference
                                 'ocr_text': ocr_text,
                                 'det_conf': result.get('det_conf', 0.0)
@@ -841,6 +856,31 @@ class MetricsServer:
             ocr_conf = most_recent.get('ocr_conf', 0.0)
             det_conf = most_recent.get('det_conf', 0.0)
             
+            # Extract GPS coordinates - check direct fields first, then world_coords
+            lat = most_recent.get('lat')
+            lon = most_recent.get('lon')
+            world_coords = most_recent.get('world_coords')
+            
+            # Extract from world_coords if lat/lon not directly available
+            # world_coords format: [lat, lon] when GPS coordinates are available
+            if (lat is None or lon is None) and world_coords:
+                if isinstance(world_coords, (list, tuple)) and len(world_coords) >= 2:
+                    try:
+                        coord1, coord2 = float(world_coords[0]), float(world_coords[1])
+                        # Check if coordinates look like GPS (lat/lon) vs meters
+                        # GPS: lat is -90 to 90, lon is -180 to 180
+                        # Meters: typically much larger values (hundreds or thousands)
+                        if -90.0 <= coord1 <= 90.0 and -180.0 <= coord2 <= 180.0:
+                            lat = coord1
+                            lon = coord2
+                        # Also check if world_coords might be stored as [lon, lat] (less common)
+                        elif -90.0 <= coord2 <= 90.0 and -180.0 <= coord1 <= 180.0:
+                            lat = coord2
+                            lon = coord1
+                    except (ValueError, TypeError) as e:
+                        # If conversion fails, leave lat/lon as None
+                        pass
+            
             # Determine status based on spot and confidence
             if spot == 'unknown' or not spot:
                 status = 'In Transit'
@@ -856,7 +896,9 @@ class MetricsServer:
                 'spot': spot if spot != 'unknown' else 'N/A',
                 'status': status,
                 'detectedAt': timestamp,
-                'ocrConfidence': float(ocr_conf) if ocr_conf else 0.0
+                'ocrConfidence': float(ocr_conf) if ocr_conf else 0.0,
+                'lat': lat,
+                'lon': lon
             }
             
             trailers.append(trailer)

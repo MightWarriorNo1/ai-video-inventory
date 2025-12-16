@@ -27,7 +27,7 @@ class VideoProcessor:
     Video processor for testing uploaded video files.
     """
     
-    def __init__(self, detector, ocr, tracker_factory, spot_resolver, homography=None, preprocessor=None):
+    def __init__(self, detector, ocr, tracker_factory, spot_resolver, homography=None, preprocessor=None, gps_reference=None):
         """
         Initialize video processor.
         
@@ -38,6 +38,7 @@ class VideoProcessor:
             spot_resolver: Spot resolver instance
             homography: Optional homography matrix for world projection
             preprocessor: Optional ImagePreprocessor instance for OCR preprocessing
+            gps_reference: Optional dict with 'lat' and 'lon' keys for GPS conversion
         """
         self.detector = detector
         self.ocr = ocr
@@ -45,6 +46,7 @@ class VideoProcessor:
         self.spot_resolver = spot_resolver
         self.homography = homography
         self.preprocessor = preprocessor
+        self.gps_reference = gps_reference  # Dict with 'lat' and 'lon' keys
         
         # Log detector type for verification
         if self.detector is not None:
@@ -459,7 +461,8 @@ class VideoProcessor:
                         # Project to world coordinates and resolve spot FIRST (before OCR)
                         # We need spot to identify unique physical trailers
                         # Use original bbox center for more accurate world coordinates
-                        world_coords = None
+                        world_coords_meters = None
+                        world_coords_gps = None
                         if self.homography is not None:
                             try:
                                 center_x = (orig_x1 + orig_x2) / 2.0
@@ -468,21 +471,32 @@ class VideoProcessor:
                                 point = np.array([point])
                                 projected = cv2.perspectiveTransform(point, self.homography)
                                 x_world, y_world = projected[0][0]
-                                world_coords = (float(x_world), float(y_world))
+                                world_coords_meters = (float(x_world), float(y_world))
+                                
+                                # Convert to GPS if reference available
+                                if self.gps_reference:
+                                    from app.gps_utils import meters_to_gps
+                                    lat, lon = meters_to_gps(x_world, y_world, 
+                                                           self.gps_reference['lat'], 
+                                                           self.gps_reference['lon'])
+                                    world_coords_gps = (float(lat), float(lon))
                             except Exception as e:
                                 pass
                         
-                        # Resolve parking spot
+                        # Resolve parking spot (spot resolver expects meters, not GPS)
                         spot = "unknown"
                         method = "no-calibration"
-                        if world_coords and self.spot_resolver:
+                        if world_coords_meters and self.spot_resolver:
                             try:
-                                x_world, y_world = world_coords
+                                x_world, y_world = world_coords_meters
                                 spot_result = self.spot_resolver.resolve(x_world, y_world)
                                 spot = spot_result['spot']
                                 method = spot_result['method']
                             except Exception as e:
                                 pass
+                        
+                        # Use GPS coordinates for output if available, otherwise use meters
+                        world_coords = world_coords_gps if world_coords_gps else world_coords_meters
                         
                         # Calculate track_key and ocr_cache_key NOW (before OCR processing)
                         # Track unique physical trailers using position clustering
@@ -791,8 +805,10 @@ class VideoProcessor:
                             'text': text,
                             'conf': conf_ocr,
                             'det_conf': det_conf,
-                            'x_world': world_coords[0] if world_coords else None,
-                            'y_world': world_coords[1] if world_coords else None,
+                            'x_world': world_coords_meters[0] if world_coords_meters else None,
+                            'y_world': world_coords_meters[1] if world_coords_meters else None,
+                            'lat': world_coords_gps[0] if world_coords_gps else None,
+                            'lon': world_coords_gps[1] if world_coords_gps else None,
                             'spot': spot,
                             'method': method
                         }
