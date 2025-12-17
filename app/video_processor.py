@@ -471,6 +471,12 @@ class VideoProcessor:
                                 point = np.array([point])
                                 projected = cv2.perspectiveTransform(point, self.homography)
                                 x_world, y_world = projected[0][0]
+                                
+                                # Fix coordinate system: homography may output coordinates where
+                                # X and Y are swapped. Swap them to match GPS convention:
+                                # X = east-west (longitude), Y = north-south (latitude)
+                                x_world, y_world = y_world, x_world
+                                
                                 world_coords_meters = (float(x_world), float(y_world))
                                 
                                 # Convert to GPS if reference available

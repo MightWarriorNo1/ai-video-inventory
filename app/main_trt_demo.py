@@ -333,6 +333,8 @@ class TrailerVisionApp:
             return None
         
         H = self.homographies[camera_id]
+        # Note: When called from main_trt_demo, x_img, y_img should already be
+        # the bottom-center coordinates for ground plane projection
         point = np.array([[x_img, y_img]], dtype=np.float32)
         point = np.array([point])
         
@@ -787,12 +789,39 @@ class TrailerVisionApp:
                 # Clean GPU memory after OCR (only once, not after each preprocessing attempt)
                 self._cleanup_gpu_memory()
             
-            # Project center to world coordinates
-            center_x = (x1 + x2) / 2.0
-            center_y = (y1 + y2) / 2.0
+            # Calculate ground contact point for trailer
+            # Adaptive approach: Use bbox geometry with adaptive corrections
+            bbox_height = y2 - y1
+            bbox_width = x2 - x1
+            
+            # X: Adaptive offset based on bbox width
+            # Larger bboxes (wider trailers) may need different offsets
+            # Use percentage-based offset that scales with bbox width
+            # Base offset: 12-15% of bbox width (Door 42: 109/849 = 12.8%)
+            # For wider bboxes, use slightly larger percentage
+            if bbox_width > 800:
+                x_offset_percent = 0.15  # 15% for wide trailers
+            elif bbox_width > 600:
+                x_offset_percent = 0.13  # 13% for medium trailers
+            else:
+                x_offset_percent = 0.12  # 12% for narrow trailers
+            
+            ground_x = float(x2) + (bbox_width * x_offset_percent)
+            
+            # Y: Adaptive percentage from top based on bbox height
+            # Taller bboxes might need slightly different percentage
+            # Base: 38.5% (average of doors), adjust for very tall/short bboxes
+            if bbox_height > 900:
+                y_percent = 0.39  # Slightly higher for very tall trailers
+            elif bbox_height > 700:
+                y_percent = 0.385  # Standard (average of doors)
+            else:
+                y_percent = 0.38  # Slightly lower for shorter trailers
+            
+            ground_y = y1 + (bbox_height * y_percent)
             
             # Get world coordinates in meters first (for spot resolution)
-            world_coords_meters = self._project_to_world(camera_id, center_x, center_y, return_gps=False)
+            world_coords_meters = self._project_to_world(camera_id, ground_x, ground_y, return_gps=False)
             
             # Resolve parking spot (uses meters, same as GeoJSON)
             spot = "unknown"
