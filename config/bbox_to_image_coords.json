@@ -1,0 +1,35 @@
+{
+  "method": "linear_combination",
+  "linear_model": {
+    "weights_x": [
+      3148.9156599833327,
+      -0.08731209524505641,
+      -1.20860201891938,
+      1.0339790344477215,
+      -2.2425810639480455,
+      0.5927818912862506,
+      0.00048089777048848236
+    ],
+    "weights_y": [
+      719.7714909558778,
+      -0.002032391489059302,
+      -0.00719517551286619,
+      0.003130668203440871,
+      -0.010325846134873232,
+      0.06980402090902021,
+      -6.044961722364233e-05
+    ],
+    "features": [
+      "bias",
+      "center_x",
+      "right_x",
+      "left_x",
+      "width",
+      "height",
+      "area"
+    ]
+  },
+  "fallback_method": "adaptive_percentage",
+  "description": "Linear combination model learned from calibration data. Total error: 51.43px, X error: 51.41px, Y error: 1.10px."
+
+
