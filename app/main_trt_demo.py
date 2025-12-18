@@ -296,7 +296,8 @@ class TrailerVisionApp:
                 tracker_factory=create_tracker,
                 spot_resolver=self.spot_resolver,
                 homography=test_homography,
-                gps_reference=test_gps_reference
+                gps_reference=test_gps_reference,
+                swap_coordinates=False  # Test shows swap is incorrect - disable it
             )
             print(f"[TrailerVisionApp] Video processor created successfully")
         except Exception as e:

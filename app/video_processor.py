@@ -27,7 +27,7 @@ class VideoProcessor:
     Video processor for testing uploaded video files.
     """
     
-    def __init__(self, detector, ocr, tracker_factory, spot_resolver, homography=None, preprocessor=None, gps_reference=None):
+    def __init__(self, detector, ocr, tracker_factory, spot_resolver, homography=None, preprocessor=None, gps_reference=None, swap_coordinates=None):
         """
         Initialize video processor.
         
@@ -39,6 +39,9 @@ class VideoProcessor:
             homography: Optional homography matrix for world projection
             preprocessor: Optional ImagePreprocessor instance for OCR preprocessing
             gps_reference: Optional dict with 'lat' and 'lon' keys for GPS conversion
+            swap_coordinates: Optional bool to swap x/y coordinates from homography output.
+                             If None, defaults to True for backward compatibility.
+                             Set to False if coordinates are already in correct ENU convention.
         """
         self.detector = detector
         self.ocr = ocr
@@ -47,6 +50,7 @@ class VideoProcessor:
         self.homography = homography
         self.preprocessor = preprocessor
         self.gps_reference = gps_reference  # Dict with 'lat' and 'lon' keys
+        self.swap_coordinates = swap_coordinates if swap_coordinates is not None else True  # Default True for backward compatibility
         
         # Log detector type for verification
         if self.detector is not None:
@@ -460,22 +464,28 @@ class VideoProcessor:
                         
                         # Project to world coordinates and resolve spot FIRST (before OCR)
                         # We need spot to identify unique physical trailers
-                        # Use original bbox center for more accurate world coordinates
+                        # Use bottom-center of bbox for ground plane projection (where trailer touches ground)
+                        # NOT center - center is elevated and causes projection errors
                         world_coords_meters = None
                         world_coords_gps = None
                         if self.homography is not None:
                             try:
+                                # Bottom-center: X is center, Y is bottom (ground contact point)
                                 center_x = (orig_x1 + orig_x2) / 2.0
-                                center_y = (orig_y1 + orig_y2) / 2.0
-                                point = np.array([[center_x, center_y]], dtype=np.float32)
+                                bottom_y = float(orig_y2)  # Bottom of bbox = ground contact point
+                                point = np.array([[center_x, bottom_y]], dtype=np.float32)
                                 point = np.array([point])
                                 projected = cv2.perspectiveTransform(point, self.homography)
                                 x_world, y_world = projected[0][0]
                                 
-                                # Fix coordinate system: homography may output coordinates where
-                                # X and Y are swapped. Swap them to match GPS convention:
-                                # X = east-west (longitude), Y = north-south (latitude)
-                                x_world, y_world = y_world, x_world
+                                # Coordinate system: homography outputs coordinates in ENU convention
+                                # X = east (longitude), Y = north (latitude)
+                                # Test results show current system is correct, so NO swap needed
+                                # The swap was causing coordinates to appear in wrong region
+                                if self.swap_coordinates:
+                                    # Only swap if explicitly enabled (for backward compatibility)
+                                    # But test shows swap is WRONG - coordinates should NOT be swapped
+                                    x_world, y_world = y_world, x_world
                                 
                                 world_coords_meters = (float(x_world), float(y_world))
                                 
