@@ -113,6 +113,27 @@ def gps_to_meters(
     return (x_meters, y_meters)
 
 
+def gps_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """
+    Calculate distance between two GPS coordinates in meters.
+    
+    Uses geodesic calculation for accurate distance on Earth's surface.
+    
+    Args:
+        lat1: Latitude of first point (degrees)
+        lon1: Longitude of first point (degrees)
+        lat2: Latitude of second point (degrees)
+        lon2: Longitude of second point (degrees)
+    
+    Returns:
+        Distance in meters
+    """
+    # Use geodesic inverse calculation to get distance
+    # geod.inv returns (forward_azimuth, back_azimuth, distance_in_meters)
+    _, _, distance = _geod.inv(lon1, lat1, lon2, lat2)
+    return distance
+
+
 def validate_gps_coordinate(lat: float, lon: float) -> bool:
     """
     Validate GPS coordinates are within valid ranges.

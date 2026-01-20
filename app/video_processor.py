@@ -10,7 +10,7 @@ import re
 import os
 from pathlib import Path
 from typing import Dict, List, Optional, Generator, Tuple
-from datetime import datetime
+from datetime import datetime, timedelta
 import threading
 import gc
 
@@ -27,30 +27,48 @@ class VideoProcessor:
     Video processor for testing uploaded video files.
     """
     
-    def __init__(self, detector, ocr, tracker_factory, spot_resolver, homography=None, preprocessor=None, gps_reference=None, swap_coordinates=None):
+    def __init__(self, detector, ocr, tracker_factory, spot_resolver, bev_projector=None, preprocessor=None, gps_reference=None, camera_id="test-video", gps_log_path=None):
         """
         Initialize video processor.
+        
+        Video processing uses GPS log method only - GPS coordinates are read from the GPS log file
+        that was recorded during video capture. No projection methods (3D, depth, homography, BEV) are used.
         
         Args:
             detector: Detection model instance (should be YOLOv8Detector for YOLOv8m COCO truck detection)
             ocr: OCR model instance
             tracker_factory: Function that returns a new tracker instance
-            spot_resolver: Spot resolver instance
-            homography: Optional homography matrix for world projection
+            spot_resolver: Spot resolver instance (not used for GPS calculation, kept for API compatibility)
+            bev_projector: Optional BEVProjector instance (not used, kept for API compatibility)
             preprocessor: Optional ImagePreprocessor instance for OCR preprocessing
-            gps_reference: Optional dict with 'lat' and 'lon' keys for GPS conversion
-            swap_coordinates: Optional bool to swap x/y coordinates from homography output.
-                             If None, defaults to True for backward compatibility.
-                             Set to False if coordinates are already in correct ENU convention.
+            gps_reference: Optional dict with 'lat' and 'lon' keys (not used for GPS calculation)
+            camera_id: Camera ID for logging purposes (default: "test-video")
+            gps_log_path: Path to GPS log JSON file from video recording (required for GPS coordinates)
         """
         self.detector = detector
         self.ocr = ocr
         self.tracker_factory = tracker_factory
         self.spot_resolver = spot_resolver
-        self.homography = homography
+        self.bev_projector = bev_projector
         self.preprocessor = preprocessor
         self.gps_reference = gps_reference  # Dict with 'lat' and 'lon' keys
-        self.swap_coordinates = swap_coordinates if swap_coordinates is not None else True  # Default True for backward compatibility
+        self.camera_id = camera_id
+        self.gps_log_path = gps_log_path
+        
+        # Load GPS log if provided
+        self.gps_log = {}
+        if self.gps_log_path and os.path.exists(self.gps_log_path):
+            try:
+                from app.gps_sensor import load_gps_log
+                self.gps_log = load_gps_log(self.gps_log_path)
+                print(f"[VideoProcessor] Loaded GPS log: {self.gps_log_path} ({len(self.gps_log)} entries)")
+            except Exception as e:
+                print(f"[VideoProcessor] Failed to load GPS log: {e}")
+                self.gps_log = {}
+        elif self.gps_log_path:
+            print(f"[VideoProcessor] GPS log file not found: {self.gps_log_path}")
+        
+        # Video processing uses GPS log method only - no projection methods needed
         
         # Log detector type for verification
         if self.detector is not None:
@@ -129,10 +147,107 @@ class VideoProcessor:
                 # Silently fail - don't interrupt video processing
                 pass
     
+    def _split_video(self, video_path: str, frames_per_chunk: int = 1500) -> List[str]:
+        """
+        Split a video into chunks of specified frames.
+        
+        Args:
+            video_path: Path to input video file
+            frames_per_chunk: Number of frames per chunk (default: 1500)
+            
+        Returns:
+            List of paths to split video files
+        """
+        import tempfile
+        
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise ValueError(f"Failed to open video: {video_path}")
+        
+        # Get video properties
+        fps = int(cap.get(cv2.CAP_PROP_FPS))
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fourcc = int(cap.get(cv2.CAP_PROP_FOURCC))
+        
+        print(f"[VideoProcessor] Video properties: {total_frames} frames, {fps} FPS, {width}x{height}")
+        
+        # If video is shorter than chunk size, no need to split
+        if total_frames <= frames_per_chunk:
+            print(f"[VideoProcessor] Video is {total_frames} frames (<= {frames_per_chunk}), no splitting needed")
+            cap.release()
+            return [video_path]
+        
+        # Calculate number of chunks needed
+        num_chunks = (total_frames + frames_per_chunk - 1) // frames_per_chunk
+        print(f"[VideoProcessor] Splitting video into {num_chunks} chunks of {frames_per_chunk} frames each")
+        
+        # Create temporary directory for split videos
+        video_name = Path(video_path).stem
+        temp_dir = Path(tempfile.gettempdir()) / 'trailer_vision_splits' / video_name
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        
+        split_paths = []
+        frame_count = 0
+        chunk_idx = 0
+        out = None
+        output_path = None
+        
+        try:
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                
+                # Start a new chunk if needed (at the beginning or after frames_per_chunk frames)
+                if frame_count % frames_per_chunk == 0:
+                    # Close previous chunk if it exists
+                    if out is not None and out.isOpened():
+                        out.release()
+                        split_paths.append(str(output_path))
+                        print(f"[VideoProcessor] Created chunk {chunk_idx}: {output_path} ({frames_per_chunk} frames)")
+                    
+                    # Create new chunk
+                    output_path = temp_dir / f"chunk_{chunk_idx:03d}.mp4"
+                    fourcc_codec = cv2.VideoWriter_fourcc(*'mp4v')
+                    out = cv2.VideoWriter(str(output_path), fourcc_codec, fps, (width, height))
+                    
+                    if not out.isOpened():
+                        raise ValueError(f"Failed to create output video: {output_path}")
+                    
+                    chunk_idx += 1
+                
+                # Write frame to current chunk
+                out.write(frame)
+                frame_count += 1
+            
+            # Close last chunk if it has frames
+            if out is not None and out.isOpened():
+                out.release()
+                split_paths.append(str(output_path))
+                # Calculate frames in last chunk
+                if len(split_paths) > 1:
+                    remaining_frames = frame_count % frames_per_chunk
+                    if remaining_frames == 0:
+                        remaining_frames = frames_per_chunk
+                else:
+                    remaining_frames = frame_count
+                print(f"[VideoProcessor] Created chunk {chunk_idx}: {output_path} ({remaining_frames} frames)")
+        
+        finally:
+            cap.release()
+            if out.isOpened():
+                out.release()
+        
+        print(f"[VideoProcessor] Video split complete: {len(split_paths)} chunks created")
+        return split_paths
+    
     def process_video(self, video_path: str, camera_id: str = "test-video", 
                      detect_every_n: int = 5) -> Generator[Tuple[int, np.ndarray, List[Dict]], None, None]:
         """
-        Process a video file.
+        Process a video file. If video is longer than 1500 frames, it will be split
+        into chunks and each chunk will be processed separately, then results combined.
         
         Args:
             video_path: Path to video file
@@ -178,6 +293,82 @@ class VideoProcessor:
             }
         
         try:
+            # Check video length and split if needed
+            cap = cv2.VideoCapture(video_path)
+            if not cap.isOpened():
+                raise ValueError(f"Failed to open video: {video_path}")
+            
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            cap.release()
+            
+            print(f"[VideoProcessor] Video has {total_frames} frames")
+            
+            # Split video if it's longer than 1500 frames
+            frames_per_chunk = 1500
+            if total_frames > frames_per_chunk:
+                print(f"[VideoProcessor] Video is longer than {frames_per_chunk} frames, splitting into chunks...")
+                split_paths = self._split_video(video_path, frames_per_chunk)
+                
+                # Process each split and combine results
+                global_frame_offset = 0
+                for chunk_idx, split_path in enumerate(split_paths):
+                    if self.stop_flag:
+                        print(f"[VideoProcessor] Stop flag set, stopping at chunk {chunk_idx}")
+                        break
+                    
+                    print(f"[VideoProcessor] Processing chunk {chunk_idx + 1}/{len(split_paths)}: {split_path}")
+                    
+                    # Process this chunk
+                    for frame_num, processed_frame, events in self._process_single_video(
+                        split_path, camera_id, detect_every_n, global_frame_offset
+                    ):
+                        # Adjust frame number to account for previous chunks
+                        yield (frame_num, processed_frame, events)
+                    
+                    # Update global frame offset for next chunk
+                    cap_chunk = cv2.VideoCapture(split_path)
+                    if cap_chunk.isOpened():
+                        chunk_frames = int(cap_chunk.get(cv2.CAP_PROP_FRAME_COUNT))
+                        cap_chunk.release()
+                        global_frame_offset += chunk_frames
+                    else:
+                        # Estimate based on frames_per_chunk
+                        global_frame_offset += frames_per_chunk
+                    
+                    print(f"[VideoProcessor] Chunk {chunk_idx + 1} complete. Global frame offset: {global_frame_offset}")
+            else:
+                # Process video normally if it's short enough
+                print(f"[VideoProcessor] Video is {total_frames} frames (<= {frames_per_chunk}), processing normally")
+                for frame_num, processed_frame, events in self._process_single_video(
+                    video_path, camera_id, detect_every_n, 0
+                ):
+                    yield (frame_num, processed_frame, events)
+        
+        except Exception as e:
+            print(f"[VideoProcessor] Error in process_video: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
+        finally:
+            with self.lock:
+                self.processing = False
+            print(f"[VideoProcessor] Video processing complete")
+    
+    def _process_single_video(self, video_path: str, camera_id: str = "test-video", 
+                             detect_every_n: int = 5, frame_offset: int = 0) -> Generator[Tuple[int, np.ndarray, List[Dict]], None, None]:
+        """
+        Process a single video file (or chunk).
+        
+        Args:
+            video_path: Path to video file
+            camera_id: Camera identifier for events
+            detect_every_n: Run detector every N frames
+            frame_offset: Offset to add to frame numbers (for combining split videos)
+            
+        Yields:
+            Tuple of (frame_number, processed_frame, events)
+        """
+        try:
             cap = cv2.VideoCapture(video_path)
             if not cap.isOpened():
                 raise ValueError(f"Failed to open video: {video_path}")
@@ -185,6 +376,11 @@ class VideoProcessor:
             print(f"[VideoProcessor] Starting to process video: {video_path}")
             print(f"[VideoProcessor] Detector available: {self.detector is not None}")
             print(f"[VideoProcessor] OCR available: {self.ocr is not None}")
+            
+            # Get video frame size for logging
+            video_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            video_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            print(f"[VideoProcessor] Video frame size: {video_width}x{video_height}")
             
             tracker = self.tracker_factory()
             frame_count = 0
@@ -202,6 +398,34 @@ class VideoProcessor:
                 # Process frame
                 processed_frame = frame.copy()
                 frame_events = []
+                
+                # Draw center crosshair to visualize centered detection zone
+                frame_height, frame_width = frame.shape[:2]
+                center_x = int(frame_width / 2)
+                center_y = int(frame_height / 2)
+                
+                # Draw crosshair lines (subtle, semi-transparent)
+                crosshair_color = (200, 200, 200)  # Light gray
+                crosshair_length = 30
+                crosshair_thickness = 1
+                
+                # Horizontal line
+                cv2.line(processed_frame, 
+                        (center_x - crosshair_length, center_y), 
+                        (center_x + crosshair_length, center_y), 
+                        crosshair_color, crosshair_thickness)
+                
+                # Vertical line
+                cv2.line(processed_frame, 
+                        (center_x, center_y - crosshair_length), 
+                        (center_x, center_y + crosshair_length), 
+                        crosshair_color, crosshair_thickness)
+                
+                # Draw center circle
+                cv2.circle(processed_frame, (center_x, center_y), 5, crosshair_color, crosshair_thickness)
+                
+                # Track centered vehicles for this frame
+                centered_track_ids = set()
                 
                 # Run detector
                 detections = []
@@ -233,7 +457,16 @@ class VideoProcessor:
                         
                         # Filter out very low confidence detections before tracking
                         # This prevents false positive tracks from low-quality detections
-                        MIN_DETECTION_CONFIDENCE = 0.10  # Minimum confidence to create a track
+                        # Detect if we're in car mode (target_class == 2) vs trailer mode (0 or 7)
+                        is_car_mode = False
+                        if self.detector and hasattr(self.detector, 'target_class'):
+                            is_car_mode = (self.detector.target_class == 2)  # COCO class 2 = car
+                        
+                        # Use higher confidence threshold for car mode to reduce false positives
+                        if is_car_mode:
+                            MIN_DETECTION_CONFIDENCE = 0.40  # Stricter threshold for cars
+                        else:
+                            MIN_DETECTION_CONFIDENCE = 0.10  # Minimum confidence to create a track
                         detections = [d for d in all_detections if d.get('conf', 0.0) >= MIN_DETECTION_CONFIDENCE]
                         
                         filtered_low_conf = len(all_detections) - len(detections)
@@ -255,15 +488,30 @@ class VideoProcessor:
                 try:
                     tracks = tracker.update(detections, frame)
                     
-                    # Filter out non-trailer objects (false positives like mirrors, signs, etc.)
-                    # Trailers have specific characteristics but need LENIENT filters
-                    # to account for different viewing angles and distances
-                    # Made more lenient to catch smaller or partially visible trailers
-                    MIN_TRAILER_WIDTH = 80    # Reduced from 150 - allow smaller detections
-                    MIN_TRAILER_HEIGHT = 30   # Reduced from 50 - allow shorter detections
-                    MIN_AREA = 2400           # Reduced from 10000 (80*30 = 2400)
-                    MIN_ASPECT_RATIO = 0.15   # More lenient - allow very tall/narrow trailers (was 0.5)
-                    MAX_ASPECT_RATIO = 10.0   # More lenient - allow very wide or tall
+                    # Detect if we're in car mode (target_class == 2) vs trailer mode (0 or 7)
+                    is_car_mode = False
+                    if self.detector and hasattr(self.detector, 'target_class'):
+                        is_car_mode = (self.detector.target_class == 2)  # COCO class 2 = car
+                    
+                    # Filter out false positives with mode-specific parameters
+                    if is_car_mode:
+                        # Car mode: Stricter filters to reduce false positives (grass, road patches, etc.)
+                        # Cars have more consistent size and aspect ratios than trailers
+                        MIN_WIDTH = 100       # Cars should be reasonably sized (wider than small false positives)
+                        MIN_HEIGHT = 40       # Cars should have minimum height
+                        MIN_AREA = 5000       # Higher minimum area to filter out small patches
+                        MIN_ASPECT_RATIO = 0.6   # Cars are typically wider than tall (0.6 = width 60% of height minimum)
+                        MAX_ASPECT_RATIO = 2.5   # Cars shouldn't be more than 2.5x wider than tall
+                        filter_type = "car"
+                    else:
+                        # Trailer mode: LENIENT filters to catch different viewing angles and distances
+                        # Made more lenient to catch smaller or partially visible trailers
+                        MIN_WIDTH = 80        # Reduced from 150 - allow smaller detections
+                        MIN_HEIGHT = 30       # Reduced from 50 - allow shorter detections
+                        MIN_AREA = 2400       # Reduced from 10000 (80*30 = 2400)
+                        MIN_ASPECT_RATIO = 0.15   # More lenient - allow very tall/narrow trailers (was 0.5)
+                        MAX_ASPECT_RATIO = 10.0   # More lenient - allow very wide or tall
+                        filter_type = "trailer"
                     
                     filtered_tracks = []
                     filtered_count = 0
@@ -295,9 +543,9 @@ class VideoProcessor:
                         area = width * height
                         aspect_ratio = width / (height + 1e-6)  # Avoid division by zero
                         
-                        # Apply filters for trailer characteristics
-                        if (width >= MIN_TRAILER_WIDTH and 
-                            height >= MIN_TRAILER_HEIGHT and 
+                        # Apply mode-specific filters
+                        if (width >= MIN_WIDTH and 
+                            height >= MIN_HEIGHT and 
                             area >= MIN_AREA and
                             MIN_ASPECT_RATIO <= aspect_ratio <= MAX_ASPECT_RATIO):
                             filtered_tracks.append(track)
@@ -305,29 +553,30 @@ class VideoProcessor:
                             filtered_count += 1
                             # Log filtered out tracks for debugging (more frequent)
                             if frame_count % 10 == 0:  # Log more frequently
-                                print(f"[VideoProcessor] Filtered Track {track['track_id']}: size={width}x{height}, area={area}, aspect={aspect_ratio:.2f}")
+                                print(f"[VideoProcessor] Filtered Track {track['track_id']} ({filter_type} mode): size={width}x{height}, area={area}, aspect={aspect_ratio:.2f}")
                     
                     # Log filtering summary
                     if len(tracks) > 0 and frame_count % 10 == 0:
-                        print(f"[VideoProcessor] Frame {frame_count}: {len(filtered_tracks)}/{len(tracks)} tracks passed filter ({filtered_count} filtered out)")
+                        print(f"[VideoProcessor] Frame {frame_count}: {len(filtered_tracks)}/{len(tracks)} tracks passed {filter_type} filter ({filtered_count} filtered out)")
                     
                     tracks = filtered_tracks
                     
-                    # Additional deduplication: Merge tracks with very high IoU (likely same trailer)
-                    # This helps catch cases where ByteTrack creates duplicate tracks for the same trailer
+                    # Additional deduplication: Merge tracks with very high IoU (likely same object)
+                    # This helps catch cases where ByteTrack creates duplicate tracks for the same object
                     tracks = self._deduplicate_overlapping_tracks(tracks, frame_count)
                     
                     # Count unique tracks (track_id + spot combination) - don't count per frame
                     # We'll count unique tracks when events are created
                     if len(tracks) > 0:
-                        print(f"[VideoProcessor] Frame {frame_count}: Tracking {len(tracks)} valid trailers")
+                        object_type = "cars" if is_car_mode else "trailers"
+                        print(f"[VideoProcessor] Frame {frame_count}: Tracking {len(tracks)} valid {object_type}")
                 except Exception as e:
                     print(f"[VideoProcessor] Error in tracking at frame {frame_count}: {e}")
                     import traceback
                     traceback.print_exc()
                     tracks = []
                 
-                # Find the nearest trailer (largest y2 value = closest to bottom of frame = nearest)
+                # Find the nearest object (largest y2 value = closest to bottom of frame = nearest)
                 nearest_track_id = None
                 if tracks:
                     max_y2 = -1
@@ -400,12 +649,17 @@ class VideoProcessor:
                         
                         # Draw bounding box for ALL trucks (stable detection display)
                         is_nearest = (track_id == nearest_track_id)
+                        is_vehicle_centered = track_id in centered_track_ids
                         track_state = track.get('state', 'tracked')
                         
                         # Color coding:
+                        # - Blue: Centered (GPS being captured)
                         # - Green: Tracked (confirmed detection)
                         # - Yellow: Lost but within buffer (predicted position - maintains stability)
-                        if track_state == 'tracked':
+                        if is_vehicle_centered:
+                            box_color = (255, 0, 0)  # Blue for centered (GPS capture moment)
+                            thickness = 4  # Thicker to emphasize
+                        elif track_state == 'tracked':
                             box_color = (0, 255, 0)  # Green for confirmed
                             thickness = 3
                         else:  # lost
@@ -423,7 +677,9 @@ class VideoProcessor:
                         
                         # Draw detection confidence and track ID above the box
                         det_conf_percent = det_conf * 100.0
-                        if is_nearest:
+                        if is_vehicle_centered:
+                            conf_text = f"Track {track_id} - {det_conf_percent:.1f}% [CENTERED - GPS CAPTURED]"
+                        elif is_nearest:
                             conf_text = f"Track {track_id} - {det_conf_percent:.1f}% [NEAREST]"
                         else:
                             conf_text = f"Track {track_id} - {det_conf_percent:.1f}%"
@@ -462,115 +718,68 @@ class VideoProcessor:
                             cv2.putText(processed_frame, size_text, (text_x, size_y),
                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                         
-                        # Project to world coordinates and resolve spot FIRST (before OCR)
-                        # We need spot to identify unique physical trailers
-                        # Use bottom-center of bbox for ground plane projection (where trailer touches ground)
-                        # NOT center - center is elevated and causes projection errors
+                        # GPS coordinates will be retrieved ONLY when crops are saved (when car is in middle of camera)
+                        # This ensures GPS matches the exact moment the crop is captured
                         world_coords_meters = None
-                        world_coords_gps = None
-                        # Calculate ground contact point using learned linear model
+                        world_coords_gps = None  # Will be set only when crops are saved
                         image_coords = None
-                        if self.homography is not None:
-                            try:
-                                from app.bbox_to_image_coords_advanced import calculate_image_coords_from_bbox_with_config
-                                
-                                bbox = [float(orig_x1), float(orig_y1), float(orig_x2), float(orig_y2)]
-                                # Enable debug logging for first few frames
-                                debug = (frame_count <= 5)
-                                ground_x, ground_y = calculate_image_coords_from_bbox_with_config(bbox, debug=debug)
-                                image_coords = [float(ground_x), float(ground_y)]
-                                
-                                if debug:
-                                    print(f"[VideoProcessor] Frame {frame_count}, Track {track_id}: Calculated image coords from bbox {bbox} -> ({ground_x:.2f}, {ground_y:.2f})")
-                                
-                                point = np.array([[ground_x, ground_y]], dtype=np.float32)
-                                point = np.array([point])
-                                projected = cv2.perspectiveTransform(point, self.homography)
-                                x_world, y_world = projected[0][0]
-                                
-                                # Coordinate system: homography outputs coordinates in ENU convention
-                                # X = east (longitude), Y = north (latitude)
-                                # Test results show current system is correct, so NO swap needed
-                                # The swap was causing coordinates to appear in wrong region
-                                if self.swap_coordinates:
-                                    # Only swap if explicitly enabled (for backward compatibility)
-                                    # But test shows swap is WRONG - coordinates should NOT be swapped
-                                    x_world, y_world = y_world, x_world
-                                
-                                world_coords_meters = (float(x_world), float(y_world))
-                                
-                                # Convert to GPS if reference available
-                                if self.gps_reference:
-                                    from app.gps_utils import meters_to_gps
-                                    lat, lon = meters_to_gps(x_world, y_world, 
-                                                           self.gps_reference['lat'], 
-                                                           self.gps_reference['lon'])
-                                    world_coords_gps = (float(lat), float(lon))
-                            except Exception as e:
-                                print(f"[VideoProcessor] Error calculating image coords: {e}")
-                                import traceback
-                                traceback.print_exc()
-                                pass
-                        
-                        # Resolve parking spot (spot resolver expects meters, not GPS)
                         spot = "unknown"
-                        method = "no-calibration"
-                        if world_coords_meters and self.spot_resolver:
-                            try:
-                                x_world, y_world = world_coords_meters
-                                spot_result = self.spot_resolver.resolve(x_world, y_world)
-                                spot = spot_result['spot']
-                                method = spot_result['method']
-                            except Exception as e:
-                                pass
+                        method = "gps_sensor_recorded"
                         
-                        # Use GPS coordinates for output if available, otherwise use meters
-                        world_coords = world_coords_gps if world_coords_gps else world_coords_meters
+                        # Get image coordinates for reference
+                        center_x = (orig_x1 + orig_x2) / 2.0
+                        bottom_y = float(orig_y2)
+                        image_coords = [float(center_x), float(bottom_y)]
+                        
+                        # Initialize video start time and calculate actual FPS from GPS log duration
+                        # This ensures frame timestamps align correctly with GPS log time range
+                        if self.gps_log and not hasattr(self, '_video_start_time'):
+                            try:
+                                first_timestamp = min(self.gps_log.keys())
+                                last_timestamp = max(self.gps_log.keys())
+                                self._video_start_time = datetime.fromisoformat(first_timestamp.replace('Z', '+00:00'))
+                                last_ts = datetime.fromisoformat(last_timestamp.replace('Z', '+00:00'))
+                                
+                                # Calculate GPS log duration
+                                gps_log_duration_seconds = (last_ts - self._video_start_time).total_seconds()
+                                
+                                # Calculate actual FPS based on video frames and GPS log duration
+                                total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+                                if gps_log_duration_seconds > 0 and total_frames > 0:
+                                    self._actual_fps = total_frames / gps_log_duration_seconds
+                                    print(f"[VideoProcessor] Using GPS log start time: {self._video_start_time}")
+                                    print(f"[VideoProcessor] GPS log duration: {gps_log_duration_seconds:.2f} seconds")
+                                    print(f"[VideoProcessor] Calculated actual FPS from GPS log: {self._actual_fps:.2f} (video has {total_frames} frames)")
+                                else:
+                                    # Fallback to video metadata FPS
+                                    fps = cap.get(cv2.CAP_PROP_FPS)
+                                    self._actual_fps = fps if fps > 0 else 30.0
+                                    print(f"[VideoProcessor] Using GPS log start time: {self._video_start_time}")
+                                    print(f"[VideoProcessor] Using video metadata FPS: {self._actual_fps:.2f}")
+                            except Exception as e:
+                                # Fallback: use current time minus video duration
+                                fps = cap.get(cv2.CAP_PROP_FPS)
+                                total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+                                video_duration_seconds = total_frames / fps if fps > 0 else 0
+                                self._video_start_time = datetime.utcnow() - timedelta(seconds=video_duration_seconds)
+                                self._actual_fps = fps if fps > 0 else 30.0
+                                print(f"[VideoProcessor] Estimated video start time: {self._video_start_time}")
+                                print(f"[VideoProcessor] Using fallback FPS: {self._actual_fps:.2f}")
+                        
+                        # Note: Spot resolution requires world coordinates in meters
+                        # Since we're using GPS from log (camera position), we can't resolve spots
+                        # Spot resolution would require converting GPS to local coordinates or using a different method
+                        # For now, spot remains "unknown" when using GPS log method
+                        
+                        # GPS coordinates will be retrieved when crops are saved
+                        world_coords = None
                         
                         # Calculate track_key and ocr_cache_key NOW (before OCR processing)
-                        # Track unique physical trailers using position clustering
-                        if spot != "unknown" and world_coords:
-                            x_world, y_world = world_coords
-                            
-                            # Find or create position cluster (tolerance for grouping nearby positions)
-                            # Use 5m tolerance to group detections of the same trailer while keeping different trailers separate
-                            cluster_id = None
-                            CLUSTER_TOLERANCE = 5.0  # 5 meters - balance between grouping same trailer and separating different trailers
-                            
-                            for cid, cluster in self.position_clusters.items():
-                                # Check if this position is within tolerance of cluster center
-                                dist = np.sqrt((x_world - cluster['center_x'])**2 + (y_world - cluster['center_y'])**2)
-                                if dist <= CLUSTER_TOLERANCE:
-                                    cluster_id = cid
-                                    # Add position to cluster
-                                    if 'positions' not in cluster:
-                                        cluster['positions'] = []
-                                    cluster['positions'].append((x_world, y_world))
-                                    # Update cluster center (moving average)
-                                    cluster['center_x'] = (cluster['center_x'] * cluster['count'] + x_world) / (cluster['count'] + 1)
-                                    cluster['center_y'] = (cluster['center_y'] * cluster['count'] + y_world) / (cluster['count'] + 1)
-                                    cluster['count'] += 1
-                                    break
-                            
-                            # Create new cluster if none found
-                            if cluster_id is None:
-                                cluster_id = self.next_cluster_id
-                                self.next_cluster_id += 1
-                                self.position_clusters[cluster_id] = {
-                                    'center_x': x_world,
-                                    'center_y': y_world,
-                                    'count': 1,
-                                    'positions': [(x_world, y_world)]
-                                }
-                            
-                            # Use spot + cluster_id + track_id as unique identifier
-                            # Including track_id helps distinguish different trailers in the same spot/cluster
-                            # Clusters are merged incrementally (every 30 frames), so cluster_id
-                            # should already reflect merged clusters by the time we save crops
-                            # track_id helps prevent different trailers from sharing the same crop
-                            track_key = f"{spot}_cluster_{cluster_id}_track_{track_id}"
-                        elif spot != "unknown":
-                            # Use spot + track_id if position unavailable
+                        # Since we're using GPS from log (camera position), we can't do position clustering
+                        # Use track_id as the primary identifier
+                        cluster_id = None
+                        if spot != "unknown":
+                            # Use spot + track_id if spot is available
                             track_key = f"{spot}_track_{track_id}"
                         else:
                             # Fallback to track_id if spot is unknown
@@ -606,73 +815,16 @@ class VideoProcessor:
                         # If merged, use the merged cluster's track_key to avoid saving duplicate crops.
                         should_save_crop = True
                         
-                        # Resolve to final merged track_key (if cluster was merged)
-                        # This ensures we only save one crop per final merged cluster
-                        # However, we still want to preserve track_id to distinguish different trailers
-                        final_track_key = track_key
-                        if "_cluster_" in track_key:
-                            # Check if this cluster_id still exists (hasn't been merged)
-                            if cluster_id not in self.position_clusters:
-                                # Cluster was merged - find the merged cluster's track_key
-                                # But preserve track_id to distinguish different trailers
-                                merged_base_key = self._resolve_final_track_key(spot, cluster_id)
-                                # Extract track_id from original track_key and append to merged key
-                                if "_track_" in track_key:
-                                    track_id_part = track_key.split("_track_")[-1]
-                                    final_track_key = f"{merged_base_key.split('_track_')[0]}_track_{track_id_part}"
-                                else:
-                                    final_track_key = merged_base_key
-                        
                         # CRITICAL: Deduplicate crops by track_id to ensure one crop per unique track
                         # Each track_id represents a different trailer, so we save one crop per track_id
                         # Use track_id-based key for deduplication to ensure we get crops for all unique tracks
-                        crop_dedup_key = None
-                        if cluster_id is not None:
-                            # Use track_id in the deduplication key to ensure one crop per unique track
-                            crop_dedup_key = f"{spot}_cluster_{cluster_id}_track_{track_id}"
-                        elif spot != "unknown":
-                            crop_dedup_key = f"{spot}_track_{track_id}"
-                        else:
-                            crop_dedup_key = f"track_{track_id}"
-                        
-                        # Keep cluster_key for logging/display purposes (without track_id)
-                        cluster_key = None
-                        if cluster_id is not None:
-                            cluster_key = f"{spot}_cluster_{cluster_id}"  # Base key without track_id for display
+                        crop_dedup_key = track_key  # Use track_key for deduplication (includes track_id)
                         
                         # Check if we already have a crop for this track_id
                         # We'll check later if we should replace it with a better crop
                         if crop_dedup_key and crop_dedup_key in self.crop_deduplication:
                             # Crop exists - we'll check if this one is better later
                             pass
-                        
-                        if cluster_key:
-                            # Only save crops for "stable" clusters (seen multiple times)
-                            # This prevents saving crops for one-off detections that create new clusters
-                            # A cluster is considered stable if it has been seen at least 2 times
-                            # Lowered from 3 to 2 to ensure all valid clusters (count >= 2) get crops
-                            MIN_CLUSTER_COUNT_FOR_CROP = 2
-                            
-                            # Check stability using the ORIGINAL cluster_id (the one that was just updated)
-                            # This is the cluster that actually exists and has the current count
-                            if cluster_id in self.position_clusters:
-                                cluster_info = self.position_clusters[cluster_id]
-                                cluster_count = cluster_info.get('count', 0)
-                                if cluster_count < MIN_CLUSTER_COUNT_FOR_CROP:
-                                    # Cluster not stable yet - skip saving crop
-                                    should_save_crop = False
-                                    # Always log stability skips (not just every 30 frames) for debugging
-                                    print(f"[VideoProcessor] Frame {frame_count}: Skipping crop for {track_key} (track_id={track_id}, cluster_id={cluster_id}) - cluster not stable yet (count={cluster_count} < {MIN_CLUSTER_COUNT_FOR_CROP})")
-                            else:
-                                # Cluster doesn't exist (was merged) - skip saving
-                                should_save_crop = False
-                                if frame_count % 30 == 0:
-                                    print(f"[VideoProcessor] Frame {frame_count}: Skipping crop for {track_key} (track_id={track_id}, cluster_id={cluster_id}) - cluster was merged")
-                        else:
-                            # No cluster_id means no world_coords or spot unknown - skip saving
-                            should_save_crop = False
-                            if frame_count % 30 == 0:
-                                print(f"[VideoProcessor] Frame {frame_count}: Skipping crop for {track_key} (track_id={track_id}) - no cluster_id (missing world_coords or spot)")
                         
                         # Filter out narrow/partial crops - only save full backside crops
                         # Minimum requirements for a good crop (full trailer backside)
@@ -721,6 +873,48 @@ class VideoProcessor:
                                     should_save_crop = False
                                     if frame_count % 30 == 0:
                                         print(f"[VideoProcessor] Frame {frame_count}: Skipping crop for {track_key} (track_id={track_id}) - crop is too wide (aspect={aspect_ratio:.2f} > {MAX_ASPECT_RATIO}, size={crop_width}x{crop_height}) - likely placard or partial view")
+                        
+                        # CENTERED DETECTION: Only save crop when vehicle is centered in frame
+                        # This ensures GPS coordinates are captured at the most accurate moment
+                        is_centered = False
+                        if should_save_crop:
+                            # Calculate bounding box center
+                            bbox_center_x = (orig_x1 + orig_x2) / 2
+                            bbox_center_y = (orig_y1 + orig_y2) / 2
+                            
+                            # Calculate frame center
+                            frame_center_x = frame_width / 2
+                            frame_center_y = frame_height / 2
+                            
+                            # Define tolerance (in pixels) for centered detection
+                            # Horizontal tolerance: 15% of frame width (more lenient for horizontal movement)
+                            # Vertical tolerance: 20% of frame height (more lenient for vertical since vehicles pass through quickly)
+                            horizontal_threshold = frame_width * 0.15
+                            vertical_threshold = frame_height * 0.20
+                            
+                            # Check if vehicle is centered (within tolerance)
+                            horizontal_distance = abs(bbox_center_x - frame_center_x)
+                            vertical_distance = abs(bbox_center_y - frame_center_y)
+                            
+                            is_horizontally_centered = horizontal_distance < horizontal_threshold
+                            is_vertically_centered = vertical_distance < vertical_threshold
+                            is_centered = is_horizontally_centered and is_vertically_centered
+                            
+                            if not is_centered:
+                                should_save_crop = False
+                                if frame_count % 30 == 0:
+                                    print(f"[VideoProcessor] Frame {frame_count}: Skipping crop for {track_key} (track_id={track_id}) - vehicle not centered " +
+                                          f"(bbox_center=[{bbox_center_x:.1f}, {bbox_center_y:.1f}], " +
+                                          f"frame_center=[{frame_center_x:.1f}, {frame_center_y:.1f}], " +
+                                          f"distance=[{horizontal_distance:.1f}, {vertical_distance:.1f}], " +
+                                          f"threshold=[{horizontal_threshold:.1f}, {vertical_threshold:.1f}])")
+                            else:
+                                # Vehicle is centered - add to centered tracks set for visual highlighting
+                                centered_track_ids.add(track_id)
+                                if frame_count % 30 == 0:
+                                    print(f"[VideoProcessor] Frame {frame_count}: Vehicle centered for {track_key} (track_id={track_id}) " +
+                                          f"(bbox_center=[{bbox_center_x:.1f}, {bbox_center_y:.1f}], " +
+                                          f"frame_center=[{frame_center_x:.1f}, {frame_center_y:.1f}])")
                         
                         # Save crop if it's a new unique track and save_crops is enabled
                         if should_save_crop and self.save_crops:
@@ -779,7 +973,88 @@ class VideoProcessor:
                                 # Save crop image
                                 cv2.imwrite(str(crop_path), crop)
                                 
-                                # Save metadata
+                                # Get GPS coordinates from log file AT THE EXACT MOMENT crop is saved
+                                # This ensures GPS matches when car is in middle of camera (crop moment)
+                                crop_lat = None
+                                crop_lon = None
+                                crop_heading = None
+                                crop_speed = None
+                                
+                                # ALWAYS retrieve GPS fresh from log file when saving crop
+                                if self.gps_log and len(self.gps_log) > 0:
+                                    try:
+                                        from app.gps_sensor import get_gps_for_timestamp
+                                        
+                                        # Ensure video start time and actual FPS are initialized
+                                        if not hasattr(self, '_video_start_time') or not hasattr(self, '_actual_fps'):
+                                            first_timestamp = min(self.gps_log.keys())
+                                            last_timestamp = max(self.gps_log.keys())
+                                            try:
+                                                self._video_start_time = datetime.fromisoformat(first_timestamp.replace('Z', '+00:00'))
+                                                last_ts = datetime.fromisoformat(last_timestamp.replace('Z', '+00:00'))
+                                                
+                                                # Calculate GPS log duration
+                                                gps_log_duration_seconds = (last_ts - self._video_start_time).total_seconds()
+                                                
+                                                # Calculate actual FPS based on video frames and GPS log duration
+                                                total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+                                                if gps_log_duration_seconds > 0 and total_frames > 0:
+                                                    self._actual_fps = total_frames / gps_log_duration_seconds
+                                                    print(f"[VideoProcessor] Using GPS log start time: {self._video_start_time}")
+                                                    print(f"[VideoProcessor] GPS log duration: {gps_log_duration_seconds:.2f} seconds")
+                                                    print(f"[VideoProcessor] Calculated actual FPS from GPS log: {self._actual_fps:.2f} (video has {total_frames} frames)")
+                                                else:
+                                                    # Fallback to video metadata FPS
+                                                    fps = cap.get(cv2.CAP_PROP_FPS)
+                                                    self._actual_fps = fps if fps > 0 else 30.0
+                                                    print(f"[VideoProcessor] Using GPS log start time: {self._video_start_time}")
+                                                    print(f"[VideoProcessor] Using video metadata FPS: {self._actual_fps:.2f}")
+                                            except Exception as e:
+                                                # Fallback: use current time minus video duration
+                                                fps = cap.get(cv2.CAP_PROP_FPS)
+                                                total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+                                                video_duration_seconds = total_frames / fps if fps > 0 else 0
+                                                self._video_start_time = datetime.utcnow() - timedelta(seconds=video_duration_seconds)
+                                                self._actual_fps = fps if fps > 0 else 30.0
+                                                print(f"[VideoProcessor] Estimated video start time: {self._video_start_time}")
+                                                print(f"[VideoProcessor] Using fallback FPS: {self._actual_fps:.2f}")
+                                        
+                                        # Calculate frame timestamp based on frame number and actual FPS (more reliable than CAP_PROP_POS_MSEC)
+                                        # Formula: frame_timestamp = video_start_time + (frame_count / actual_fps)
+                                        frame_timestamp_ms = (frame_count / self._actual_fps) * 1000.0
+                                        
+                                        # Calculate exact frame timestamp for this crop moment
+                                        frame_timestamp = self._video_start_time + timedelta(milliseconds=frame_timestamp_ms)
+                                        
+                                        # Get GPS for THIS SPECIFIC FRAME when crop is saved
+                                        frame_gps = get_gps_for_timestamp(
+                                            self.gps_log,
+                                            frame_timestamp,
+                                            tolerance_seconds=2.0
+                                        )
+                                        
+                                        if frame_gps and 'lat' in frame_gps and 'lon' in frame_gps:
+                                            crop_lat = float(frame_gps['lat'])
+                                            crop_lon = float(frame_gps['lon'])
+                                            # Extract heading and speed if available
+                                            if 'heading' in frame_gps and frame_gps['heading'] is not None:
+                                                crop_heading = float(frame_gps['heading'])
+                                            if 'speed' in frame_gps and frame_gps['speed'] is not None:
+                                                crop_speed = float(frame_gps['speed'])
+                                            print(f"[VideoProcessor] Frame {frame_count}: GPS retrieved at crop save: ({crop_lat:.6f}, {crop_lon:.6f})" + 
+                                                  (f", heading={crop_heading:.2f}°" if crop_heading is not None else "") +
+                                                  (f", speed={crop_speed:.2f} mph" if crop_speed is not None else ""))
+                                        else:
+                                            print(f"[VideoProcessor] Frame {frame_count}: No GPS match found for crop timestamp {frame_timestamp}")
+                                    except Exception as e:
+                                        print(f"[VideoProcessor] Error getting GPS for crop at frame {frame_count}: {e}")
+                                        import traceback
+                                        traceback.print_exc()
+                                else:
+                                    if frame_count <= 5:
+                                        print(f"[VideoProcessor] WARNING: No GPS log available for crop at frame {frame_count}")
+                                
+                                # Save metadata with GPS coordinates from log file
                                 crop_metadata = {
                                     'crop_path': str(crop_path),
                                     'crop_filename': crop_filename,
@@ -794,12 +1069,20 @@ class VideoProcessor:
                                     'area': width * height,  # Store area for comparison
                                     'image_coords': image_coords,  # Calculated image coordinates (ground contact point)
                                     'spot': spot,
-                                    'world_coords': world_coords,
+                                    'lat': crop_lat,  # GPS latitude from log file
+                                    'lon': crop_lon,  # GPS longitude from log file
+                                    'gps_source': 'gps_log_file',  # Indicate GPS comes from log file
                                     'track_key': crop_dedup_key,  # Use crop_dedup_key (with track_id) for deduplication
                                     'bbox_hash': bbox_hash,
                                     'timestamp': datetime.utcnow().isoformat(),
                                     'camera_id': camera_id
                                 }
+                                
+                                # Add heading and speed if available
+                                if crop_heading is not None:
+                                    crop_metadata['heading'] = crop_heading
+                                if crop_speed is not None:
+                                    crop_metadata['speed'] = crop_speed
                                 
                                 self.saved_crops.append(crop_metadata)
                                 # Store by crop_dedup_key (includes track_id) to ensure one crop per unique track_id
@@ -824,6 +1107,8 @@ class VideoProcessor:
                         # OCR results will be added in Stage 2 and can be matched back to detections
                         
                         # Create event with trailer size information
+                        # Note: GPS coordinates are retrieved only when crops are saved (not for events)
+                        # Events are for tracking purposes; accurate GPS is stored in crop metadata
                         event = {
                             'frame': frame_count,
                             'ts_iso': datetime.utcnow().isoformat(),
@@ -881,7 +1166,7 @@ class VideoProcessor:
                                 frame_events.append(event)
                             # Otherwise, skip adding duplicate event for same physical trailer
                         
-                        # Update last nearest trailer if this is the nearest one
+                        # Update last nearest object if this is the nearest one
                         if is_nearest:
                             self.last_nearest_trailer = {
                                 'bbox': bbox,
@@ -917,9 +1202,10 @@ class VideoProcessor:
                 # Print progress every 30 frames
                 if frame_count % 30 == 0:
                     with self.lock:
-                        print(f"[VideoProcessor] Processed {frame_count} frames, detections: {self.stats['detections']}, tracks: {self.stats['tracks']}, OCR: {self.stats['ocr_results']}")
+                        print(f"[VideoProcessor] Processed {frame_count} frames (offset: {frame_offset}), detections: {self.stats['detections']}, tracks: {self.stats['tracks']}, OCR: {self.stats['ocr_results']}")
                 
-                yield frame_count, processed_frame, frame_events
+                # Yield with adjusted frame number (including offset for split videos)
+                yield (frame_count + frame_offset, processed_frame, frame_events)
                 frame_count += 1
                 
                 # Small delay to ensure frame is stored before next iteration
@@ -939,61 +1225,7 @@ class VideoProcessor:
             
             # Save crop metadata to JSON file for batch OCR processing
             if self.save_crops and len(self.saved_crops) > 0:
-                # Assign world_coords based on number of unique detections
-                # Count unique track_ids
-                unique_track_ids = set()
-                for crop in self.saved_crops:
-                    unique_track_ids.add(crop.get('track_id'))
-                
-                num_detections = len(unique_track_ids)
-                print(f"[VideoProcessor] Found {num_detections} unique detections (track_ids: {sorted(unique_track_ids)})")
-                
-                # Define world coordinates for demo
-                # First 4 coordinates (for 4-detection video)
-                coords_4_detections = [
-                    [41.911786, -89.044771],  # DD 42
-                    [41.911742, -89.044625],  # DD45
-                    [41.911734, -89.044564],  # DD46
-                    [41.911854, -89.044470]   # Door 48
-                ]
-                
-                # Last 3 coordinates (for 3-detection video)
-                coords_3_detections = [
-                    [41.912530, -89.044642],  # YARD182
-                    [41.912570, -89.044685],  # YARD 181
-                    [41.912622, -89.044954]   # YARD175
-                ]
-                
-                # Assign coordinates based on detection count
-                if num_detections == 4:
-                    coords_to_use = coords_4_detections
-                    print(f"[VideoProcessor] Assigning first 4 coordinates for 4-detection video")
-                elif num_detections == 3:
-                    coords_to_use = coords_3_detections
-                    print(f"[VideoProcessor] Assigning last 3 coordinates for 3-detection video")
-                else:
-                    # Fallback: use available coordinates or keep existing
-                    print(f"[VideoProcessor] Warning: Unexpected number of detections ({num_detections}). Using available coordinates.")
-                    if num_detections <= 4:
-                        coords_to_use = coords_4_detections[:num_detections]
-                    else:
-                        coords_to_use = coords_3_detections + coords_4_detections[:num_detections-3]
-                
-                # Assign coordinates to crops in track_id order
-                sorted_track_ids = sorted(unique_track_ids)
-                track_id_to_coords = {}
-                for idx, track_id in enumerate(sorted_track_ids):
-                    if idx < len(coords_to_use):
-                        track_id_to_coords[track_id] = coords_to_use[idx]
-                        print(f"[VideoProcessor] Assigning track_id {track_id} -> {coords_to_use[idx]}")
-                
-                # Update world_coords in saved_crops
-                for crop in self.saved_crops:
-                    track_id = crop.get('track_id')
-                    if track_id in track_id_to_coords:
-                        crop['world_coords'] = track_id_to_coords[track_id]
-                        print(f"[VideoProcessor] Updated world_coords for track_id {track_id}: {track_id_to_coords[track_id]}")
-                
+                # GPS coordinates are already included in crop metadata from GPS log file
                 import json
                 metadata_path = self.crops_dir / "crops_metadata.json"
                 with open(metadata_path, 'w') as f:
@@ -1580,6 +1812,56 @@ class VideoProcessor:
                                             
                                             cv2.imwrite(str(crop_path), crop)
                                             
+                                            # Get GPS coordinates from log file for this specific frame
+                                            crop_lat = None
+                                            crop_lon = None
+                                            crop_heading = None
+                                            crop_speed = None
+                                            if self.gps_log:
+                                                try:
+                                                    from app.gps_sensor import get_gps_for_timestamp
+                                                    
+                                                    # Get GPS from event if available (from when it was processed)
+                                                    event_lat = event.get('lat')
+                                                    event_lon = event.get('lon')
+                                                    
+                                                    if event_lat is not None and event_lon is not None:
+                                                        # Use GPS from event (already retrieved from log file during processing)
+                                                        crop_lat = float(event_lat)
+                                                        crop_lon = float(event_lon)
+                                                        # Try to get heading and speed from event if available
+                                                        if 'heading' in event:
+                                                            crop_heading = event.get('heading')
+                                                        if 'speed' in event:
+                                                            crop_speed = event.get('speed')
+                                                    else:
+                                                        # Fallback: retrieve GPS from log file for this frame
+                                                        # Calculate frame timestamp
+                                                        if hasattr(self, '_video_start_time'):
+                                                            # Get frame timestamp in milliseconds (approximate based on frame number)
+                                                            # This is a fallback, ideally GPS should be in the event
+                                                            # Use actual FPS if available, otherwise fallback to 30 fps
+                                                            actual_fps = getattr(self, '_actual_fps', 30.0)
+                                                            frame_timestamp_ms = (frame_num / actual_fps) * 1000.0
+                                                            frame_timestamp = self._video_start_time + timedelta(milliseconds=frame_timestamp_ms)
+                                                            
+                                                            frame_gps = get_gps_for_timestamp(
+                                                                self.gps_log,
+                                                                frame_timestamp,
+                                                                tolerance_seconds=2.0
+                                                            )
+                                                            
+                                                            if frame_gps:
+                                                                crop_lat = float(frame_gps['lat'])
+                                                                crop_lon = float(frame_gps['lon'])
+                                                                # Extract heading and speed if available
+                                                                if 'heading' in frame_gps and frame_gps['heading'] is not None:
+                                                                    crop_heading = float(frame_gps['heading'])
+                                                                if 'speed' in frame_gps and frame_gps['speed'] is not None:
+                                                                    crop_speed = float(frame_gps['speed'])
+                                                except Exception as e:
+                                                    print(f"[VideoProcessor] Error getting GPS for missing crop metadata at frame {frame_num}: {e}")
+                                            
                                             crop_metadata = {
                                                 'crop_path': str(crop_path),
                                                 'crop_filename': crop_filename,
@@ -1593,12 +1875,20 @@ class VideoProcessor:
                                                 'height': height,
                                                 'area': width * height,
                                                 'spot': spot,
-                                                'world_coords': (event.get('x_world'), event.get('y_world')),
+                                                'lat': crop_lat,  # GPS latitude from log file
+                                                'lon': crop_lon,  # GPS longitude from log file
+                                                'gps_source': 'gps_log_file',  # Indicate GPS comes from log file
                                                 'track_key': crop_dedup_key,  # Use crop_dedup_key (with track_id)
                                                 'bbox_hash': bbox_hash,
                                                 'timestamp': datetime.utcnow().isoformat(),
                                                 'camera_id': event.get('camera_id', 'test-video')
                                             }
+                                            
+                                            # Add heading and speed if available
+                                            if crop_heading is not None:
+                                                crop_metadata['heading'] = crop_heading
+                                            if crop_speed is not None:
+                                                crop_metadata['speed'] = crop_speed
                                             
                                             crops_to_keep.append(crop_metadata)
                                             self.crop_deduplication[crop_dedup_key] = str(crop_path)
@@ -2035,10 +2325,12 @@ class VideoProcessor:
             # This is done AFTER merging to catch any remaining small clusters
             # Lowered to 2 to allow trailers that are detected infrequently
             MIN_CLUSTER_COUNT = 2  # Minimum detections to consider a cluster valid (lowered from 5)
-            MAX_REALISTIC_X = 50.0  # Maximum realistic X position (meters)
-            MAX_REALISTIC_Y = 100.0  # Maximum realistic Y position (meters)
-            MIN_REALISTIC_X = -20.0  # Minimum realistic X position (meters)
-            MIN_REALISTIC_Y = 0.0  # Minimum realistic Y position (meters)
+            # Bounds are in meters (world coordinates), not GPS coordinates
+            # Made more permissive to handle various calibration ranges
+            MAX_REALISTIC_X = 200.0  # Maximum realistic X position (meters, eastward)
+            MAX_REALISTIC_Y = 200.0  # Maximum realistic Y position (meters, northward)
+            MIN_REALISTIC_X = -200.0  # Minimum realistic X position (meters, westward)
+            MIN_REALISTIC_Y = -200.0  # Minimum realistic Y position (meters, southward)
             
             clusters_to_remove = []
             for cid, cluster in self.position_clusters.items():

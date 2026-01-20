@@ -16,6 +16,9 @@ uvicorn>=0.24.0
 psycopg2-binary>=2.9.9
 python-dotenv>=1.0.0
 requests>=2.31.0
+# GPS sensor support (optional, for GPS-enabled recording)
+pyserial>=3.5
+pynmea2>=1.19.0
 # YOLOv8 detection (Ultralytics)
 ultralytics>=8.0.0
 
@@ -28,3 +31,18 @@ ultralytics>=8.0.0
 # torchvision>=0.15.0
 # qwen-vl-utils>=0.0.8
 # Pillow>=9.0.0
+
+# Deep Learning-based BEV (Bird's-Eye View) - Optional, for BEV transformation
+# Install PyTorch based on your system (CUDA or CPU):
+# For CUDA: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+# For CPU: pip install torch torchvision
+# torch>=2.0.0
+# torchvision>=0.15.0
+
+# Monocular Depth Estimation - Optional, for improved 3D projection accuracy
+# Required for depth-based 3D projection method (Option A: Monocular Depth Estimation)
+# Install PyTorch first (see above), then:
+# torch>=2.0.0
+# torchvision>=0.15.0
+# transformers>=4.49.0  # For Depth Anything model (alternative to MiDaS)
+# Note: MiDaS is loaded via torch.hub, no additional install needed

@@ -14,6 +14,7 @@ let resultsInterval = null;
 document.addEventListener('DOMContentLoaded', () => {
     loadMetrics();
     setupVideoProcessing();
+    setupVideoRecording();
     
     // Auto-refresh
     metricsInterval = setInterval(loadMetrics, REFRESH_INTERVAL);
@@ -102,12 +103,18 @@ function setupVideoProcessing() {
             stopBtn.disabled = false;
             updateProcessingStatus('Processing video...', 'processing');
             
+            // Get detection mode from dropdown
+            const detectionMode = document.getElementById('detectionMode').value;
+            
             const response = await fetch(`/api/process-video/${currentVideoId}`, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json'
                 },
-                body: JSON.stringify({ detect_every_n: 5 })
+                body: JSON.stringify({ 
+                    detect_every_n: 5,
+                    detection_mode: detectionMode
+                })
             });
             
             if (!response.ok) {
@@ -248,6 +255,181 @@ function updateProcessingStatus(message, type) {
     const statusEl = document.getElementById('processingStatus');
     statusEl.textContent = message;
     statusEl.className = `processing-status status-${type}`;
+}
+
+// Video recording functions
+function setupVideoRecording() {
+    const startBtn = document.getElementById('startRecordingBtn');
+    const stopBtn = document.getElementById('stopRecordingBtn');
+    const statusEl = document.getElementById('recordingStatus');
+    const infoEl = document.getElementById('recordingInfo');
+    
+    // Check recording status on load
+    checkRecordingStatus();
+    
+    // Poll recording status every 2 seconds
+    setInterval(checkRecordingStatus, 2000);
+    
+    startBtn.addEventListener('click', async () => {
+        try {
+            startBtn.disabled = true;
+            statusEl.textContent = 'Starting...';
+            
+            const response = await fetch('/api/start-recording', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({})
+            });
+            
+            const data = await response.json();
+            
+            if (data.success) {
+                startBtn.disabled = true;
+                stopBtn.disabled = false;
+                statusEl.textContent = 'Recording';
+                statusEl.className = 'recording-status recording';
+                infoEl.style.display = 'block';
+                if (data.camera_id) {
+                    document.getElementById('recordingCameraId').textContent = data.camera_id;
+                    // Start displaying camera preview
+                    startCameraPreview(data.camera_id);
+                }
+                updateRecordingStatus('Recording started', 'success');
+            } else {
+                startBtn.disabled = false;
+                statusEl.textContent = 'Not recording';
+                statusEl.className = 'recording-status';
+                updateRecordingStatus('Failed to start: ' + data.message, 'error');
+            }
+        } catch (error) {
+            console.error('Error starting recording:', error);
+            startBtn.disabled = false;
+            statusEl.textContent = 'Not recording';
+            statusEl.className = 'recording-status';
+            updateRecordingStatus('Error: ' + error.message, 'error');
+        }
+    });
+    
+    stopBtn.addEventListener('click', async () => {
+        try {
+            stopBtn.disabled = true;
+            statusEl.textContent = 'Stopping...';
+            
+            const response = await fetch('/api/stop-recording', {
+                method: 'POST'
+            });
+            
+            const data = await response.json();
+            
+            if (data.success) {
+                startBtn.disabled = false;
+                stopBtn.disabled = true;
+                statusEl.textContent = 'Not recording';
+                statusEl.className = 'recording-status';
+                infoEl.style.display = 'none';
+                // Stop camera preview
+                stopCameraPreview();
+                updateRecordingStatus('Recording stopped. Video: ' + (data.video_path || 'N/A'), 'success');
+            } else {
+                stopBtn.disabled = false;
+                updateRecordingStatus('Failed to stop: ' + data.message, 'error');
+            }
+        } catch (error) {
+            console.error('Error stopping recording:', error);
+            stopBtn.disabled = false;
+            updateRecordingStatus('Error: ' + error.message, 'error');
+        }
+    });
+}
+
+async function checkRecordingStatus() {
+    try {
+        const response = await fetch('/api/recording-status');
+        const data = await response.json();
+        
+        const startBtn = document.getElementById('startRecordingBtn');
+        const stopBtn = document.getElementById('stopRecordingBtn');
+        const statusEl = document.getElementById('recordingStatus');
+        
+        if (data.recording) {
+            startBtn.disabled = true;
+            stopBtn.disabled = false;
+            statusEl.textContent = 'Recording';
+            statusEl.className = 'recording-status recording';
+            document.getElementById('recordingInfo').style.display = 'block';
+            // Start camera preview if camera_id is available
+            if (data.camera_id) {
+                document.getElementById('recordingCameraId').textContent = data.camera_id;
+                startCameraPreview(data.camera_id);
+            }
+        } else {
+            startBtn.disabled = false;
+            stopBtn.disabled = true;
+            statusEl.textContent = 'Not recording';
+            statusEl.className = 'recording-status';
+            document.getElementById('recordingInfo').style.display = 'none';
+            // Stop camera preview
+            stopCameraPreview();
+        }
+        
+        // Update GPS status
+        if (data.gps_available !== undefined) {
+            document.getElementById('gpsStatus').textContent = data.gps_available ? 'Available' : 'Not available';
+        }
+    } catch (error) {
+        console.error('Error checking recording status:', error);
+    }
+}
+
+function updateRecordingStatus(message, type) {
+    const statusEl = document.getElementById('recordingStatus');
+    // Status is already updated in checkRecordingStatus, but we can add a temporary message
+    console.log(`Recording: ${message} (${type})`);
+}
+
+// Camera preview functions
+function startCameraPreview(cameraId) {
+    const container = document.getElementById('cameraPreviewContainer');
+    const previewImg = document.getElementById('cameraPreview');
+    
+    if (!container || !previewImg) return;
+    
+    // Show the preview container
+    container.style.display = 'block';
+    
+    // Set the stream source
+    previewImg.src = `/stream/${cameraId}?${new Date().getTime()}`;
+    
+    // Handle errors
+    previewImg.onerror = function() {
+        console.error('Error loading camera preview stream');
+        // Try to reload after a delay
+        setTimeout(() => {
+            if (this.src) {
+                this.src = `/stream/${cameraId}?${new Date().getTime()}`;
+            }
+        }, 2000);
+    };
+    
+    // Handle load
+    previewImg.onload = function() {
+        console.log('Camera preview stream loaded');
+    };
+}
+
+function stopCameraPreview() {
+    const container = document.getElementById('cameraPreviewContainer');
+    const previewImg = document.getElementById('cameraPreview');
+    
+    if (!container || !previewImg) return;
+    
+    // Hide the preview container
+    container.style.display = 'none';
+    
+    // Clear the stream source
+    previewImg.src = '';
 }
 
 

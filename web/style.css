@@ -30,6 +30,12 @@ header {
     align-items: center;
 }
 
+.header-controls {
+    display: flex;
+    align-items: center;
+    gap: 20px;
+}
+
 header h1 {
     font-size: 28px;
     font-weight: 600;
@@ -281,8 +287,48 @@ tbody tr:hover {
     display: flex;
     gap: 10px;
     align-items: center;
-    margin-bottom: 20px;
+    margin-bottom: 15px;
     flex-wrap: wrap;
+}
+
+.detection-mode-controls {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.detection-mode-label {
+    font-weight: 500;
+    font-size: 14px;
+    color: white;
+}
+
+.detection-mode-select {
+    padding: 8px 12px;
+    font-size: 14px;
+    border: 1px solid rgba(255, 255, 255, 0.3);
+    border-radius: 6px;
+    background: rgba(255, 255, 255, 0.15);
+    color: white;
+    cursor: pointer;
+    transition: background 0.2s, border-color 0.2s;
+    min-width: 120px;
+}
+
+.detection-mode-select:hover {
+    background: rgba(255, 255, 255, 0.25);
+    border-color: rgba(255, 255, 255, 0.5);
+}
+
+.detection-mode-select:focus {
+    outline: none;
+    background: rgba(255, 255, 255, 0.25);
+    border-color: rgba(255, 255, 255, 0.6);
+}
+
+.detection-mode-select option {
+    background: #667eea;
+    color: white;
 }
 
 .btn-primary, .btn-secondary {
@@ -496,6 +542,75 @@ tbody tr:hover {
     text-align: center;
     color: #6b7280;
     padding: 20px;
+}
+
+.video-recording-section {
+    padding: 30px;
+    border-bottom: 1px solid #e5e7eb;
+}
+
+.recording-controls {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    margin-bottom: 20px;
+    flex-wrap: wrap;
+}
+
+.recording-status {
+    padding: 8px 16px;
+    border-radius: 6px;
+    font-size: 14px;
+    font-weight: 500;
+    margin-left: 10px;
+}
+
+.recording-status.recording {
+    background: #fee2e2;
+    color: #991b1b;
+}
+
+.recording-info {
+    margin-top: 15px;
+    padding: 15px;
+    background: #f9fafb;
+    border-radius: 6px;
+    border: 1px solid #e5e7eb;
+}
+
+.recording-info p {
+    margin-bottom: 8px;
+    font-size: 14px;
+}
+
+.recording-info p:last-child {
+    margin-bottom: 0;
+}
+
+.camera-preview-container {
+    margin-top: 20px;
+}
+
+.camera-preview-container h3 {
+    font-size: 18px;
+    margin-bottom: 15px;
+    color: #111827;
+}
+
+.camera-preview-wrapper {
+    background: #000;
+    border-radius: 8px;
+    padding: 10px;
+    border: 1px solid #e5e7eb;
+}
+
+.camera-preview-stream {
+    width: 100%;
+    height: auto;
+    max-height: 500px;
+    object-fit: contain;
+    border-radius: 4px;
+    display: block;
 }
 
 @media (max-width: 1024px) {

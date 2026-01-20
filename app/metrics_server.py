@@ -135,6 +135,59 @@ class MetricsServer:
                 mimetype='multipart/x-mixed-replace; boundary=frame'
             )
         
+        @self.app.route('/api/start-recording', methods=['POST'])
+        def start_recording():
+            """Start video recording with GPS logging."""
+            try:
+                data = request.get_json() or {}
+                camera_id = data.get('camera_id')
+                
+                # Get app instance from frame_storage
+                app = self.frame_storage if hasattr(self, 'frame_storage') else None
+                if not app or not hasattr(app, 'start_recording'):
+                    return jsonify({'error': 'Recording not available'}), 500
+                
+                result = app.start_recording(camera_id=camera_id)
+                
+                if result.get('success'):
+                    return jsonify(result), 200
+                else:
+                    return jsonify(result), 400
+            except Exception as e:
+                return jsonify({'error': str(e)}), 500
+        
+        @self.app.route('/api/stop-recording', methods=['POST'])
+        def stop_recording():
+            """Stop video recording and return paths."""
+            try:
+                # Get app instance from frame_storage
+                app = self.frame_storage if hasattr(self, 'frame_storage') else None
+                if not app or not hasattr(app, 'stop_recording'):
+                    return jsonify({'error': 'Recording not available'}), 500
+                
+                result = app.stop_recording()
+                
+                if result.get('success'):
+                    return jsonify(result), 200
+                else:
+                    return jsonify(result), 400
+            except Exception as e:
+                return jsonify({'error': str(e)}), 500
+        
+        @self.app.route('/api/recording-status', methods=['GET'])
+        def recording_status():
+            """Get current recording status."""
+            try:
+                # Get app instance from frame_storage
+                app = self.frame_storage if hasattr(self, 'frame_storage') else None
+                if not app or not hasattr(app, 'is_recording'):
+                    return jsonify({'recording': False, 'error': 'Recording not available'}), 200
+                
+                is_recording = app.is_recording()
+                return jsonify({'recording': is_recording}), 200
+            except Exception as e:
+                return jsonify({'recording': False, 'error': str(e)}), 200
+        
         @self.app.route('/api/upload-video', methods=['POST'])
         def upload_video():
             """Upload video file for processing."""
@@ -195,29 +248,159 @@ class MetricsServer:
                     
                     video_path = str(video_files[0])
                     print(f"[MetricsServer] Found video file: {video_path}")
+                    
+                    # Look for corresponding GPS log file
+                    video_path_obj = Path(video_path)
+                    gps_log_path = None
+                    
+                    # Extract camera ID, date, and time from video filename
+                    # Format: {video_id}_{camera_id}_{date}_{time}.mp4
+                    # Example: 5b8e7e9a-b5f8-4ff2-ad12-b7f9b837b223_lifecam-hd6000-01_20260116_174341.mp4
+                    video_stem = video_path_obj.stem
+                    parts = video_stem.split('_')
+                    camera_id = None
+                    date_str = None
+                    time_str = None
+                    
+                    if len(parts) >= 3:
+                        # Try to find camera_id, date, and time in filename
+                        # Look for pattern: {video_id}_{camera_id}_{date}_{time}
+                        # Find the date part (8 digits: YYYYMMDD) and time part (6 digits: HHMMSS)
+                        for i in range(1, len(parts) - 1):
+                            # Check if this part looks like a date (YYYYMMDD)
+                            if len(parts[i]) == 8 and parts[i].isdigit():
+                                # Camera ID is everything before the date
+                                camera_id = '_'.join(parts[1:i])  # Skip video_id (parts[0])
+                                date_str = parts[i]
+                                # Check if next part is time (6 digits: HHMMSS)
+                                if i + 1 < len(parts) and len(parts[i+1]) == 6 and parts[i+1].isdigit():
+                                    time_str = parts[i+1]
+                                break
+                    
+                    # Try to find GPS log with same base name (in same directory)
+                    possible_gps_paths = [
+                        video_path_obj.parent / f"{video_path_obj.stem}_gps.json",
+                        video_path_obj.parent / f"{video_path_obj.stem.replace('_', '_')}_gps.json"
+                    ]
+                    
+                    # Also check out/recordings directory for GPS log files
+                    recordings_dir = Path("out/recordings")
+                    if recordings_dir.exists() and camera_id and date_str:
+                        # Priority 1: Try exact match with time component
+                        if time_str:
+                            exact_match = recordings_dir / f"{camera_id}_{date_str}_{time_str}_gps.json"
+                            if exact_match.exists():
+                                possible_gps_paths.insert(0, exact_match)  # Highest priority
+                                print(f"[MetricsServer] Found exact GPS log match: {exact_match}")
+                            else:
+                                # Priority 2: Find closest timestamp match
+                                # Look for all GPS log files matching camera_id and date
+                                gps_pattern = f"{camera_id}_{date_str}_*_gps.json"
+                                matching_gps_files = list(recordings_dir.glob(gps_pattern))
+                                if matching_gps_files:
+                                    # Extract timestamps and find the closest match
+                                    def extract_time_from_filename(filename):
+                                        """Extract time string (HHMMSS) from GPS log filename."""
+                                        name = filename.stem  # Remove .json extension
+                                        parts = name.split('_')
+                                        # Find the part that looks like time (6 digits)
+                                        for part in parts:
+                                            if len(part) == 6 and part.isdigit():
+                                                return part
+                                        return None
+                                    
+                                    # Convert video time to seconds for comparison
+                                    video_time_sec = int(time_str[:2]) * 3600 + int(time_str[2:4]) * 60 + int(time_str[4:6])
+                                    
+                                    best_match = None
+                                    min_time_diff = float('inf')
+                                    
+                                    for gps_file in matching_gps_files:
+                                        gps_time_str = extract_time_from_filename(gps_file)
+                                        if gps_time_str:
+                                            gps_time_sec = int(gps_time_str[:2]) * 3600 + int(gps_time_str[2:4]) * 60 + int(gps_time_str[4:6])
+                                            time_diff = abs(gps_time_sec - video_time_sec)
+                                            if time_diff < min_time_diff:
+                                                min_time_diff = time_diff
+                                                best_match = gps_file
+                                    
+                                    if best_match:
+                                        # Only use if within 5 minutes (300 seconds)
+                                        if min_time_diff <= 300:
+                                            possible_gps_paths.insert(0, best_match)
+                                            print(f"[MetricsServer] Found closest GPS log match (time diff: {min_time_diff}s): {best_match}")
+                                        else:
+                                            print(f"[MetricsServer] GPS log files found but time difference too large ({min_time_diff}s > 300s), using closest anyway")
+                                            possible_gps_paths.append(best_match)
+                                    else:
+                                        # Fallback: use first matching file
+                                        possible_gps_paths.append(matching_gps_files[0])
+                                        print(f"[MetricsServer] Found GPS log in recordings directory (no time match): {matching_gps_files[0]}")
+                                else:
+                                    # Try without time component (just camera_id and date)
+                                    gps_pattern_alt = f"{camera_id}_{date_str}_gps.json"
+                                    matching_gps_files_alt = list(recordings_dir.glob(gps_pattern_alt))
+                                    if matching_gps_files_alt:
+                                        possible_gps_paths.append(matching_gps_files_alt[0])
+                                        print(f"[MetricsServer] Found GPS log in recordings directory (no time): {matching_gps_files_alt[0]}")
+                        else:
+                            # No time component in video filename, just match by camera_id and date
+                            gps_pattern = f"{camera_id}_{date_str}_*_gps.json"
+                            matching_gps_files = list(recordings_dir.glob(gps_pattern))
+                            if matching_gps_files:
+                                possible_gps_paths.append(matching_gps_files[0])
+                                print(f"[MetricsServer] Found GPS log in recordings directory: {matching_gps_files[0]}")
+                            else:
+                                # Try without time component
+                                gps_pattern_alt = f"{camera_id}_{date_str}_gps.json"
+                                matching_gps_files_alt = list(recordings_dir.glob(gps_pattern_alt))
+                                if matching_gps_files_alt:
+                                    possible_gps_paths.append(matching_gps_files_alt[0])
+                                    print(f"[MetricsServer] Found GPS log in recordings directory (no time): {matching_gps_files_alt[0]}")
+                    
+                    # Try all possible paths in priority order
+                    for gps_path in possible_gps_paths:
+                        if gps_path.exists():
+                            gps_log_path = str(gps_path)
+                            print(f"[MetricsServer] Found GPS log file: {gps_log_path}")
+                            break
+                    
+                    if not gps_log_path:
+                        print(f"[MetricsServer] No GPS log file found for video (this is OK if video was not recorded with GPS)")
+                        print(f"[MetricsServer] Searched in: {video_path_obj.parent} and {recordings_dir if recordings_dir.exists() else 'N/A'}")
+                        if camera_id and date_str:
+                            print(f"[MetricsServer] Looking for GPS log with camera_id={camera_id}, date={date_str}, time={time_str if time_str else 'N/A'}")
                 except Exception as e:
                     print(f"[MetricsServer] ERROR: Failed to find video file: {e}")
                     import traceback
                     traceback.print_exc()
                     return jsonify({'error': f'Failed to find video file: {str(e)}'}), 500
                 
-                # Get detect_every_n parameter safely (must be done in request context)
+                # Get detect_every_n and detection_mode parameters safely (must be done in request context)
                 detect_every_n = 20  # default
+                detection_mode = 'trailer'  # default
                 try:
                     if request.is_json:
                         try:
                             json_data = request.get_json(silent=True)
-                            if json_data and 'detect_every_n' in json_data:
-                                detect_every_n = int(json_data['detect_every_n'])
+                            if json_data:
+                                if 'detect_every_n' in json_data:
+                                    detect_every_n = int(json_data['detect_every_n'])
+                                if 'detection_mode' in json_data:
+                                    detection_mode = str(json_data['detection_mode']).lower()
+                                    if detection_mode not in ['trailer', 'car']:
+                                        detection_mode = 'trailer'  # fallback to trailer
                         except (ValueError, TypeError) as e:
-                            print(f"[MetricsServer] Warning: Invalid detect_every_n value, using default: {e}")
+                            print(f"[MetricsServer] Warning: Invalid parameter value, using defaults: {e}")
                 except Exception as e:
-                    print(f"[MetricsServer] Warning: Failed to parse request JSON, using default detect_every_n=5: {e}")
+                    print(f"[MetricsServer] Warning: Failed to parse request JSON, using defaults: {e}")
                 
-                # Capture video_path and detect_every_n for background thread
+                # Capture video_path, GPS log path, detect_every_n, and detection_mode for background thread
                 # (Flask request context is not available in background threads)
                 captured_video_path = video_path
+                captured_gps_log_path = gps_log_path if 'gps_log_path' in locals() else None
                 captured_detect_every_n = detect_every_n
+                captured_detection_mode = detection_mode
                 
                 # Reset status before starting new processing
                 with self.status_lock:
@@ -230,17 +413,69 @@ class MetricsServer:
                 def process_in_background():
                     try:
                         import traceback
-                        print(f"[MetricsServer] Starting video processing: {captured_video_path}, detect_every_n={captured_detect_every_n}")
+                        print(f"[MetricsServer] Starting video processing: {captured_video_path}, detect_every_n={captured_detect_every_n}, detection_mode={captured_detection_mode}")
                         
                         # Update status: video processing started
                         with self.status_lock:
                             self.processing_status['status'] = 'processing_video'
-                            self.processing_status['message'] = 'Processing video...'
+                            self.processing_status['message'] = f'Processing video ({captured_detection_mode} mode)...'
                             self.processing_status['video_processing_complete'] = False
                             self.processing_status['ocr_processing_complete'] = False
                         
+                        # Create detector based on detection mode
+                        original_detector = self.video_processor.detector
+                        try:
+                            from app.ai.detector_yolov8 import YOLOv8Detector
+                            import os
+                            
+                            if captured_detection_mode == 'car':
+                                # Use COCO pre-trained model for car detection (class 2 = car)
+                                print(f"[MetricsServer] Creating car detector (COCO class 2)")
+                                car_detector = YOLOv8Detector(
+                                    model_name="yolov8m.pt",  # COCO pre-trained model
+                                    conf_threshold=0.25,
+                                    target_class=2  # COCO class 2 = car
+                                )
+                                self.video_processor.detector = car_detector
+                                print(f"[MetricsServer] Car detector loaded successfully")
+                            else:  # trailer mode
+                                # Use fine-tuned model if available, otherwise COCO truck (class 7)
+                                fine_tuned_model_path = "runs/detect/truck_detector_finetuned/weights/best.pt"
+                                if os.path.exists(fine_tuned_model_path):
+                                    print(f"[MetricsServer] Creating trailer detector (fine-tuned model)")
+                                    trailer_detector = YOLOv8Detector(
+                                        model_name=fine_tuned_model_path,
+                                        conf_threshold=0.35,
+                                        target_class=0  # Fine-tuned model is single-class (trailer = class 0)
+                                    )
+                                    self.video_processor.detector = trailer_detector
+                                    print(f"[MetricsServer] Fine-tuned trailer detector loaded successfully")
+                                else:
+                                    # Fallback to COCO truck detection
+                                    print(f"[MetricsServer] Creating trailer detector (COCO class 7 = truck)")
+                                    trailer_detector = YOLOv8Detector(
+                                        model_name="yolov8m.pt",
+                                        conf_threshold=0.25,
+                                        target_class=7  # COCO class 7 = truck
+                                    )
+                                    self.video_processor.detector = trailer_detector
+                                    print(f"[MetricsServer] COCO truck detector loaded successfully")
+                        except Exception as e:
+                            print(f"[MetricsServer] Warning: Failed to create detector for {captured_detection_mode} mode: {e}")
+                            print(f"[MetricsServer] Using original detector")
+                            # Keep original detector if new one fails
+                        
                         frame_count = 0
                         last_results_check = 0
+                        
+                        # Update video processor with GPS log path if available
+                        if captured_gps_log_path and hasattr(self.video_processor, 'gps_log_path'):
+                            self.video_processor.gps_log_path = captured_gps_log_path
+                            # Reload GPS log
+                            if hasattr(self.video_processor, 'gps_log'):
+                                from app.gps_sensor import load_gps_log
+                                self.video_processor.gps_log = load_gps_log(captured_gps_log_path)
+                                print(f"[MetricsServer] Loaded GPS log for video processing: {captured_gps_log_path}")
                         
                         for frame_num, processed_frame, events in self.video_processor.process_video(
                             captured_video_path, camera_id="test-video", detect_every_n=captured_detect_every_n
@@ -263,6 +498,11 @@ class MetricsServer:
                         print(f"[MetricsServer] Video processing completed: {frame_count} frames processed")
                         print(f"[MetricsServer] Final results: {final_results}")
                         
+                        # Restore original detector
+                        if 'original_detector' in locals() and original_detector is not None:
+                            self.video_processor.detector = original_detector
+                            print(f"[MetricsServer] Restored original detector")
+                        
                         # Update status: video processing complete
                         # OCR will not be loaded automatically - user must trigger it manually if needed
                         # YOLO detector is kept loaded (not unloaded automatically)
@@ -279,6 +519,13 @@ class MetricsServer:
                         print(f"[MetricsServer] Error processing video: {e}")
                         import traceback
                         traceback.print_exc()
+                        # Restore original detector on error
+                        if 'original_detector' in locals() and original_detector is not None:
+                            try:
+                                self.video_processor.detector = original_detector
+                                print(f"[MetricsServer] Restored original detector after error")
+                            except:
+                                pass
                         # Make sure processing flag is cleared on error
                         try:
                             self.video_processor.stop_processing()

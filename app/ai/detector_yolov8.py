@@ -22,7 +22,7 @@ class YOLOv8Detector:
     Filters detections to only return trucks (class 7).
     """
     
-    def __init__(self, model_name: str = "yolov8m.pt", conf_threshold: float = 0.25, 
+    def __init__(self, model_name: str = "yolov8m.pt", conf_threshold: float = 0.5, 
                  target_class: int = 7, device: str = None):
         """
         Initialize YOLOv8 detector.

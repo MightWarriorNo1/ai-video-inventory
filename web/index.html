@@ -10,11 +10,39 @@
     <div class="container">
         <header>
             <h1>AI EdgeBox Orion - Trailer Vision Dashboard</h1>
+            <div class="header-controls">
+                <div class="detection-mode-controls">
+                    <label for="detectionMode" class="detection-mode-label">Detection Mode:</label>
+                    <select id="detectionMode" class="detection-mode-select">
+                        <option value="trailer">Trailer</option>
+                        <option value="car">Car</option>
+                    </select>
+                </div>
             <div class="status-indicator">
                 <span class="status-dot" id="statusDot"></span>
                 <span id="statusText">Connected</span>
+                </div>
             </div>
         </header>
+
+        <div class="video-recording-section">
+            <h2>Video Recording</h2>
+            <div class="recording-controls">
+                <button id="startRecordingBtn" class="btn-primary">Start Recording</button>
+                <button id="stopRecordingBtn" class="btn-secondary" disabled>Stop Recording</button>
+                <span id="recordingStatus" class="recording-status">Not recording</span>
+            </div>
+            <div id="recordingInfo" class="recording-info" style="display: none;">
+                <p><strong>Recording:</strong> <span id="recordingCameraId">-</span></p>
+                <p><strong>GPS Status:</strong> <span id="gpsStatus">Unknown</span></p>
+            </div>
+            <div id="cameraPreviewContainer" class="camera-preview-container" style="display: none;">
+                <h3>Live Camera Feed</h3>
+                <div class="camera-preview-wrapper">
+                    <img id="cameraPreview" class="camera-preview-stream" alt="Camera preview" />
+                </div>
+            </div>
+        </div>
 
         <div class="video-processing-section">
             <h2>Video Processing</h2>

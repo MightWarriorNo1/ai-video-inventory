@@ -3,6 +3,8 @@ Homography Calibration Tool
 
 Interactive tool for calibrating camera homography (image -> GPS coordinates).
 Click 4+ landmark points on an image and enter corresponding GPS coordinates.
+
+Supports both camera frames and Google Maps satellite images.
 """
 
 import cv2
@@ -12,6 +14,7 @@ import argparse
 from pathlib import Path
 import sys
 import os
+import re
 
 # Add parent directory to path to import gps_utils
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -23,17 +26,19 @@ class HomographyCalibrator:
     Interactive homography calibration tool.
     """
     
-    def __init__(self, image_path: str, use_gps: bool = True):
+    def __init__(self, image_path: str, use_gps: bool = True, is_satellite: bool = False):
         """
         Initialize calibrator.
         
         Args:
             image_path: Path to calibration image
             use_gps: If True, accept GPS coordinates (lat/lon). If False, use local meters.
+            is_satellite: If True, image is from Google Maps satellite view (enables GPS URL parsing)
         """
         self.image_path = image_path
         self.image = cv2.imread(image_path)
         self.use_gps = use_gps
+        self.is_satellite = is_satellite
         
         if self.image is None:
             raise ValueError(f"Failed to load image: {image_path}")
@@ -43,7 +48,71 @@ class HomographyCalibrator:
         self.gps_points = []  # Always store GPS coords for reference
         self.ref_lat = None
         self.ref_lon = None
+        
+        if is_satellite:
+            self.window_name = "Homography Calibration (Google Maps Satellite) - Click 4+ points, press 'q' when done"
+        else:
         self.window_name = "Homography Calibration - Click 4+ points, press 'q' when done"
+    
+    def parse_gps_from_input(self, user_input: str) -> tuple:
+        """
+        Parse GPS coordinates from various input formats.
+        
+        Supports:
+        - "lat, lon" or "lat,lon"
+        - "lat lon" (space separated)
+        - Google Maps URL with coordinates
+        - Single coordinate value (prompts for second)
+        
+        Args:
+            user_input: User input string
+            
+        Returns:
+            Tuple of (lat, lon) or (lat, None) if only one value, or None if cannot parse
+        """
+        user_input = user_input.strip()
+        
+        # Try to extract from Google Maps URL
+        url_pattern = r'[-+]?[0-9]*\.?[0-9]+'
+        if 'maps.google' in user_input or 'google.com/maps' in user_input:
+            coords = re.findall(url_pattern, user_input)
+            if len(coords) >= 2:
+                try:
+                    lat = float(coords[0])
+                    lon = float(coords[1])
+                    return (lat, lon)
+                except ValueError:
+                    pass
+        
+        # Try comma-separated
+        if ',' in user_input:
+            parts = user_input.split(',')
+            if len(parts) >= 2:
+                try:
+                    lat = float(parts[0].strip())
+                    lon = float(parts[1].strip())
+                    return (lat, lon)
+                except ValueError:
+                    pass
+        
+        # Try space-separated
+        parts = user_input.split()
+        if len(parts) >= 2:
+            try:
+                lat = float(parts[0])
+                lon = float(parts[1])
+                return (lat, lon)
+            except ValueError:
+                pass
+        
+        # Single value - return as latitude, will prompt for longitude
+        try:
+            lat = float(user_input)
+            return (lat, None)
+        except ValueError:
+            pass
+        
+        return None
     
     def mouse_callback(self, event, x, y, flags, param):
         """Mouse callback for clicking points."""
@@ -54,6 +123,25 @@ class HomographyCalibrator:
             # Prompt for coordinates
             try:
                 if self.use_gps:
+                    if self.is_satellite:
+                        print("  Enter GPS coordinates:")
+                        print("    - Format: 'lat, lon' (e.g., '41.91164053, -89.04468542')")
+                        print("    - Or paste Google Maps URL with coordinates")
+                        print("    - Or enter latitude, then longitude separately")
+                        user_input = input(f"  GPS (lat, lon or URL): ").strip()
+                        
+                        parsed = self.parse_gps_from_input(user_input)
+                        if parsed and parsed[1] is not None:
+                            lat, lon = parsed
+                        elif parsed and parsed[1] is None:
+                            # Got latitude, prompt for longitude
+                            lat = parsed[0]
+                            lon = float(input(f"  Enter GPS Longitude (degrees): "))
+                        else:
+                            # Try as single latitude value
+                            lat = float(user_input)
+                            lon = float(input(f"  Enter GPS Longitude (degrees): "))
+                    else:
                     lat = float(input(f"  Enter GPS Latitude (degrees, e.g., 40.7128): "))
                     lon = float(input(f"  Enter GPS Longitude (degrees, e.g., -74.0060): "))
                     
@@ -107,10 +195,18 @@ class HomographyCalibrator:
             Tuple of (homography_matrix, rmse)
         """
         print("\n=== Homography Calibration ===")
+        if self.is_satellite:
+            print("Google Maps Satellite Image Mode")
+            print("=" * 50)
         if self.use_gps:
             print("Instructions:")
             print("1. Click 4+ landmark points on the image")
             print("2. Enter corresponding GPS coordinates (latitude, longitude)")
+            if self.is_satellite:
+                print("   - Right-click on Google Maps to get coordinates")
+                print("   - Or paste Google Maps URL")
+                print("   - Format: 'lat, lon' or separate prompts")
+            else:
             print("   Example: Latitude: 40.7128, Longitude: -74.0060")
             print("   Tip: Use Google Maps to get GPS coordinates for each point")
             print("3. Press 'q' when done (minimum 4 points required)")
@@ -174,13 +270,21 @@ class HomographyCalibrator:
             H: Homography matrix (3x3)
             rmse: Root mean square error (meters)
         """
+        # Get image dimensions
+        img_height, img_width = self.image.shape[:2]
+        
         calib_data = {
             'H': H.tolist(),
             'rmse': float(rmse),
             'image_points': self.image_points,
             'world_points': self.world_points,
             'image_path': str(self.image_path),
-            'use_gps': self.use_gps
+            'image_size': {
+                'width': int(img_width),
+                'height': int(img_height)
+            },
+            'use_gps': self.use_gps,
+            'is_satellite_image': self.is_satellite
         }
         
         # Add GPS reference if using GPS
@@ -208,16 +312,35 @@ class HomographyCalibrator:
 
 def main():
     """Main entry point."""
-    parser = argparse.ArgumentParser(description='Homography Calibration Tool')
+    parser = argparse.ArgumentParser(
+        description='Homography Calibration Tool',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Calibrate from camera frame:
+  python tools/calibrate_h.py --image frame.jpg --save config/calib/camera-01_h.json
+  
+  # Calibrate from Google Maps satellite image:
+  python tools/calibrate_h.py --image satellite_map.png --save config/calib/camera-01_h.json --satellite
+  
+  # Using local meters (legacy mode):
+  python tools/calibrate_h.py --image frame.jpg --save config/calib/camera-01_h.json --use-meters
+        """
+    )
     parser.add_argument('--image', required=True, help='Path to calibration image')
     parser.add_argument('--save', required=True, help='Output JSON file path (e.g., config/calib/camera-id_h.json)')
     parser.add_argument('--use-meters', action='store_true', help='Use local meters instead of GPS coordinates (legacy mode)')
+    parser.add_argument('--satellite', action='store_true', help='Image is from Google Maps satellite view (enables GPS URL parsing)')
     
     args = parser.parse_args()
     
     try:
         use_gps = not args.use_meters  # Default to GPS mode
-        calibrator = HomographyCalibrator(args.image, use_gps=use_gps)
+        calibrator = HomographyCalibrator(
+            args.image, 
+            use_gps=use_gps,
+            is_satellite=args.satellite
+        )
         H, rmse = calibrator.calibrate()
         calibrator.save(args.save, H, rmse)
         

@@ -6,7 +6,7 @@ End-to-end processing pipeline:
 2. Detection (YOLO TensorRT)
 3. Tracking (ByteTrack)
 4. OCR (TrOCR/PaddleOCR/CRNN TensorRT)
-5. Homography projection (image -> world)
+5. BEV projection (image -> world using deep learning)
 6. Spot resolution (GeoJSON polygons)
 7. Logging, publishing, metrics
 """
@@ -50,6 +50,8 @@ from app.uploader import UploadManager
 from app.metrics_server import MetricsServer
 from app.video_processor import VideoProcessor
 from app.image_preprocessing import ImagePreprocessor
+from app.gps_sensor import GPSSensor
+from app.video_recorder import VideoRecorder
 import requests
 
 
@@ -80,9 +82,10 @@ class TrailerVisionApp:
         self.metrics_server = None
         self.preprocessor = None
         
-        # Per-camera trackers and homographies
+        # Per-camera trackers and BEV projectors
         self.trackers = {}
-        self.homographies = {}
+        self.camera_3d_projectors = {}  # camera_id -> Camera3DProjector (priority)
+        self.bev_projectors = {}  # camera_id -> BEVProjector (fallback)
         
         # Check if OCR is oLmOCR (needs GPU memory cleanup)
         self.is_olmocr = False  # Will be set after OCR initialization
@@ -105,6 +108,10 @@ class TrailerVisionApp:
         self.ocr_min_confidence = 0.5  # Only cache results with confidence >= this
         self.ocr_run_every_n_frames = 10  # Run OCR every N frames for existing tracks (if not cached)
         self.ocr_cache_max_size = 100  # Maximum cache entries to prevent memory leaks
+        
+        # GPS sensor and video recorder
+        self.gps_sensor = None
+        self.video_recorder = None
         
         self._initialize_components()
     
@@ -200,6 +207,42 @@ class TrailerVisionApp:
         )
         self.metrics_server.start()
         
+        # Initialize GPS sensor
+        try:
+            gps_port = os.getenv('GPS_PORT', None)
+            # Try common GPS ports if not specified
+            if gps_port is None:
+                # Try common Linux ports
+                for port in ['/dev/ttyUSB0', '/dev/ttyUSB1', '/dev/ttyACM0']:
+                    if os.path.exists(port):
+                        gps_port = port
+                        break
+                # Try Windows COM ports if Linux ports not found
+                if gps_port is None:
+                    import platform
+                    if platform.system() == 'Windows':
+                        for port in ['COM3', 'COM4', 'COM5']:
+                            gps_port = port
+                            break
+            
+            if gps_port:
+                self.gps_sensor = GPSSensor(port=gps_port, baudrate=4800)
+                self.gps_sensor.start()
+                print(f"[TrailerVisionApp] GPS sensor initialized on {gps_port} at 4800 baud")
+            else:
+                print(f"[TrailerVisionApp] No GPS port found, GPS sensor disabled")
+                self.gps_sensor = None
+        except Exception as e:
+            print(f"[TrailerVisionApp] Failed to initialize GPS sensor: {e}")
+            self.gps_sensor = None
+        
+        # Initialize video recorder
+        self.video_recorder = VideoRecorder(
+            output_dir="out/recordings",
+            gps_sensor=self.gps_sensor
+        )
+        print(f"[TrailerVisionApp] Video recorder initialized")
+        
         # Initialize image preprocessor
         # IMPORTANT: Disable rotation for oLmOCR and EasyOCR because they handle rotation internally.
         # Pre-rotating images causes double rotation issues.
@@ -228,28 +271,68 @@ class TrailerVisionApp:
             rotation_msg = "Enabled"
         print(f"  Rotation: {rotation_msg}")
         
-        # Load homographies for each camera
+        # Load 3D projectors and BEV projectors for each camera
         self.gps_references = {}  # Store GPS reference for each camera
+        from app.bev_utils import BEVProjector
+        
         for camera in self.config.get('cameras', []):
             camera_id = camera['id']
-            calib_path = f"config/calib/{camera_id}_h.json"
-            if os.path.exists(calib_path):
-                with open(calib_path, 'r') as f:
-                    calib_data = json.load(f)
-                    self.homographies[camera_id] = np.array(calib_data['H'])
+            
+            # Priority 1: Load 3D projector if available
+            calib_3d_path = f"config/calib/{camera_id}_3d.json"
+            gps_reference = None
+            
+            if os.path.exists(calib_3d_path):
+                try:
+                    from app.camera_3d_projection import Camera3DProjector
+                    self.camera_3d_projectors[camera_id] = Camera3DProjector.from_calibration_file(calib_3d_path)
+                    gps_msg = ""
+                    if self.camera_3d_projectors[camera_id].gps_reference:
+                        gps_ref = self.camera_3d_projectors[camera_id].gps_reference
+                        gps_reference = gps_ref
+                        gps_msg = f"with GPS reference: ({gps_ref['lat']:.6f}, {gps_ref['lon']:.6f})"
+                        self.gps_references[camera_id] = gps_ref
+                    print(f"Loaded 3D projector for {camera_id} {gps_msg}")
+                except Exception as e:
+                    print(f"Error loading 3D projector for {camera_id}: {e}")
+                    import traceback
+                    traceback.print_exc()
+            
+            # Fallback: Also check homography calibration file for GPS reference if not set
+            if not gps_reference:
+                calib_path = f"config/calib/{camera_id}_h.json"
+                if os.path.exists(calib_path):
+                    with open(calib_path, 'r') as f:
+                        calib_data = json.load(f)
+                        # Load GPS reference if available
+                        if 'gps_reference' in calib_data:
+                            gps_ref = calib_data['gps_reference']
+                            gps_reference = {
+                                'lat': gps_ref['lat'],
+                                'lon': gps_ref['lon']
+                            }
+                            self.gps_references[camera_id] = gps_reference
+            
+            # Priority 2: Load BEV transformer if configured (fallback)
+            bev_model_path = f"models/bev/{camera_id}_bev.pth"
+            if os.path.exists(bev_model_path):
+                try:
+                    # Get input size from camera config or use default
+                    input_size = (camera.get('height', 720), camera.get('width', 1280))
                     
-                    # Load GPS reference if available
-                    if 'gps_reference' in calib_data:
-                        gps_ref = calib_data['gps_reference']
-                        self.gps_references[camera_id] = {
-                            'lat': gps_ref['lat'],
-                            'lon': gps_ref['lon']
-                        }
-                        print(f"Loaded homography for {camera_id} with GPS reference: ({gps_ref['lat']:.6f}, {gps_ref['lon']:.6f})")
-                    else:
-                        print(f"Loaded homography for {camera_id} (no GPS reference - using local meters)")
+                    self.bev_projectors[camera_id] = BEVProjector(
+                        model_path=bev_model_path,
+                        gps_reference=gps_reference,
+                        input_size=input_size
+                    )
+                    gps_msg = f"with GPS reference: ({gps_reference['lat']:.6f}, {gps_reference['lon']:.6f})" if gps_reference else "(no GPS reference - using local meters)"
+                    print(f"Loaded BEV projector for {camera_id} {gps_msg}")
+                except Exception as e:
+                    print(f"Error loading BEV projector for {camera_id}: {e}")
+                    import traceback
+                    traceback.print_exc()
             else:
-                print(f"Warning: Homography not found for {camera_id}: {calib_path}")
+                print(f"Warning: BEV model not found for {camera_id}: {bev_model_path}")
         
         # Initialize trackers for each camera
         # Use lower track threshold to match detector confidence
@@ -269,14 +352,14 @@ class TrailerVisionApp:
         def create_tracker():
             return ByteTrackWrapper(track_thresh=track_thresh)
         
-        # Get homography and GPS reference for first camera (or None) for video processing
-        test_homography = None
+        # Get BEV projector and GPS reference for first camera (or None) for video processing
+        test_bev_projector = None
         test_gps_reference = None
         cameras_list = self.config.get('cameras', [])
         if cameras_list:
             first_camera_id = cameras_list[0]['id']
-            if first_camera_id in self.homographies:
-                test_homography = self.homographies[first_camera_id]
+            if first_camera_id in self.bev_projectors:
+                test_bev_projector = self.bev_projectors[first_camera_id]
                 if first_camera_id in self.gps_references:
                     test_gps_reference = self.gps_references[first_camera_id]
         
@@ -284,20 +367,33 @@ class TrailerVisionApp:
         print(f"  - Detector: {'Available' if self.detector else 'NOT AVAILABLE'}")
         print(f"  - OCR: {'Available' if self.ocr else 'NOT AVAILABLE'}")
         print(f"  - Spot Resolver: {'Available' if self.spot_resolver else 'NOT AVAILABLE'}")
-        print(f"  - Homography: {'Available' if test_homography is not None else 'NOT AVAILABLE'}")
+        # Check for 3D projector
+        test_3d_projector = None
+        if cameras_list:
+            first_camera_id = cameras_list[0]['id']
+            if first_camera_id in self.camera_3d_projectors:
+                test_3d_projector = self.camera_3d_projectors[first_camera_id]
+        
+        print(f"  - 3D Projector: {'Available' if test_3d_projector is not None else 'NOT AVAILABLE'}")
+        print(f"  - BEV Projector: {'Available' if test_bev_projector is not None else 'NOT AVAILABLE'}")
         if test_gps_reference:
             print(f"  - GPS Reference: ({test_gps_reference['lat']:.6f}, {test_gps_reference['lon']:.6f})")
         
         try:
+            # Determine camera_id for homography loading (use first camera or "test-video")
+            test_camera_id = "test-video"
+            if cameras_list:
+                test_camera_id = cameras_list[0]['id']
+            
             self.video_processor = VideoProcessor(
                 preprocessor=self.preprocessor,
                 detector=self.detector,
                 ocr=self.ocr,
                 tracker_factory=create_tracker,
                 spot_resolver=self.spot_resolver,
-                homography=test_homography,
+                bev_projector=test_bev_projector,
                 gps_reference=test_gps_reference,
-                swap_coordinates=False  # Test shows swap is incorrect - disable it
+                camera_id=test_camera_id
             )
             print(f"[TrailerVisionApp] Video processor created successfully")
         except Exception as e:
@@ -314,9 +410,42 @@ class TrailerVisionApp:
         else:
             print(f"[TrailerVisionApp] ERROR: Metrics server not initialized!")
     
-    def _project_to_world(self, camera_id: str, x_img: float, y_img: float, return_gps: bool = True) -> Optional[tuple]:
+    def _get_gps_reference(self, camera_id: str) -> Optional[Dict[str, float]]:
         """
-        Project image coordinates to world coordinates using homography.
+        Get GPS reference point for coordinate conversion.
+        
+        Priority: Live GPS sensor > Static calibration GPS reference
+        
+        Args:
+            camera_id: Camera identifier
+            
+        Returns:
+            Dict with 'lat' and 'lon' keys, or None if no GPS reference available
+        """
+        # Priority 1: Use live GPS sensor if available and has data
+        if self.gps_sensor:
+            try:
+                current_gps = self.gps_sensor.get_current_gps()
+                if current_gps and current_gps.get('lat') and current_gps.get('lon'):
+                    return {
+                        'lat': current_gps['lat'],
+                        'lon': current_gps['lon']
+                    }
+            except Exception as e:
+                # GPS sensor error - fall back to static reference
+                pass
+        
+        # Priority 2: Fall back to static GPS reference from calibration
+        if camera_id in self.gps_references:
+            return self.gps_references[camera_id]
+        
+        return None
+    
+    def _project_to_world(self, camera_id: str, x_img: float, y_img: float, return_gps: bool = True, frame: Optional[np.ndarray] = None) -> Optional[tuple]:
+        """
+        Project image coordinates to world coordinates.
+        
+        Priority: 3D Projection > Homography > BEV Transformer
         
         Args:
             camera_id: Camera identifier
@@ -324,31 +453,54 @@ class TrailerVisionApp:
             y_img: Image Y coordinate
             return_gps: If True and GPS reference available, return GPS coordinates (lat, lon).
                        If False or no GPS reference, return local meters (x, y).
+            frame: Optional frame image (required for BEV projection, not needed for 3D/homography)
             
         Returns:
             Tuple of (lat, lon) if return_gps=True and GPS reference available,
             Tuple of (x_world, y_world) in meters otherwise,
-            or None if homography not available
+            or None if no projector available
         """
-        if camera_id not in self.homographies:
-            return None
+        # Priority 1: Use 3D projection if available
+        if camera_id in self.camera_3d_projectors:
+            try:
+                projector = self.camera_3d_projectors[camera_id]
+                x_world, y_world = projector.pixel_to_world(
+                    x_img, y_img,
+                    plane_z=0.0,  # Project to ground plane
+                    return_gps=return_gps
+                )
+                return (x_world, y_world)
+            except Exception as e:
+                print(f"Warning: 3D projection failed for {camera_id}: {e}")
+                # Fall through to other methods
         
-        H = self.homographies[camera_id]
-        # Note: When called from main_trt_demo, x_img, y_img should already be
-        # the bottom-center coordinates for ground plane projection
-        point = np.array([[x_img, y_img]], dtype=np.float32)
-        point = np.array([point])
-        
-        # Project using homography (gives local meters)
-        projected = cv2.perspectiveTransform(point, H)
-        x_world, y_world = projected[0][0]
+        # Priority 2: Use BEV transformer if available
+        if camera_id in self.bev_projectors:
+            if frame is None:
+                # Try to get latest frame from storage
+                if camera_id in self.latest_frames:
+                    frame = self.latest_frames[camera_id]
+                else:
+                    print(f"Warning: No frame available for BEV projection for camera {camera_id}")
+                    return None
+            
+            bev_projector = self.bev_projectors[camera_id]
+            
+            # Project using BEV transformer
+            x_world, y_world = bev_projector.project_to_world(
+                frame,
+                x_img,
+                y_img,
+                return_gps=False  # Get meters first, convert to GPS below if needed
+            )
         
         # Convert to GPS if requested and reference available
-        if return_gps and camera_id in self.gps_references:
-            from app.gps_utils import meters_to_gps
-            gps_ref = self.gps_references[camera_id]
-            lat, lon = meters_to_gps(x_world, y_world, gps_ref['lat'], gps_ref['lon'])
-            return (float(lat), float(lon))
+        if return_gps:
+            gps_ref = self._get_gps_reference(camera_id)
+            if gps_ref:
+                from app.gps_utils import meters_to_gps
+                lat, lon = meters_to_gps(x_world, y_world, gps_ref['lat'], gps_ref['lon'])
+                return (float(lat), float(lon))
         
         return (float(x_world), float(y_world))
     
@@ -794,11 +946,35 @@ class TrailerVisionApp:
             from app.bbox_to_image_coords_advanced import calculate_image_coords_from_bbox_with_config
             
             bbox = [float(x1), float(y1), float(x2), float(y2)]
-            ground_x, ground_y = calculate_image_coords_from_bbox_with_config(bbox)
-            image_coords = [float(ground_x), float(ground_y)]
             
-            # Get world coordinates in meters first (for spot resolution)
-            world_coords_meters = self._project_to_world(camera_id, ground_x, ground_y, return_gps=False)
+            # Priority: If 3D projector available, use its bbox_to_ground_coords method
+            # which properly accounts for trailer elevation
+            if camera_id in self.camera_3d_projectors:
+                try:
+                    x_world, y_world = self.camera_3d_projectors[camera_id].bbox_to_ground_coords(
+                        bbox,
+                        method="backside_projection",
+                        trailer_height=2.6  # Typical trailer back height in meters
+                    )
+                    world_coords_meters = (float(x_world), float(y_world))
+                    # Image coords for reference (bottom-center)
+                    center_x = (x1 + x2) / 2.0
+                    bottom_y = float(y2)
+                    image_coords = [float(center_x), float(bottom_y)]
+                except Exception as e:
+                    print(f"[TrailerVisionApp] Error in 3D bbox projection: {e}")
+                    # Fall through to standard method
+                    ground_x, ground_y = calculate_image_coords_from_bbox_with_config(bbox)
+                    image_coords = [float(ground_x), float(ground_y)]
+                    world_coords_meters = self._project_to_world(camera_id, ground_x, ground_y, return_gps=False, frame=frame)
+            else:
+                # Standard method: calculate image coords then project
+                ground_x, ground_y = calculate_image_coords_from_bbox_with_config(bbox)
+                image_coords = [float(ground_x), float(ground_y)]
+                
+                # Get world coordinates in meters first (for spot resolution)
+                # Note: frame should be available in the calling context
+                world_coords_meters = self._project_to_world(camera_id, ground_x, ground_y, return_gps=False, frame=frame)
             
             # Resolve parking spot (uses meters, same as GeoJSON)
             spot = "unknown"
@@ -810,13 +986,15 @@ class TrailerVisionApp:
                 method = spot_result['method']
             
             # Convert to GPS coordinates for output (if GPS reference available)
+            # Uses live GPS sensor if available, otherwise falls back to static calibration reference
             world_coords_gps = None
-            if world_coords_meters and camera_id in self.gps_references:
-                from app.gps_utils import meters_to_gps
-                gps_ref = self.gps_references[camera_id]
-                x_meters, y_meters = world_coords_meters
-                lat, lon = meters_to_gps(x_meters, y_meters, gps_ref['lat'], gps_ref['lon'])
-                world_coords_gps = (lat, lon)
+            if world_coords_meters:
+                gps_ref = self._get_gps_reference(camera_id)
+                if gps_ref:
+                    from app.gps_utils import meters_to_gps
+                    x_meters, y_meters = world_coords_meters
+                    lat, lon = meters_to_gps(x_meters, y_meters, gps_ref['lat'], gps_ref['lon'])
+                    world_coords_gps = (lat, lon)
             
             # Use GPS coordinates if available, otherwise use meters
             world_coords_output = world_coords_gps if world_coords_gps else world_coords_meters
@@ -1000,6 +1178,8 @@ class TrailerVisionApp:
             self.camera_captures = {}
         self.camera_captures[camera_id] = cap
         
+        frame_count = 0
+        
         # Register camera in metrics immediately so dashboard shows it
         if self.metrics_server:
             self.metrics_server.update_camera_metrics(
@@ -1009,8 +1189,6 @@ class TrailerVisionApp:
                 last_publish=datetime.utcnow(),
                 queue_depth=0
             )
-        
-        frame_count = 0
         
         try:
             for ret, frame in frame_generator(cap):
@@ -1023,6 +1201,10 @@ class TrailerVisionApp:
                 # Store latest frame for streaming (no processing)
                 with self.frame_lock:
                     self.latest_frames[camera_id] = frame.copy()
+                
+                # Write frame to video recorder if recording
+                if self.video_recorder and self.video_recorder.is_recording():
+                    self.video_recorder.write_frame(frame)
                 
                 frame_count += 1
                 
@@ -1049,10 +1231,112 @@ class TrailerVisionApp:
             cap.release()
             print(f"Closed display stream for {camera_id}")
     
+    def start_recording(self, camera_id: str = None) -> Dict:
+        """
+        Start video recording with GPS logging.
+        
+        Args:
+            camera_id: Camera ID to record (uses first camera if None)
+            
+        Returns:
+            Dict with 'success', 'message', and optional 'video_path', 'gps_log_path'
+        """
+        if not self.video_recorder:
+            return {
+                'success': False,
+                'message': 'Video recorder not initialized'
+            }
+        
+        if self.video_recorder.is_recording():
+            return {
+                'success': False,
+                'message': 'Already recording. Stop current recording first.'
+            }
+        
+        # Get camera config
+        cameras = self.config.get('cameras', [])
+        if not cameras:
+            return {
+                'success': False,
+                'message': 'No cameras configured'
+            }
+        
+        # Use specified camera or first camera
+        camera = None
+        if camera_id:
+            camera = next((c for c in cameras if c['id'] == camera_id), None)
+            if not camera:
+                return {
+                    'success': False,
+                    'message': f'Camera {camera_id} not found'
+                }
+        else:
+            camera = cameras[0]
+        
+        camera_id = camera['id']
+        width = camera.get('width', 1920)
+        height = camera.get('height', 1080)
+        fps = camera.get('fps_cap', 30)
+        
+        # Start recording
+        success = self.video_recorder.start_recording(camera_id, width, height, fps)
+        
+        if success:
+            return {
+                'success': True,
+                'message': f'Recording started for camera {camera_id}',
+                'camera_id': camera_id
+            }
+        else:
+            return {
+                'success': False,
+                'message': 'Failed to start recording'
+            }
+    
+    def stop_recording(self) -> Dict:
+        """
+        Stop video recording and return paths.
+        
+        Returns:
+            Dict with 'success', 'message', 'video_path', 'gps_log_path'
+        """
+        if not self.video_recorder:
+            return {
+                'success': False,
+                'message': 'Video recorder not initialized'
+            }
+        
+        if not self.video_recorder.is_recording():
+            return {
+                'success': False,
+                'message': 'Not currently recording'
+            }
+        
+        video_path, gps_log_path = self.video_recorder.stop_recording()
+        
+        return {
+            'success': True,
+            'message': 'Recording stopped',
+            'video_path': video_path,
+            'gps_log_path': gps_log_path
+        }
+    
+    def is_recording(self) -> bool:
+        """Check if currently recording."""
+        return self.video_recorder.is_recording() if self.video_recorder else False
+    
     def stop(self):
         """Stop the application and cleanup."""
         print("Stopping application...")
         self.running = False
+        
+        # Stop recording if active
+        if self.video_recorder and self.video_recorder.is_recording():
+            self.video_recorder.stop_recording()
+        
+        # Stop GPS sensor
+        if self.gps_sensor:
+            self.gps_sensor.stop()
         
         # Stop publishers
         if self.publisher:
