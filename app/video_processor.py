@@ -273,6 +273,27 @@ class VideoProcessor:
             # Reset OCR results tracking
             self.track_ocr_results = {}  # track_key -> list of {text, conf, frame}
             
+            # CRITICAL: Reset GPS timing variables for new video
+            # This prevents timing data from previous video from persisting
+            if hasattr(self, '_video_start_time'):
+                delattr(self, '_video_start_time')
+            if hasattr(self, '_video_end_time'):
+                delattr(self, '_video_end_time')
+            if hasattr(self, '_total_frames'):
+                delattr(self, '_total_frames')
+            if hasattr(self, '_gps_log_duration'):
+                delattr(self, '_gps_log_duration')
+            
+            # Track centered detection statistics
+            self.centered_detection_stats = {
+                'vehicles_detected': 0,
+                'vehicles_centered': 0,
+                'rejected_not_centered': 0,
+                'rejected_too_small': 0,
+                'rejected_aspect_ratio': 0,
+                'rejected_clipped': 0
+            }
+            
             # Two-stage processing: Initialize crop saving
             import os
             from pathlib import Path
@@ -731,40 +752,47 @@ class VideoProcessor:
                         bottom_y = float(orig_y2)
                         image_coords = [float(center_x), float(bottom_y)]
                         
-                        # Initialize video start time and calculate actual FPS from GPS log duration
-                        # This ensures frame timestamps align correctly with GPS log time range
+                        # Initialize video timing parameters from GPS log
+                        # Uses direct proportion method: timestamp = start + (frame / total_frames) × duration
                         if self.gps_log and not hasattr(self, '_video_start_time'):
                             try:
                                 first_timestamp = min(self.gps_log.keys())
                                 last_timestamp = max(self.gps_log.keys())
                                 self._video_start_time = datetime.fromisoformat(first_timestamp.replace('Z', '+00:00'))
-                                last_ts = datetime.fromisoformat(last_timestamp.replace('Z', '+00:00'))
+                                self._video_end_time = datetime.fromisoformat(last_timestamp.replace('Z', '+00:00'))
                                 
-                                # Calculate GPS log duration
-                                gps_log_duration_seconds = (last_ts - self._video_start_time).total_seconds()
+                                # Get total frames from video
+                                self._total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
                                 
-                                # Calculate actual FPS based on video frames and GPS log duration
-                                total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-                                if gps_log_duration_seconds > 0 and total_frames > 0:
-                                    self._actual_fps = total_frames / gps_log_duration_seconds
-                                    print(f"[VideoProcessor] Using GPS log start time: {self._video_start_time}")
-                                    print(f"[VideoProcessor] GPS log duration: {gps_log_duration_seconds:.2f} seconds")
-                                    print(f"[VideoProcessor] Calculated actual FPS from GPS log: {self._actual_fps:.2f} (video has {total_frames} frames)")
+                                # Calculate GPS log duration (total time span)
+                                self._gps_log_duration = (self._video_end_time - self._video_start_time).total_seconds()
+                                
+                                if self._gps_log_duration > 0 and self._total_frames > 0:
+                                    # Calculate FPS for logging/reference only
+                                    calculated_fps = self._total_frames / self._gps_log_duration
+                                    print(f"[VideoProcessor] Video timing initialized:")
+                                    print(f"[VideoProcessor]   Start: {self._video_start_time}")
+                                    print(f"[VideoProcessor]   End: {self._video_end_time}")
+                                    print(f"[VideoProcessor]   Duration: {self._gps_log_duration:.2f} seconds")
+                                    print(f"[VideoProcessor]   Total frames: {int(self._total_frames)}")
+                                    print(f"[VideoProcessor]   Calculated FPS: {calculated_fps:.2f}")
                                 else:
-                                    # Fallback to video metadata FPS
-                                    fps = cap.get(cv2.CAP_PROP_FPS)
-                                    self._actual_fps = fps if fps > 0 else 30.0
-                                    print(f"[VideoProcessor] Using GPS log start time: {self._video_start_time}")
-                                    print(f"[VideoProcessor] Using video metadata FPS: {self._actual_fps:.2f}")
+                                    # Fallback to video metadata
+                                    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+                                    self._gps_log_duration = self._total_frames / fps
+                                    print(f"[VideoProcessor] Using video metadata:")
+                                    print(f"[VideoProcessor]   Start: {self._video_start_time}")
+                                    print(f"[VideoProcessor]   Frames: {int(self._total_frames)}")
+                                    print(f"[VideoProcessor]   Duration: {self._gps_log_duration:.2f} seconds (estimated)")
                             except Exception as e:
-                                # Fallback: use current time minus video duration
-                                fps = cap.get(cv2.CAP_PROP_FPS)
-                                total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-                                video_duration_seconds = total_frames / fps if fps > 0 else 0
-                                self._video_start_time = datetime.utcnow() - timedelta(seconds=video_duration_seconds)
-                                self._actual_fps = fps if fps > 0 else 30.0
-                                print(f"[VideoProcessor] Estimated video start time: {self._video_start_time}")
-                                print(f"[VideoProcessor] Using fallback FPS: {self._actual_fps:.2f}")
+                                # Fallback: estimate from video metadata
+                                fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+                                self._total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+                                self._gps_log_duration = self._total_frames / fps
+                                self._video_start_time = datetime.utcnow() - timedelta(seconds=self._gps_log_duration)
+                                print(f"[VideoProcessor] Fallback timing (estimated):")
+                                print(f"[VideoProcessor]   Start: {self._video_start_time}")
+                                print(f"[VideoProcessor]   Duration: {self._gps_log_duration:.2f} seconds")
                         
                         # Note: Spot resolution requires world coordinates in meters
                         # Since we're using GPS from log (camera position), we can't resolve spots
@@ -836,6 +864,8 @@ class VideoProcessor:
                             # Check crop size requirements
                             if width < MIN_CROP_WIDTH or height < MIN_CROP_HEIGHT or (width * height) < MIN_CROP_AREA:
                                 should_save_crop = False
+                                with self.lock:
+                                    self.centered_detection_stats['rejected_too_small'] += 1
                                 if frame_count % 30 == 0:
                                     print(f"[VideoProcessor] Frame {frame_count}: Skipping crop for {track_key} (track_id={track_id}) - crop too small ({width}x{height}, area={width*height}) - need at least {MIN_CROP_WIDTH}x{MIN_CROP_HEIGHT} (area={MIN_CROP_AREA})")
                             
@@ -867,10 +897,14 @@ class VideoProcessor:
                                 
                                 if visible_ratio < MIN_VISIBLE_RATIO or width_ratio < MIN_VISIBLE_RATIO or height_ratio < MIN_VISIBLE_RATIO:
                                     should_save_crop = False
+                                    with self.lock:
+                                        self.centered_detection_stats['rejected_clipped'] += 1
                                     if frame_count % 30 == 0:
                                         print(f"[VideoProcessor] Frame {frame_count}: Skipping crop for {track_key} (track_id={track_id}) - crop is partially clipped (visible={visible_ratio:.1%}, width={width_ratio:.1%}, height={height_ratio:.1%}, original={original_width}x{original_height}, crop={crop_width}x{crop_height})")
                                 elif aspect_ratio > MAX_ASPECT_RATIO:
                                     should_save_crop = False
+                                    with self.lock:
+                                        self.centered_detection_stats['rejected_aspect_ratio'] += 1
                                     if frame_count % 30 == 0:
                                         print(f"[VideoProcessor] Frame {frame_count}: Skipping crop for {track_key} (track_id={track_id}) - crop is too wide (aspect={aspect_ratio:.2f} > {MAX_ASPECT_RATIO}, size={crop_width}x{crop_height}) - likely placard or partial view")
                         
@@ -878,6 +912,10 @@ class VideoProcessor:
                         # This ensures GPS coordinates are captured at the most accurate moment
                         is_centered = False
                         if should_save_crop:
+                            # Track that a valid vehicle was detected (passed size/aspect filters)
+                            with self.lock:
+                                self.centered_detection_stats['vehicles_detected'] += 1
+                            
                             # Calculate bounding box center
                             bbox_center_x = (orig_x1 + orig_x2) / 2
                             bbox_center_y = (orig_y1 + orig_y2) / 2
@@ -887,10 +925,10 @@ class VideoProcessor:
                             frame_center_y = frame_height / 2
                             
                             # Define tolerance (in pixels) for centered detection
-                            # Horizontal tolerance: 15% of frame width (more lenient for horizontal movement)
-                            # Vertical tolerance: 20% of frame height (more lenient for vertical since vehicles pass through quickly)
-                            horizontal_threshold = frame_width * 0.15
-                            vertical_threshold = frame_height * 0.20
+                            # Horizontal tolerance: 30% of frame width (captures vehicles in left/right lanes)
+                            # Vertical tolerance: 30% of frame height (captures vehicles throughout the driving zone)
+                            horizontal_threshold = frame_width * 0.30
+                            vertical_threshold = frame_height * 0.30
                             
                             # Check if vehicle is centered (within tolerance)
                             horizontal_distance = abs(bbox_center_x - frame_center_x)
@@ -902,6 +940,8 @@ class VideoProcessor:
                             
                             if not is_centered:
                                 should_save_crop = False
+                                with self.lock:
+                                    self.centered_detection_stats['rejected_not_centered'] += 1
                                 if frame_count % 30 == 0:
                                     print(f"[VideoProcessor] Frame {frame_count}: Skipping crop for {track_key} (track_id={track_id}) - vehicle not centered " +
                                           f"(bbox_center=[{bbox_center_x:.1f}, {bbox_center_y:.1f}], " +
@@ -911,6 +951,8 @@ class VideoProcessor:
                             else:
                                 # Vehicle is centered - add to centered tracks set for visual highlighting
                                 centered_track_ids.add(track_id)
+                                with self.lock:
+                                    self.centered_detection_stats['vehicles_centered'] += 1
                                 if frame_count % 30 == 0:
                                     print(f"[VideoProcessor] Frame {frame_count}: Vehicle centered for {track_key} (track_id={track_id}) " +
                                           f"(bbox_center=[{bbox_center_x:.1f}, {bbox_center_y:.1f}], " +
@@ -985,52 +1027,64 @@ class VideoProcessor:
                                     try:
                                         from app.gps_sensor import get_gps_for_timestamp
                                         
-                                        # Ensure video start time and actual FPS are initialized
-                                        if not hasattr(self, '_video_start_time') or not hasattr(self, '_actual_fps'):
+                                        # Ensure video timing parameters are initialized
+                                        if not hasattr(self, '_video_start_time') or not hasattr(self, '_total_frames') or not hasattr(self, '_gps_log_duration'):
                                             first_timestamp = min(self.gps_log.keys())
                                             last_timestamp = max(self.gps_log.keys())
                                             try:
                                                 self._video_start_time = datetime.fromisoformat(first_timestamp.replace('Z', '+00:00'))
-                                                last_ts = datetime.fromisoformat(last_timestamp.replace('Z', '+00:00'))
+                                                self._video_end_time = datetime.fromisoformat(last_timestamp.replace('Z', '+00:00'))
                                                 
-                                                # Calculate GPS log duration
-                                                gps_log_duration_seconds = (last_ts - self._video_start_time).total_seconds()
+                                                # Get total frames from video
+                                                self._total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
                                                 
-                                                # Calculate actual FPS based on video frames and GPS log duration
-                                                total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-                                                if gps_log_duration_seconds > 0 and total_frames > 0:
-                                                    self._actual_fps = total_frames / gps_log_duration_seconds
-                                                    print(f"[VideoProcessor] Using GPS log start time: {self._video_start_time}")
-                                                    print(f"[VideoProcessor] GPS log duration: {gps_log_duration_seconds:.2f} seconds")
-                                                    print(f"[VideoProcessor] Calculated actual FPS from GPS log: {self._actual_fps:.2f} (video has {total_frames} frames)")
+                                                # Calculate GPS log duration (time span of GPS recordings)
+                                                self._gps_log_duration = (self._video_end_time - self._video_start_time).total_seconds()
+                                                
+                                                if self._gps_log_duration > 0 and self._total_frames > 0:
+                                                    # Calculate FPS for logging purposes only
+                                                    calculated_fps = self._total_frames / self._gps_log_duration
+                                                    print(f"[VideoProcessor] Video timing initialized:")
+                                                    print(f"[VideoProcessor]   Start time: {self._video_start_time}")
+                                                    print(f"[VideoProcessor]   End time: {self._video_end_time}")
+                                                    print(f"[VideoProcessor]   Duration: {self._gps_log_duration:.2f} seconds")
+                                                    print(f"[VideoProcessor]   Total frames: {int(self._total_frames)}")
+                                                    print(f"[VideoProcessor]   Calculated FPS: {calculated_fps:.2f}")
                                                 else:
-                                                    # Fallback to video metadata FPS
+                                                    # Fallback to video metadata
                                                     fps = cap.get(cv2.CAP_PROP_FPS)
-                                                    self._actual_fps = fps if fps > 0 else 30.0
-                                                    print(f"[VideoProcessor] Using GPS log start time: {self._video_start_time}")
-                                                    print(f"[VideoProcessor] Using video metadata FPS: {self._actual_fps:.2f}")
+                                                    self._gps_log_duration = self._total_frames / fps if fps > 0 else self._total_frames / 30.0
+                                                    print(f"[VideoProcessor] Using video metadata:")
+                                                    print(f"[VideoProcessor]   Start time: {self._video_start_time}")
+                                                    print(f"[VideoProcessor]   Total frames: {int(self._total_frames)}")
+                                                    print(f"[VideoProcessor]   Estimated duration: {self._gps_log_duration:.2f} seconds")
+                                                    print(f"[VideoProcessor]   Video FPS: {fps:.2f}")
                                             except Exception as e:
                                                 # Fallback: use current time minus video duration
-                                                fps = cap.get(cv2.CAP_PROP_FPS)
-                                                total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-                                                video_duration_seconds = total_frames / fps if fps > 0 else 0
-                                                self._video_start_time = datetime.utcnow() - timedelta(seconds=video_duration_seconds)
-                                                self._actual_fps = fps if fps > 0 else 30.0
-                                                print(f"[VideoProcessor] Estimated video start time: {self._video_start_time}")
-                                                print(f"[VideoProcessor] Using fallback FPS: {self._actual_fps:.2f}")
+                                                fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+                                                self._total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+                                                self._gps_log_duration = self._total_frames / fps
+                                                self._video_start_time = datetime.utcnow() - timedelta(seconds=self._gps_log_duration)
+                                                print(f"[VideoProcessor] Fallback timing estimation:")
+                                                print(f"[VideoProcessor]   Estimated start time: {self._video_start_time}")
+                                                print(f"[VideoProcessor]   Duration: {self._gps_log_duration:.2f} seconds")
+                                                print(f"[VideoProcessor]   FPS: {fps:.2f}")
                                         
-                                        # Calculate frame timestamp based on frame number and actual FPS (more reliable than CAP_PROP_POS_MSEC)
-                                        # Formula: frame_timestamp = video_start_time + (frame_count / actual_fps)
-                                        frame_timestamp_ms = (frame_count / self._actual_fps) * 1000.0
+                                        # Calculate frame timestamp using direct proportion method
+                                        # Formula: timestamp = start_time + (frame_count / total_frames) × total_duration
+                                        # This directly calculates what fraction of the video we're at
+                                        frame_progress = frame_count / self._total_frames  # Fraction of video completed (0.0 to 1.0)
+                                        elapsed_seconds = frame_progress * self._gps_log_duration
                                         
                                         # Calculate exact frame timestamp for this crop moment
-                                        frame_timestamp = self._video_start_time + timedelta(milliseconds=frame_timestamp_ms)
+                                        frame_timestamp = self._video_start_time + timedelta(seconds=elapsed_seconds)
                                         
                                         # Get GPS for THIS SPECIFIC FRAME when crop is saved
+                                        # Uses 0.2s tolerance and selects LATEST timestamp within range
                                         frame_gps = get_gps_for_timestamp(
                                             self.gps_log,
                                             frame_timestamp,
-                                            tolerance_seconds=2.0
+                                            tolerance_seconds=0.7
                                         )
                                         
                                         if frame_gps and 'lat' in frame_gps and 'lon' in frame_gps:
@@ -1224,15 +1278,78 @@ class VideoProcessor:
                 self._cleanup_merged_crops()
             
             # Save crop metadata to JSON file for batch OCR processing
-            if self.save_crops and len(self.saved_crops) > 0:
+            if self.save_crops:
                 # GPS coordinates are already included in crop metadata from GPS log file
                 import json
                 metadata_path = self.crops_dir / "crops_metadata.json"
-                with open(metadata_path, 'w') as f:
-                    json.dump(self.saved_crops, f, indent=2)
-                print(f"[VideoProcessor] Saved {len(self.saved_crops)} crop metadata to {metadata_path}")
-                print(f"[VideoProcessor] Crops directory: {self.crops_dir}")
-                print(f"[VideoProcessor] Ready for batch OCR processing")
+                
+                if len(self.saved_crops) > 0:
+                    with open(metadata_path, 'w') as f:
+                        json.dump(self.saved_crops, f, indent=2)
+                    
+                    with self.lock:
+                        stats = self.centered_detection_stats.copy()
+                    
+                    print(f"[VideoProcessor] ✓ Saved {len(self.saved_crops)} crop metadata to {metadata_path}")
+                    print(f"[VideoProcessor] ")
+                    print(f"[VideoProcessor] Centered Detection Summary:")
+                    print(f"[VideoProcessor]   Vehicles detected (after filters): {stats['vehicles_detected']}")
+                    print(f"[VideoProcessor]   Vehicles centered & saved: {stats['vehicles_centered']} ✓")
+                    print(f"[VideoProcessor]   Rejected - not centered: {stats['rejected_not_centered']}")
+                    print(f"[VideoProcessor]   Rejected - too small: {stats['rejected_too_small']}")
+                    print(f"[VideoProcessor]   Rejected - aspect ratio: {stats['rejected_aspect_ratio']}")
+                    print(f"[VideoProcessor]   Rejected - clipped: {stats['rejected_clipped']}")
+                    if stats['vehicles_centered'] > 0:
+                        capture_rate = (stats['vehicles_centered'] / stats['vehicles_detected'] * 100) if stats['vehicles_detected'] > 0 else 0
+                        print(f"[VideoProcessor]   Capture rate: {capture_rate:.1f}% of detected vehicles")
+                    print(f"[VideoProcessor] ")
+                    print(f"[VideoProcessor] Crops directory: {self.crops_dir}")
+                    print(f"[VideoProcessor] Ready for batch OCR processing")
+                else:
+                    # Save empty metadata with explanation when no crops were saved
+                    empty_metadata = {
+                        "info": "No crops saved - no vehicles were detected as centered in the frame",
+                        "reason": "Vehicles must be within tolerance of frame center to trigger GPS capture",
+                        "tolerance_horizontal": "15% of frame width",
+                        "tolerance_vertical": "20% of frame height",
+                        "suggestion": "Increase tolerance if vehicles are passing through but not being captured",
+                        "crops": []
+                    }
+                    with open(metadata_path, 'w') as f:
+                        json.dump(empty_metadata, f, indent=2)
+                    
+                    with self.lock:
+                        total_detections = self.stats.get('detections', 0)
+                        total_tracks = self.stats.get('tracks', 0)
+                        stats = self.centered_detection_stats.copy()
+                    
+                    print(f"[VideoProcessor] ⚠️  WARNING: No crops saved for this video!")
+                    print(f"[VideoProcessor] Reason: No vehicles were detected as centered in the frame")
+                    print(f"[VideoProcessor] ")
+                    print(f"[VideoProcessor] Processing Summary:")
+                    print(f"[VideoProcessor]   Total frames: {frame_count}")
+                    print(f"[VideoProcessor]   Total detections: {total_detections}")
+                    print(f"[VideoProcessor]   Total tracks: {total_tracks}")
+                    print(f"[VideoProcessor] ")
+                    print(f"[VideoProcessor] Centered Detection Stats:")
+                    print(f"[VideoProcessor]   Vehicles detected (after filters): {stats['vehicles_detected']}")
+                    print(f"[VideoProcessor]   Vehicles centered: {stats['vehicles_centered']} ✓")
+                    print(f"[VideoProcessor]   Rejected - not centered: {stats['rejected_not_centered']}")
+                    print(f"[VideoProcessor]   Rejected - too small: {stats['rejected_too_small']}")
+                    print(f"[VideoProcessor]   Rejected - aspect ratio: {stats['rejected_aspect_ratio']}")
+                    print(f"[VideoProcessor]   Rejected - clipped: {stats['rejected_clipped']}")
+                    print(f"[VideoProcessor] ")
+                    print(f"[VideoProcessor] Current tolerance settings:")
+                    print(f"[VideoProcessor]   Horizontal: 15% of frame width = {int(frame_width*0.15)}px")
+                    print(f"[VideoProcessor]   Vertical: 20% of frame height = {int(frame_height*0.20)}px")
+                    print(f"[VideoProcessor] ")
+                    print(f"[VideoProcessor] Suggestions:")
+                    print(f"[VideoProcessor]   - If vehicles are passing through but not being captured,")
+                    print(f"[VideoProcessor]     increase tolerance in video_processor.py (line ~920)")
+                    print(f"[VideoProcessor]   - Try: horizontal_threshold = frame_width * 0.25")
+                    print(f"[VideoProcessor]   - Try: vertical_threshold = frame_height * 0.30")
+                    print(f"[VideoProcessor] ")
+                    print(f"[VideoProcessor] Empty metadata saved to: {metadata_path}")
             
             with self.lock:
                 final_stats = self.stats.copy()
@@ -1836,19 +1953,24 @@ class VideoProcessor:
                                                             crop_speed = event.get('speed')
                                                     else:
                                                         # Fallback: retrieve GPS from log file for this frame
-                                                        # Calculate frame timestamp
+                                                        # Calculate frame timestamp using direct proportion method
                                                         if hasattr(self, '_video_start_time'):
-                                                            # Get frame timestamp in milliseconds (approximate based on frame number)
+                                                            # Use direct proportion: timestamp = start + (frame / total_frames) × duration
                                                             # This is a fallback, ideally GPS should be in the event
-                                                            # Use actual FPS if available, otherwise fallback to 30 fps
-                                                            actual_fps = getattr(self, '_actual_fps', 30.0)
-                                                            frame_timestamp_ms = (frame_num / actual_fps) * 1000.0
-                                                            frame_timestamp = self._video_start_time + timedelta(milliseconds=frame_timestamp_ms)
+                                                            if hasattr(self, '_total_frames') and hasattr(self, '_gps_log_duration'):
+                                                                frame_progress = frame_num / self._total_frames
+                                                                elapsed_seconds = frame_progress * self._gps_log_duration
+                                                                frame_timestamp = self._video_start_time + timedelta(seconds=elapsed_seconds)
+                                                            else:
+                                                                # Ultimate fallback: estimate with 30 FPS
+                                                                frame_timestamp_ms = (frame_num / 30.0) * 1000.0
+                                                                frame_timestamp = self._video_start_time + timedelta(milliseconds=frame_timestamp_ms)
                                                             
+                                                            # Uses 0.2s tolerance and selects LATEST timestamp within range
                                                             frame_gps = get_gps_for_timestamp(
                                                                 self.gps_log,
                                                                 frame_timestamp,
-                                                                tolerance_seconds=2.0
+                                                                tolerance_seconds=0.7
                                                             )
                                                             
                                                             if frame_gps:

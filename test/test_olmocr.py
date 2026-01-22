@@ -8,15 +8,10 @@ Usage:
     python3 test_olmocr.py [image_path]
 """
 
-import sys
-import os
-from pathlib import Path
-
-# Add parent directory to path to import app modules
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-
 from app.ocr.olmocr_recognizer import OlmOCRRecognizer
 import cv2
+import sys
+import os
 import gc
 
 # Try to import torch for GPU memory management
@@ -93,9 +88,9 @@ def main():
     
     try:
         ocr = OlmOCRRecognizer(
-            model_name="Qwen/Qwen3-VL-4B-Instruct",  # Best OCR, good balance
+            # model_name="Qwen/Qwen3-VL-4B-Instruct",  # Best OCR, good balance
             # Alternative for less memory:
-            # model_name="Qwen/Qwen3-VL-4B-Instruct-FP8",  # Quantized version
+            model_name="Qwen/Qwen3-VL-4B-Instruct-FP8",  # Quantized version
             # Older options:
             # model_name="Qwen/Qwen2.5-VL-7B-Instruct",  # Larger, more memory
             # model_name="Qwen/Qwen2.5-VL-3B-Instruct",  # Smaller, less memory

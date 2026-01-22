@@ -429,15 +429,15 @@ def load_gps_log(gps_log_path: str) -> Dict[str, Dict]:
 
 
 def get_gps_for_timestamp(gps_log: Dict[str, Dict], target_timestamp: datetime, 
-                         tolerance_seconds: float = 0.1) -> Optional[Dict[str, float]]:
+                         tolerance_seconds: float = 0.2) -> Optional[Dict[str, float]]:
     """
     Get GPS coordinate for a specific timestamp from GPS log.
-    Finds the closest GPS reading within tolerance.
+    Finds the LATEST GPS reading within tolerance range.
     
     Args:
         gps_log: GPS log dict from load_gps_log()
         target_timestamp: Target timestamp
-        tolerance_seconds: Maximum time difference in seconds (default: 2.0)
+        tolerance_seconds: Maximum time difference in seconds (default: 0.2)
         
     Returns:
         Dict with 'lat', 'lon', 'heading' (optional), and 'speed' (optional) keys, or None if not found
@@ -447,9 +447,8 @@ def get_gps_for_timestamp(gps_log: Dict[str, Dict], target_timestamp: datetime,
     
     target_ts = target_timestamp
     
-    # Find closest timestamp
-    closest_key = None
-    min_diff = float('inf')
+    # Find all timestamps within tolerance, then select the latest one
+    candidates = []
     
     for ts_str in gps_log.keys():
         try:
@@ -457,20 +456,26 @@ def get_gps_for_timestamp(gps_log: Dict[str, Dict], target_timestamp: datetime,
             ts_str_clean = ts_str.replace('Z', '+00:00')
             ts = datetime.fromisoformat(ts_str_clean)
             diff = abs((ts - target_ts).total_seconds())
-            if diff < min_diff:
-                min_diff = diff
-                closest_key = ts_str
+            
+            # Collect all GPS entries within tolerance
+            if diff <= tolerance_seconds:
+                candidates.append((ts, ts_str, diff))
         except (ValueError, TypeError) as e:
             # Skip invalid timestamps
             continue
     
-    if closest_key and min_diff <= tolerance_seconds:
-        gps_data = gps_log[closest_key]
+    # If we have candidates, select the one with the LATEST timestamp
+    if candidates:
+        # Sort by timestamp (descending) to get latest first
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        latest_ts, latest_key, latest_diff = candidates[0]
+        
+        gps_data = gps_log[latest_key]
         if gps_data and 'lat' in gps_data and 'lon' in gps_data:
             result = {
                 'lat': gps_data.get('lat'),
                 'lon': gps_data.get('lon'),
-                'timestamp': datetime.fromisoformat(closest_key.replace('Z', '+00:00'))
+                'timestamp': latest_ts
             }
             # Include heading and speed if available in log
             if 'heading' in gps_data:
