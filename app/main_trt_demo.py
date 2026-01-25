@@ -52,6 +52,7 @@ from app.video_processor import VideoProcessor
 from app.image_preprocessing import ImagePreprocessor
 from app.gps_sensor import GPSSensor
 from app.video_recorder import VideoRecorder
+from app.processing_queue import ProcessingQueueManager
 import requests
 
 
@@ -81,6 +82,7 @@ class TrailerVisionApp:
         self.uploader = None
         self.metrics_server = None
         self.preprocessor = None
+        self.processing_queue = None  # Processing queue manager for automated workflow
         
         # Per-camera trackers and BEV projectors
         self.trackers = {}
@@ -112,6 +114,10 @@ class TrailerVisionApp:
         # GPS sensor and video recorder
         self.gps_sensor = None
         self.video_recorder = None
+        
+        # Graceful shutdown state tracking
+        self.recording_stopped = False  # True when recording stopped but processing continues
+        self.shutdown_lock = threading.Lock()  # Lock for thread-safe state access
         
         self._initialize_components()
     
@@ -236,12 +242,15 @@ class TrailerVisionApp:
             print(f"[TrailerVisionApp] Failed to initialize GPS sensor: {e}")
             self.gps_sensor = None
         
-        # Initialize video recorder
+        # Initialize video recorder with 45-second auto-chunking
+        # Callback will be set after processing queue is initialized
         self.video_recorder = VideoRecorder(
             output_dir="out/recordings",
-            gps_sensor=self.gps_sensor
+            gps_sensor=self.gps_sensor,
+            chunk_duration_seconds=45.0,  # 45-second chunks
+            on_chunk_saved=None  # Will be set after processing queue initialization
         )
-        print(f"[TrailerVisionApp] Video recorder initialized")
+        print(f"[TrailerVisionApp] Video recorder initialized with 45-second auto-chunking")
         
         # Initialize image preprocessor
         # IMPORTANT: Disable rotation for oLmOCR and EasyOCR because they handle rotation internally.
@@ -409,6 +418,140 @@ class TrailerVisionApp:
             print(f"[TrailerVisionApp] Video processor assigned to metrics server: {self.metrics_server.video_processor is not None}")
         else:
             print(f"[TrailerVisionApp] ERROR: Metrics server not initialized!")
+        
+        # Processing queue will be initialized when Start Application is called
+        # This allows lazy loading of OCR to save memory until needed
+        self.processing_queue = None
+        print(f"[TrailerVisionApp] Processing queue will be initialized when application starts")
+    
+    def initialize_assets(self):
+        """
+        Initialize all assets required for automated processing.
+        This includes OCR model loading and processing queue setup.
+        
+        Returns:
+            Dict with 'success', 'message', and 'assets_loaded' status
+        """
+        assets_loaded = {
+            'detector': self.detector is not None,
+            'ocr': self.ocr is not None,
+            'video_processor': self.video_processor is not None,
+            'processing_queue': self.processing_queue is not None
+        }
+        
+        try:
+            # 1. Check detector
+            if not self.detector:
+                return {
+                    'success': False,
+                    'message': 'Detector not available. Please check model files.',
+                    'assets_loaded': assets_loaded
+                }
+            
+            # 2. Load OCR if not already loaded
+            if self.ocr is None:
+                print(f"[TrailerVisionApp] Loading OCR for automated processing...")
+                self._initialize_ocr()
+                assets_loaded['ocr'] = self.ocr is not None
+            
+            if not self.ocr:
+                return {
+                    'success': False,
+                    'message': 'OCR model failed to load. Please check OCR model files.',
+                    'assets_loaded': assets_loaded
+                }
+            
+            # 3. Ensure video processor is available
+            if not self.video_processor:
+                return {
+                    'success': False,
+                    'message': 'Video processor not available.',
+                    'assets_loaded': assets_loaded
+                }
+            
+            # 4. Initialize processing queue if not already initialized
+            if self.processing_queue is None:
+                print(f"[TrailerVisionApp] Initializing processing queue...")
+                
+                # Define callbacks for extensibility
+                def on_video_complete(video_path, crops_dir, results):
+                    """Called when video processing completes."""
+                    print(f"[TrailerVisionApp] Video processing complete: {Path(video_path).name}")
+                    print(f"  - Crops directory: {crops_dir}")
+                    # Extensibility point: Add server upload or other processing here
+                    if results:
+                        self.upload_to_server(video_path, crops_dir, {'type': 'video_processing', 'results': results})
+                
+                def on_ocr_complete(video_path, crops_dir, ocr_results):
+                    """Called when OCR processing completes."""
+                    print(f"[TrailerVisionApp] OCR processing complete: {Path(video_path).name}")
+                    print(f"  - Processed {len(ocr_results)} crops with OCR")
+                    # Extensibility point: Add server upload here
+                    self.upload_to_server(video_path, crops_dir, {'type': 'ocr_complete', 'ocr_results': ocr_results})
+                
+                try:
+                    self.processing_queue = ProcessingQueueManager(
+                        video_processor=self.video_processor,
+                        ocr=self.ocr,
+                        preprocessor=self.preprocessor,
+                        on_video_complete=on_video_complete,
+                        on_ocr_complete=on_ocr_complete
+                    )
+                    print(f"[TrailerVisionApp] Processing queue manager initialized")
+                    assets_loaded['processing_queue'] = True
+                    
+                    # Set up video recorder callback for auto-processing
+                    def on_chunk_saved(video_path, gps_log_path):
+                        """Called when a video chunk is saved."""
+                        # Extract camera_id from video path
+                        video_name = Path(video_path).stem
+                        # Format: camera_id_timestamp_chunkXXXX
+                        parts = video_name.split('_')
+                        camera_id = parts[0] if parts else "unknown"
+                        
+                        print(f"[TrailerVisionApp] Chunk saved: {Path(video_path).name}")
+                        print(f"  - Queueing for processing...")
+                        
+                        # Queue video processing
+                        if self.processing_queue:
+                            self.processing_queue.queue_video_processing(
+                                video_path=video_path,
+                                camera_id=camera_id,
+                                gps_log_path=gps_log_path,
+                                detect_every_n=5,
+                                detection_mode='trailer'
+                            )
+                    
+                    # Update video recorder with callback
+                    self.video_recorder.on_chunk_saved = on_chunk_saved
+                    print(f"[TrailerVisionApp] Video recorder callback configured for auto-processing")
+                    
+                except Exception as e:
+                    print(f"[TrailerVisionApp] ERROR: Failed to initialize processing queue: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    return {
+                        'success': False,
+                        'message': f'Failed to initialize processing queue: {str(e)}',
+                        'assets_loaded': assets_loaded
+                    }
+            
+            # All assets loaded successfully
+            return {
+                'success': True,
+                'message': 'All assets initialized successfully',
+                'assets_loaded': assets_loaded
+            }
+            
+        except Exception as e:
+            print(f"[TrailerVisionApp] ERROR: Failed to initialize assets: {e}")
+            import traceback
+            traceback.print_exc()
+            return {
+                'success': False,
+                'message': f'Failed to initialize assets: {str(e)}',
+                'assets_loaded': assets_loaded
+            }
     
     def _get_gps_reference(self, camera_id: str) -> Optional[Dict[str, float]]:
         """
@@ -1295,10 +1438,11 @@ class TrailerVisionApp:
     
     def stop_recording(self) -> Dict:
         """
-        Stop video recording and return paths.
+        Stop video recording but continue processing remaining videos.
+        Recording stops immediately, but video processing and OCR continue in background.
         
         Returns:
-            Dict with 'success', 'message', 'video_path', 'gps_log_path'
+            Dict with 'success', 'message', 'video_path', 'gps_log_path', 'processing_ongoing'
         """
         if not self.video_recorder:
             return {
@@ -1306,24 +1450,114 @@ class TrailerVisionApp:
                 'message': 'Video recorder not initialized'
             }
         
+        with self.shutdown_lock:
+            if self.recording_stopped:
+                # Already stopped, check if processing is still ongoing
+                is_processing = self.is_processing_ongoing()
+                return {
+                    'success': True,
+                    'message': 'Recording already stopped',
+                    'processing_ongoing': is_processing
+                }
+        
         if not self.video_recorder.is_recording():
             return {
                 'success': False,
                 'message': 'Not currently recording'
             }
         
+        # Stop recording
         video_path, gps_log_path = self.video_recorder.stop_recording()
+        
+        # Mark recording as stopped (but processing continues)
+        with self.shutdown_lock:
+            self.recording_stopped = True
+        
+        # Check if there are remaining videos to process
+        is_processing = self.is_processing_ongoing()
+        processing_status = self.get_processing_status()
+        
+        message = 'Recording stopped'
+        if is_processing:
+            video_queue = processing_status.get('video_queue_size', 0)
+            ocr_queue = processing_status.get('ocr_queue_size', 0)
+            message += f'. Processing {video_queue} video(s) and {ocr_queue} OCR job(s) in background'
         
         return {
             'success': True,
-            'message': 'Recording stopped',
+            'message': message,
             'video_path': video_path,
-            'gps_log_path': gps_log_path
+            'gps_log_path': gps_log_path,
+            'processing_ongoing': is_processing,
+            'processing_status': processing_status
         }
     
     def is_recording(self) -> bool:
         """Check if currently recording."""
         return self.video_recorder.is_recording() if self.video_recorder else False
+    
+    def is_processing_ongoing(self) -> bool:
+        """Check if video processing or OCR is still ongoing."""
+        if not self.processing_queue:
+            return False
+        
+        status = self.processing_queue.get_status()
+        return (status.get('video_queue_size', 0) > 0 or 
+                status.get('ocr_queue_size', 0) > 0 or
+                status.get('processing_video', False) or
+                status.get('processing_ocr', False))
+    
+    def is_gracefully_shutting_down(self) -> bool:
+        """Check if recording is stopped but processing is still ongoing."""
+        with self.shutdown_lock:
+            return self.recording_stopped and self.is_processing_ongoing()
+    
+    def get_processing_status(self) -> Dict:
+        """
+        Get processing queue status.
+        
+        Returns:
+            Dict with processing queue status information
+        """
+        if self.processing_queue:
+            return self.processing_queue.get_status()
+        return {
+            'processing_video': False,
+            'processing_ocr': False,
+            'video_queue_size': 0,
+            'ocr_queue_size': 0,
+            'stats': {
+                'videos_queued': 0,
+                'videos_processed': 0,
+                'ocr_jobs_queued': 0,
+                'ocr_jobs_processed': 0,
+                'errors': 0
+            }
+        }
+    
+    def upload_to_server(self, video_path: str, crops_dir: str, data: Dict):
+        """
+        Upload processed data to server.
+        
+        This is an extensibility point - implement your server upload logic here.
+        Called automatically after OCR processing completes.
+        
+        Args:
+            video_path: Path to processed video file
+            crops_dir: Directory containing processed crops
+            data: Processed data (OCR results, events, etc.)
+        """
+        # TODO: Implement server upload logic
+        # Example:
+        # import requests
+        # response = requests.post('https://your-server.com/api/upload', json=data)
+        # return response.status_code == 200
+        
+        print(f"[TrailerVisionApp] Server upload hook called (not implemented)")
+        print(f"  - Video: {Path(video_path).name}")
+        print(f"  - Crops: {crops_dir}")
+        print(f"  - Data keys: {list(data.keys()) if isinstance(data, dict) else 'N/A'}")
+        pass
     
     def stop(self):
         """Stop the application and cleanup."""
@@ -1333,6 +1567,10 @@ class TrailerVisionApp:
         # Stop recording if active
         if self.video_recorder and self.video_recorder.is_recording():
             self.video_recorder.stop_recording()
+        
+        # Stop processing queue
+        if self.processing_queue:
+            self.processing_queue.stop()
         
         # Stop GPS sensor
         if self.gps_sensor:

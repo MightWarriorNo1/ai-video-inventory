@@ -25,60 +25,141 @@
             </div>
         </header>
 
-        <div class="video-recording-section">
-            <h2>Video Recording</h2>
-            <div class="recording-controls">
-                <button id="startRecordingBtn" class="btn-primary">Start Recording</button>
-                <button id="stopRecordingBtn" class="btn-secondary" disabled>Stop Recording</button>
-                <span id="recordingStatus" class="recording-status">Not recording</span>
+        <!-- Tab Navigation -->
+        <div class="tab-navigation">
+            <button class="tab-button active" data-tab="automatic">Automatic Process</button>
+            <button class="tab-button" data-tab="manual">Manual Process</button>
+        </div>
+
+        <!-- Automatic Process Tab -->
+        <div id="automatic-tab" class="tab-content active">
+            <div class="application-control-section">
+                <div class="app-control-main">
+                    <h2>Application Control</h2>
+                    <p class="app-description">Start the automated workflow: 45-second video recording → Auto processing → OCR → Server upload</p>
+                    <div class="app-controls">
+                        <button id="startApplicationBtn" class="btn-app-start">▶ Start Application</button>
+                        <button id="stopApplicationBtn" class="btn-app-stop" disabled>⏹ Stop Application</button>
+                        <span id="applicationStatus" class="app-status">Ready</span>
+                    </div>
+                    <div id="applicationInfo" class="app-info" style="display: none;">
+                        <div class="app-info-item">
+                            <strong>Status:</strong> <span id="appStatusText">-</span>
+                        </div>
+                        <div class="app-info-item">
+                            <strong>Camera:</strong> <span id="appCameraId">-</span>
+                        </div>
+                        <div class="app-info-item">
+                            <strong>Recording:</strong> <span id="appRecordingStatus">-</span>
+                        </div>
+                        <div class="app-info-item">
+                            <strong>Video Queue:</strong> <span id="appVideoQueue">-</span>
+                        </div>
+                        <div class="app-info-item">
+                            <strong>OCR Queue:</strong> <span id="appOCRQueue">-</span>
+                        </div>
+                    </div>
+                </div>
             </div>
-            <div id="recordingInfo" class="recording-info" style="display: none;">
-                <p><strong>Recording:</strong> <span id="recordingCameraId">-</span></p>
-                <p><strong>GPS Status:</strong> <span id="gpsStatus">Unknown</span></p>
-            </div>
-            <div id="cameraPreviewContainer" class="camera-preview-container" style="display: none;">
-                <h3>Live Camera Feed</h3>
-                <div class="camera-preview-wrapper">
-                    <img id="cameraPreview" class="camera-preview-stream" alt="Camera preview" />
+
+            <div class="debug-section">
+                <h2>Debug Controls</h2>
+                <div class="debug-controls">
+                <div class="debug-control-group">
+                    <h3>Auto Recording</h3>
+                    <div class="debug-button-group">
+                        <button id="debugStartAutoRecordingBtn" class="btn-debug">Start Auto Recording (45s chunks)</button>
+                        <button id="debugStopAutoRecordingBtn" class="btn-debug-stop" disabled>Stop Auto Recording</button>
+                    </div>
+                    <span id="debugAutoRecordingStatus" class="debug-status"></span>
+                </div>
+                <div class="debug-control-group">
+                    <h3>Video Processing</h3>
+                    <p class="debug-hint">Processes all videos in out/recordings folder automatically</p>
+                    <input type="text" id="debugVideoPathInput" placeholder="Video file path (optional, currently ignored - processes all)" class="debug-input" style="opacity: 0.6;">
+                    <input type="text" id="debugGpsLogPathInput" placeholder="GPS log path (optional)" class="debug-input" style="opacity: 0.6;">
+                    <div class="debug-button-group">
+                        <button id="debugStartVideoProcessingBtn" class="btn-debug">Start Video Processing (All Videos)</button>
+                        <button id="debugStopVideoProcessingBtn" class="btn-debug-stop" disabled>Stop Video Processing</button>
+                    </div>
+                    <span id="debugVideoProcessingStatus" class="debug-status"></span>
+                </div>
+                <div class="debug-control-group">
+                    <h3>OCR Processing</h3>
+                    <p class="debug-hint">Leave directory empty to process all crops in out/crops folder</p>
+                    <input type="text" id="debugCropsDirInput" placeholder="Crops directory (optional, e.g., out/crops/camera-01/video_name)" class="debug-input">
+                    <div class="debug-button-group">
+                        <button id="debugStartOCRProcessingBtn" class="btn-debug">Start OCR Processing</button>
+                        <button id="debugStopOCRProcessingBtn" class="btn-debug-stop" disabled>Stop OCR Processing</button>
+                    </div>
+                    <span id="debugOCRProcessingStatus" class="debug-status"></span>
+                </div>
+                    <div class="debug-control-group">
+                        <h3>Queue Status</h3>
+                        <button id="debugRefreshQueueStatusBtn" class="btn-debug">Refresh Queue Status</button>
+                        <div id="debugQueueStatus" class="debug-status-box"></div>
+                    </div>
                 </div>
             </div>
         </div>
 
-        <div class="video-processing-section">
-            <h2>Video Processing</h2>
-            <div class="video-upload-controls">
-                <input type="file" id="videoFileInput" accept="video/*" style="display: none;">
-                <button id="selectVideoBtn" class="btn-primary">Select Video File</button>
-                <button id="processVideoBtn" class="btn-primary" disabled>Process Video</button>
-                <button id="stopProcessingBtn" class="btn-secondary" disabled>Stop Processing</button>
-                <span id="processingStatus" class="processing-status"></span>
-            </div>
-            <div class="processed-video-container">
-                <div class="processed-video-wrapper">
-                    <h3>Processed Video</h3>
-                    <div id="processedVideoContainer" class="processed-video-placeholder">
-                        <p>No video processed yet. Select and process a video file to see results.</p>
+        <!-- Manual Process Tab -->
+        <div id="manual-tab" class="tab-content">
+            <div class="video-recording-section">
+                <h2>Video Recording</h2>
+                <div class="recording-controls">
+                    <button id="startRecordingBtn" class="btn-primary">Start Recording</button>
+                    <button id="stopRecordingBtn" class="btn-secondary" disabled>Stop Recording</button>
+                    <span id="recordingStatus" class="recording-status">Not recording</span>
+                </div>
+                <div id="recordingInfo" class="recording-info" style="display: none;">
+                    <p><strong>Recording:</strong> <span id="recordingCameraId">-</span></p>
+                    <p><strong>GPS Status:</strong> <span id="gpsStatus">Unknown</span></p>
+                </div>
+                <div id="cameraPreviewContainer" class="camera-preview-container" style="display: none;">
+                    <h3>Live Camera Feed</h3>
+                    <div class="camera-preview-wrapper">
+                        <img id="cameraPreview" class="camera-preview-stream" alt="Camera preview" />
                     </div>
                 </div>
-                <div class="processing-results-wrapper">
-                    <h3>Processing Results</h3>
-                    <div id="processingResults" class="processing-results">
-                        <div class="results-stats" id="resultsStats">
-                            <div class="stat-item">
-                                <span class="stat-label">Frames Processed:</span>
-                                <span class="stat-value" id="framesProcessed">0</span>
-                            </div>
-                            <div class="stat-item">
-                                <span class="stat-label">Detections:</span>
-                                <span class="stat-value" id="totalDetections">0</span>
-                            </div>
-                            <div class="stat-item">
-                                <span class="stat-label">Tracks:</span>
-                                <span class="stat-value" id="totalTracks">0</span>
-                            </div>
-                            <div class="stat-item">
-                                <span class="stat-label">OCR Results:</span>
-                                <span class="stat-value" id="totalOCR">0</span>
+            </div>
+
+            <div class="video-processing-section">
+                <h2>Video Processing</h2>
+                <div class="video-upload-controls">
+                    <input type="file" id="videoFileInput" accept="video/*" style="display: none;">
+                    <button id="selectVideoBtn" class="btn-primary">Select Video File</button>
+                    <button id="processVideoBtn" class="btn-primary" disabled>Process Video</button>
+                    <button id="stopProcessingBtn" class="btn-secondary" disabled>Stop Processing</button>
+                    <span id="processingStatus" class="processing-status"></span>
+                </div>
+                <div class="processed-video-container">
+                    <div class="processed-video-wrapper">
+                        <h3>Processed Video</h3>
+                        <div id="processedVideoContainer" class="processed-video-placeholder">
+                            <p>No video processed yet. Select and process a video file to see results.</p>
+                        </div>
+                    </div>
+                    <div class="processing-results-wrapper">
+                        <h3>Processing Results</h3>
+                        <div id="processingResults" class="processing-results">
+                            <div class="results-stats" id="resultsStats">
+                                <div class="stat-item">
+                                    <span class="stat-label">Frames Processed:</span>
+                                    <span class="stat-value" id="framesProcessed">0</span>
+                                </div>
+                                <div class="stat-item">
+                                    <span class="stat-label">Detections:</span>
+                                    <span class="stat-value" id="totalDetections">0</span>
+                                </div>
+                                <div class="stat-item">
+                                    <span class="stat-label">Tracks:</span>
+                                    <span class="stat-value" id="totalTracks">0</span>
+                                </div>
+                                <div class="stat-item">
+                                    <span class="stat-label">OCR Results:</span>
+                                    <span class="stat-value" id="totalOCR">0</span>
+                                </div>
                             </div>
                         </div>
                     </div>

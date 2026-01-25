@@ -51,6 +51,48 @@ Access web UI at: `http://<device-ip>:8080/`
 - **Outputs**: CSV logs, screenshots, metrics, event bus publishing
 - **Integrations**: Azure Service Bus, Kafka, MQTT, S3, Azure Blob, TimescaleDB
 
+## Automated Video Processing Workflow
+
+The system now supports fully automated video processing with GPU-aware sequential processing:
+
+### Features
+
+1. **45-Second Auto-Chunking**: Video recordings are automatically split into 45-second chunks
+2. **Automatic Processing**: Each chunk is automatically queued for processing when saved
+3. **Sequential GPU Operations**: Video processing and OCR run sequentially to prevent GPU memory conflicts
+4. **Extensible Server Upload**: Ready-to-implement hooks for server data upload
+
+### Workflow
+
+```
+Record 45s chunk → Save video + GPS log → Queue video processing
+  ↓
+Video Processing (GPU): Detection + Tracking + Save Crops (NO OCR)
+  ↓
+Video Processing Complete → Queue OCR job
+  ↓
+OCR Processing (GPU): Process saved crops sequentially
+  ↓
+OCR Complete → Ready for server upload (extensible hook)
+```
+
+### Implementation Details
+
+- **Processing Queue Manager** (`app/processing_queue.py`): Manages sequential processing with GPU lock
+- **Auto-Chunking Video Recorder** (`app/video_recorder.py`): Automatically splits recordings into 45-second chunks
+- **Extensibility Hooks**: 
+  - `on_video_complete(video_path, crops_dir, results)`: Called after video processing
+  - `on_ocr_complete(video_path, crops_dir, ocr_results)`: Called after OCR processing
+  - `upload_to_server(video_path, crops_dir, data)`: Implement your server upload logic here
+
+### Configuration
+
+The automation is enabled by default when the application starts. To customize:
+
+- **Chunk Duration**: Modify `chunk_duration_seconds` in `VideoRecorder` initialization (default: 45.0)
+- **Processing Parameters**: Adjust `detect_every_n` and `detection_mode` in queue manager
+- **Server Upload**: Implement `upload_to_server()` method in `TrailerVisionApp` class
+
 ## Project Structure
 
 - `app/` - Core application code

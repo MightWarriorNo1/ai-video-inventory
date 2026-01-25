@@ -580,6 +580,414 @@ class MetricsServer:
             with self.status_lock:
                 return jsonify(self.processing_status.copy())
         
+        # ========== DEBUG ENDPOINTS ==========
+        
+        @self.app.route('/api/debug/start-auto-recording', methods=['POST'])
+        def debug_start_auto_recording():
+            """Debug: Start auto recording with 45-second chunking."""
+            try:
+                data = request.get_json() or {}
+                camera_id = data.get('camera_id')
+                
+                app = self.frame_storage if hasattr(self, 'frame_storage') else None
+                if not app or not hasattr(app, 'start_recording'):
+                    return jsonify({'error': 'Recording not available'}), 500
+                
+                result = app.start_recording(camera_id=camera_id)
+                
+                if result.get('success'):
+                    return jsonify({
+                        'success': True,
+                        'message': 'Auto recording started with 45-second chunking',
+                        'camera_id': result.get('camera_id')
+                    }), 200
+                else:
+                    return jsonify(result), 400
+            except Exception as e:
+                return jsonify({'error': str(e)}), 500
+        
+        @self.app.route('/api/debug/stop-auto-recording', methods=['POST'])
+        def debug_stop_auto_recording():
+            """Debug: Stop auto recording."""
+            try:
+                app = self.frame_storage if hasattr(self, 'frame_storage') else None
+                if not app or not hasattr(app, 'stop_recording'):
+                    return jsonify({'error': 'Recording not available'}), 500
+                
+                result = app.stop_recording()
+                
+                if result.get('success'):
+                    return jsonify({
+                        'success': True,
+                        'message': 'Auto recording stopped',
+                        'result': result
+                    }), 200
+                else:
+                    return jsonify(result), 400
+            except Exception as e:
+                return jsonify({'error': str(e)}), 500
+        
+        @self.app.route('/api/debug/stop-video-processing', methods=['POST'])
+        def debug_stop_video_processing():
+            """Debug: Stop current video processing."""
+            try:
+                app = self.frame_storage if hasattr(self, 'frame_storage') else None
+                if not app or not hasattr(app, 'video_processor'):
+                    return jsonify({'error': 'Video processor not available'}), 500
+                
+                if not app.video_processor:
+                    return jsonify({'error': 'Video processor not initialized'}), 500
+                
+                # Stop video processing
+                if hasattr(app.video_processor, 'stop_processing'):
+                    app.video_processor.stop_processing()
+                
+                return jsonify({
+                    'success': True,
+                    'message': 'Video processing stopped'
+                }), 200
+            except Exception as e:
+                return jsonify({'error': str(e)}), 500
+        
+        @self.app.route('/api/debug/stop-ocr-processing', methods=['POST'])
+        def debug_stop_ocr_processing():
+            """Debug: Stop current OCR processing (clear OCR queue)."""
+            import queue
+            try:
+                app = self.frame_storage if hasattr(self, 'frame_storage') else None
+                if not app or not hasattr(app, 'processing_queue'):
+                    return jsonify({'error': 'Processing queue not available'}), 500
+                
+                if not app.processing_queue:
+                    return jsonify({'error': 'Processing queue not initialized'}), 500
+                
+                # Clear OCR queue (we can't stop current OCR, but we can clear the queue)
+                # Note: Current OCR will finish, but no new jobs will be processed
+                ocr_queue_size = app.processing_queue.ocr_queue.qsize()
+                
+                # Clear OCR queue
+                while not app.processing_queue.ocr_queue.empty():
+                    try:
+                        app.processing_queue.ocr_queue.get_nowait()
+                        app.processing_queue.ocr_queue.task_done()
+                    except queue.Empty:
+                        break
+                
+                return jsonify({
+                    'success': True,
+                    'message': f'OCR queue cleared ({ocr_queue_size} jobs removed). Current OCR will finish.',
+                    'cleared_jobs': ocr_queue_size
+                }), 200
+            except Exception as e:
+                return jsonify({'error': str(e)}), 500
+        
+        @self.app.route('/api/debug/start-video-processing', methods=['POST'])
+        def debug_start_video_processing():
+            """Debug: Manually trigger video processing on a video file or all videos in out/recordings."""
+            try:
+                data = request.get_json() or {}
+                video_path = data.get('video_path')
+                process_all = data.get('process_all', False)
+                camera_id = data.get('camera_id', 'test-video')
+                gps_log_path = data.get('gps_log_path')
+                detect_every_n = data.get('detect_every_n', 5)
+                detection_mode = data.get('detection_mode', 'trailer')
+                
+                app = self.frame_storage if hasattr(self, 'frame_storage') else None
+                if not app or not hasattr(app, 'processing_queue'):
+                    return jsonify({'error': 'Processing queue not available'}), 500
+                
+                if not app.processing_queue:
+                    return jsonify({'error': 'Processing queue not initialized'}), 500
+                
+                # Process all videos in out/recordings folder
+                if process_all or not video_path:
+                    recordings_dir = Path("out/recordings")
+                    if not recordings_dir.exists():
+                        return jsonify({'error': f'Recordings directory not found: {recordings_dir}'}), 404
+                    
+                    # Find all video files
+                    video_extensions = ['.mp4', '.avi', '.mov', '.mkv']
+                    video_files = []
+                    for ext in video_extensions:
+                        video_files.extend(recordings_dir.glob(f'*{ext}'))
+                    
+                    if not video_files:
+                        return jsonify({
+                            'success': False,
+                            'message': 'No video files found in out/recordings',
+                            'videos_queued': 0
+                        }), 200
+                    
+                    # Queue all videos for processing
+                    queued_count = 0
+                    for vid_path in sorted(video_files):
+                        # Try to find corresponding GPS log
+                        gps_log = None
+                        video_stem = vid_path.stem
+                        # Look for GPS log with same name
+                        gps_log_paths = [
+                            recordings_dir / f"{video_stem}.json",
+                            recordings_dir / f"{video_stem}_gps.json",
+                        ]
+                        for gps_path in gps_log_paths:
+                            if gps_path.exists():
+                                gps_log = str(gps_path)
+                                break
+                        
+                        # Extract camera_id from filename (format: camera_id_timestamp_chunkXXXX)
+                        parts = video_stem.split('_')
+                        vid_camera_id = parts[0] if parts else camera_id
+                        
+                        app.processing_queue.queue_video_processing(
+                            video_path=str(vid_path),
+                            camera_id=vid_camera_id,
+                            gps_log_path=gps_log,
+                            detect_every_n=detect_every_n,
+                            detection_mode=detection_mode
+                        )
+                        queued_count += 1
+                    
+                    return jsonify({
+                        'success': True,
+                        'message': f'Queued {queued_count} video(s) for processing',
+                        'videos_queued': queued_count
+                    }), 200
+                
+                # Process single video
+                if not video_path:
+                    return jsonify({'error': 'video_path is required when process_all is false'}), 400
+                
+                # Queue video processing
+                app.processing_queue.queue_video_processing(
+                    video_path=video_path,
+                    camera_id=camera_id,
+                    gps_log_path=gps_log_path,
+                    detect_every_n=detect_every_n,
+                    detection_mode=detection_mode
+                )
+                
+                return jsonify({
+                    'success': True,
+                    'message': f'Video processing queued: {Path(video_path).name}',
+                    'video_path': video_path
+                }), 200
+                
+            except Exception as e:
+                return jsonify({'error': str(e)}), 500
+        
+        @self.app.route('/api/debug/start-ocr-processing', methods=['POST'])
+        def debug_start_ocr_processing():
+            """Debug: Manually trigger OCR processing on a crops directory or all crops in out/crops."""
+            try:
+                data = request.get_json() or {}
+                crops_dir = data.get('crops_dir')
+                process_all = data.get('process_all', False)
+                video_path = data.get('video_path', '')
+                camera_id = data.get('camera_id', 'test-video')
+                
+                app = self.frame_storage if hasattr(self, 'frame_storage') else None
+                if not app or not hasattr(app, 'processing_queue'):
+                    return jsonify({'error': 'Processing queue not available'}), 500
+                
+                if not app.processing_queue:
+                    return jsonify({'error': 'Processing queue not initialized'}), 500
+                
+                # Process all crops in out/crops folder
+                if process_all or not crops_dir:
+                    crops_base_dir = Path("out/crops")
+                    if not crops_base_dir.exists():
+                        return jsonify({'error': f'Crops directory not found: {crops_base_dir}'}), 404
+                    
+                    # Find all crop directories (each video has its own directory)
+                    crop_dirs = []
+                    for camera_dir in crops_base_dir.iterdir():
+                        if camera_dir.is_dir():
+                            for video_dir in camera_dir.iterdir():
+                                if video_dir.is_dir():
+                                    # Check if directory has image files
+                                    image_files = list(video_dir.glob('*.jpg')) + list(video_dir.glob('*.png'))
+                                    if image_files:
+                                        crop_dirs.append((str(video_dir), camera_dir.name))
+                    
+                    if not crop_dirs:
+                        return jsonify({
+                            'success': False,
+                            'message': 'No crop directories found in out/crops',
+                            'ocr_jobs_queued': 0
+                        }), 200
+                    
+                    # Queue all crop directories for OCR
+                    queued_count = 0
+                    for crop_path, vid_camera_id in crop_dirs:
+                        app.processing_queue._queue_ocr_job(
+                            video_path=video_path or crop_path,
+                            crops_dir=crop_path,
+                            camera_id=vid_camera_id
+                        )
+                        queued_count += 1
+                    
+                    return jsonify({
+                        'success': True,
+                        'message': f'Queued {queued_count} crop directory(ies) for OCR processing',
+                        'ocr_jobs_queued': queued_count
+                    }), 200
+                
+                # Process single crops directory
+                if not crops_dir:
+                    return jsonify({'error': 'crops_dir is required when process_all is false'}), 400
+                
+                # Manually queue OCR job
+                app.processing_queue._queue_ocr_job(
+                    video_path=video_path or crops_dir,
+                    crops_dir=crops_dir,
+                    camera_id=camera_id
+                )
+                
+                return jsonify({
+                    'success': True,
+                    'message': f'OCR processing queued: {Path(crops_dir).name}',
+                    'crops_dir': crops_dir
+                }), 200
+                
+            except Exception as e:
+                return jsonify({'error': str(e)}), 500
+        
+        @self.app.route('/api/debug/processing-queue-status', methods=['GET'])
+        def debug_processing_queue_status():
+            """Debug: Get processing queue status."""
+            try:
+                app = self.frame_storage if hasattr(self, 'frame_storage') else None
+                if not app or not hasattr(app, 'processing_queue'):
+                    return jsonify({
+                        'error': 'Processing queue not available',
+                        'available': False
+                    }), 200
+                
+                if not app.processing_queue:
+                    return jsonify({
+                        'error': 'Processing queue not initialized',
+                        'available': False
+                    }), 200
+                
+                status = app.processing_queue.get_status()
+                return jsonify({
+                    'available': True,
+                    'status': status
+                }), 200
+                
+            except Exception as e:
+                return jsonify({'error': str(e), 'available': False}), 500
+        
+        @self.app.route('/api/start-application', methods=['POST'])
+        def start_application():
+            """Start the automated application workflow (load assets + recording + processing)."""
+            try:
+                data = request.get_json() or {}
+                camera_id = data.get('camera_id')
+                
+                app = self.frame_storage if hasattr(self, 'frame_storage') else None
+                if not app:
+                    return jsonify({'error': 'Application not available'}), 500
+                
+                # Check if already running
+                if app.is_recording():
+                    return jsonify({
+                        'success': False,
+                        'message': 'Application is already running'
+                    }), 400
+                
+                # Step 1: Initialize assets (OCR, processing queue, etc.)
+                print(f"[MetricsServer] Initializing assets for automated processing...")
+                assets_result = app.initialize_assets()
+                
+                if not assets_result.get('success'):
+                    return jsonify({
+                        'success': False,
+                        'message': f'Failed to initialize assets: {assets_result.get("message", "Unknown error")}',
+                        'assets_loaded': assets_result.get('assets_loaded', {})
+                    }), 500
+                
+                print(f"[MetricsServer] Assets initialized successfully")
+                
+                # Step 2: Start auto recording (this will automatically trigger processing)
+                result = app.start_recording(camera_id=camera_id)
+                
+                if result.get('success'):
+                    return jsonify({
+                        'success': True,
+                        'message': 'Application started successfully',
+                        'camera_id': result.get('camera_id'),
+                        'workflow': 'Assets loaded → Auto recording → Video processing → OCR → Server upload',
+                        'assets_loaded': assets_result.get('assets_loaded', {})
+                    }), 200
+                else:
+                    return jsonify(result), 400
+                    
+            except Exception as e:
+                return jsonify({'error': str(e)}), 500
+        
+        @self.app.route('/api/stop-application', methods=['POST'])
+        def stop_application():
+            """Stop the automated application workflow."""
+            try:
+                app = self.frame_storage if hasattr(self, 'frame_storage') else None
+                if not app:
+                    return jsonify({'error': 'Application not available'}), 500
+                
+                # Stop recording
+                result = app.stop_recording()
+                
+                return jsonify({
+                    'success': True,
+                    'message': 'Application stopped successfully',
+                    'result': result
+                }), 200
+                    
+            except Exception as e:
+                return jsonify({'error': str(e)}), 500
+        
+        @self.app.route('/api/application-status', methods=['GET'])
+        def get_application_status():
+            """Get comprehensive application status."""
+            try:
+                app = self.frame_storage if hasattr(self, 'frame_storage') else None
+                if not app:
+                    return jsonify({
+                        'running': False,
+                        'error': 'Application not available'
+                    }), 200
+                
+                is_recording = app.is_recording()
+                
+                # Check if gracefully shutting down (recording stopped but processing ongoing)
+                is_gracefully_shutting_down = False
+                is_processing_ongoing = False
+                if hasattr(app, 'is_gracefully_shutting_down'):
+                    is_gracefully_shutting_down = app.is_gracefully_shutting_down()
+                if hasattr(app, 'is_processing_ongoing'):
+                    is_processing_ongoing = app.is_processing_ongoing()
+                
+                # Get processing queue status if available
+                queue_status = None
+                if hasattr(app, 'processing_queue') and app.processing_queue:
+                    queue_status = app.processing_queue.get_status()
+                
+                return jsonify({
+                    'running': is_recording,
+                    'recording': is_recording,
+                    'gracefully_shutting_down': is_gracefully_shutting_down,
+                    'processing_ongoing': is_processing_ongoing,
+                    'queue_status': queue_status,
+                    'processing_queue_available': hasattr(app, 'processing_queue') and app.processing_queue is not None
+                }), 200
+                    
+            except Exception as e:
+                return jsonify({
+                    'running': False,
+                    'error': str(e)
+                }), 200
+        
         @self.app.route('/api/processed-frame/<int:frame_number>')
         def get_processed_frame(frame_number):
             """Get a specific processed frame."""
