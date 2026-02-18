@@ -7,6 +7,7 @@ import CameraHealth from './pages/CameraHealth'
 import Events from './pages/Events'
 import Configuration from './pages/Configuration'
 import Reports from './pages/Reports'
+import VideoFrames from './pages/VideoFrames'
 
 function App() {
   return (
@@ -20,6 +21,7 @@ function App() {
           <Route path="/events" element={<Events />} />
           <Route path="/configuration" element={<Configuration />} />
           <Route path="/reports" element={<Reports />} />
+          <Route path="/video-frames" element={<VideoFrames />} />
         </Routes>
       </Layout>
     </Router>

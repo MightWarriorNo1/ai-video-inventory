@@ -14,6 +14,10 @@ from datetime import datetime, timedelta
 import threading
 import gc
 
+from app.app_logger import get_logger
+
+log = get_logger(__name__)
+
 # Try to import torch for GPU memory management
 try:
     import torch
@@ -32,14 +36,14 @@ class VideoProcessor:
         Initialize video processor.
         
         Video processing uses GPS log method only - GPS coordinates are read from the GPS log file
-        that was recorded during video capture. No projection methods (3D, depth, homography, BEV) are used.
+        that was recorded during video capture. BEV projection has been removed. No projection methods (3D, depth, homography, BEV) are used.
         
         Args:
             detector: Detection model instance (should be YOLOv8Detector for YOLOv8m COCO truck detection)
             ocr: OCR model instance
             tracker_factory: Function that returns a new tracker instance
             spot_resolver: Spot resolver instance (not used for GPS calculation, kept for API compatibility)
-            bev_projector: Optional BEVProjector instance (not used, kept for API compatibility)
+            bev_projector: Optional BEVProjector instance (deprecated - BEV projection removed, using GPS sensor/log files)
             preprocessor: Optional ImagePreprocessor instance for OCR preprocessing
             gps_reference: Optional dict with 'lat' and 'lon' keys (not used for GPS calculation)
             camera_id: Camera ID for logging purposes (default: "test-video")
@@ -61,38 +65,29 @@ class VideoProcessor:
             try:
                 from app.gps_sensor import load_gps_log
                 self.gps_log = load_gps_log(self.gps_log_path)
-                print(f"[VideoProcessor] Loaded GPS log: {self.gps_log_path} ({len(self.gps_log)} entries)")
+                log.info("Loaded GPS log: %s (%s entries)", self.gps_log_path, len(self.gps_log))
             except Exception as e:
-                print(f"[VideoProcessor] Failed to load GPS log: {e}")
+                log.warning("Failed to load GPS log: %s", e)
                 self.gps_log = {}
         elif self.gps_log_path:
-            print(f"[VideoProcessor] GPS log file not found: {self.gps_log_path}")
+            log.warning("GPS log file not found: %s", self.gps_log_path)
         
         # Video processing uses GPS log method only - no projection methods needed
         
         # Log detector type for verification
         if self.detector is not None:
-            detector_type = type(self.detector).__name__
-            print(f"[VideoProcessor] Using detector: {detector_type}")
-            if hasattr(self.detector, 'model_name'):
-                print(f"[VideoProcessor] Detector model: {self.detector.model_name}")
-            if hasattr(self.detector, 'target_class'):
-                # Get actual class name from model
-                class_name = "unknown"
-                if hasattr(self.detector, 'class_names'):
-                    class_name = self.detector.class_names.get(self.detector.target_class, f'class_{self.detector.target_class}')
-                print(f"[VideoProcessor] Detector target class: {self.detector.target_class} ({class_name})")
-        
+            self._log_detector_info()
+
         # Check if OCR is oLmOCR (needs GPU memory cleanup)
         self.is_olmocr = ocr is not None and 'OlmOCRRecognizer' in type(ocr).__name__
-        
+
         # Processing state
         self.processing = False
         self.stop_flag = False
         self.lock = threading.Lock()
-        
+
         # Results storage
-        self.processed_frames = {}  # frame_num -> frame
+        self.processed_frames = {}
         self.events = []
         self.stats = {
             'frames_processed': 0,
@@ -100,31 +95,82 @@ class VideoProcessor:
             'tracks': 0,
             'ocr_results': 0
         }
-        
+
         # Track unique physical trailers by spot + position clustering
         # This prevents counting the same trailer multiple times when tracking is lost/reacquired
         self.unique_tracks = {}  # track_key -> latest_event
         self.unique_track_keys = set()  # Set of unique track keys for counting
-        
+
         # Store OCR results per unique track - collect ALL results, then consolidate
         self.track_ocr_results = {}  # track_key -> list of {text, conf, frame}
-        
+
         # Two-stage processing: Save cropped trailers for batch OCR
         self.save_crops = True  # Enable crop saving mode
         self.crops_dir = None  # Will be set per video
         self.saved_crops = []  # List of saved crop metadata: [{crop_path, frame_count, track_id, bbox, ...}]
         self.crop_counter = 0  # Counter for unique crop filenames
         self.crop_deduplication = {}  # track_key -> crop_path (ONE crop per unique physical trailer)
-        
+
         # Position clustering: group nearby positions (within 5m) as the same physical location
         # This handles slight movement and position variance
         # Increased tolerance to better handle trailers parked close together
         self.position_clusters = {}  # cluster_id -> {center_x, center_y, count, positions: [(x, y), ...]}
         self.next_cluster_id = 1
-    
+
         # Last detected nearest trailer (for persistent display)
         self.last_nearest_trailer = None  # {bbox, track_id, conf, text, ocr_conf}
-    
+
+    def _log_detector_info(self):
+        """Log current detector type and target class."""
+        if self.detector is None:
+            return
+        detector_type = type(self.detector).__name__
+        log.info("Using detector: %s", detector_type)
+        if hasattr(self.detector, 'model_name'):
+            log.info("Detector model: %s", self.detector.model_name)
+        if hasattr(self.detector, 'target_class'):
+            class_name = "unknown"
+            if hasattr(self.detector, 'class_names'):
+                class_name = self.detector.class_names.get(self.detector.target_class, f'class_{self.detector.target_class}')
+            log.info("Detector target class: %s (%s)", self.detector.target_class, class_name)
+
+    def set_detection_mode(self, mode: str) -> None:
+        """
+        Switch detector to 'car' or 'trailer' mode. Call before process_video() when mode may differ from default.
+        mode: 'car' (COCO class 2) or 'trailer' (fine-tuned or COCO class 7).
+        """
+        mode = (mode or 'trailer').lower().strip()
+        if mode not in ('car', 'trailer'):
+            mode = 'trailer'
+        try:
+            from app.ai.detector_yolov8 import YOLOv8Detector
+            if mode == 'car':
+                log.info("[VideoProcessor] Setting detection mode: car (COCO class 2)")
+                self.detector = YOLOv8Detector(
+                    model_name="yolov8m.pt",
+                    conf_threshold=0.25,
+                    target_class=2  # COCO class 2 = car
+                )
+            else:
+                fine_tuned_model_path = "runs/detect/truck_detector_finetuned/weights/best.pt"
+                if os.path.exists(fine_tuned_model_path):
+                    log.info("[VideoProcessor] Setting detection mode: trailer (fine-tuned model)")
+                    self.detector = YOLOv8Detector(
+                        model_name=fine_tuned_model_path,
+                        conf_threshold=0.35,
+                        target_class=0
+                    )
+                else:
+                    log.info("[VideoProcessor] Setting detection mode: trailer (COCO class 7 = truck)")
+                    self.detector = YOLOv8Detector(
+                        model_name="yolov8m.pt",
+                        conf_threshold=0.25,
+                        target_class=7  # COCO class 7 = truck
+                    )
+            self._log_detector_info()
+        except Exception as e:
+            log.warning("[VideoProcessor] Failed to set detection mode %s: %s; keeping current detector", mode, e)
+
     def _cleanup_gpu_memory(self):
         """
         Clean up GPU memory after OCR operations to prevent accumulation.
@@ -171,17 +217,17 @@ class VideoProcessor:
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         fourcc = int(cap.get(cv2.CAP_PROP_FOURCC))
         
-        print(f"[VideoProcessor] Video properties: {total_frames} frames, {fps} FPS, {width}x{height}")
+        log.info(f"[VideoProcessor] Video properties: {total_frames} frames, {fps} FPS, {width}x{height}")
         
         # If video is shorter than chunk size, no need to split
         if total_frames <= frames_per_chunk:
-            print(f"[VideoProcessor] Video is {total_frames} frames (<= {frames_per_chunk}), no splitting needed")
+            log.info(f"[VideoProcessor] Video is {total_frames} frames (<= {frames_per_chunk}), no splitting needed")
             cap.release()
             return [video_path]
         
         # Calculate number of chunks needed
         num_chunks = (total_frames + frames_per_chunk - 1) // frames_per_chunk
-        print(f"[VideoProcessor] Splitting video into {num_chunks} chunks of {frames_per_chunk} frames each")
+        log.info(f"[VideoProcessor] Splitting video into {num_chunks} chunks of {frames_per_chunk} frames each")
         
         # Create temporary directory for split videos
         video_name = Path(video_path).stem
@@ -206,7 +252,7 @@ class VideoProcessor:
                     if out is not None and out.isOpened():
                         out.release()
                         split_paths.append(str(output_path))
-                        print(f"[VideoProcessor] Created chunk {chunk_idx}: {output_path} ({frames_per_chunk} frames)")
+                        log.info(f"[VideoProcessor] Created chunk {chunk_idx}: {output_path} ({frames_per_chunk} frames)")
                     
                     # Create new chunk
                     output_path = temp_dir / f"chunk_{chunk_idx:03d}.mp4"
@@ -233,14 +279,14 @@ class VideoProcessor:
                         remaining_frames = frames_per_chunk
                 else:
                     remaining_frames = frame_count
-                print(f"[VideoProcessor] Created chunk {chunk_idx}: {output_path} ({remaining_frames} frames)")
+                log.info(f"[VideoProcessor] Created chunk {chunk_idx}: {output_path} ({remaining_frames} frames)")
         
         finally:
             cap.release()
             if out.isOpened():
                 out.release()
         
-        print(f"[VideoProcessor] Video split complete: {len(split_paths)} chunks created")
+        log.info(f"[VideoProcessor] Video split complete: {len(split_paths)} chunks created")
         return split_paths
     
     def process_video(self, video_path: str, camera_id: str = "test-video", 
@@ -303,7 +349,11 @@ class VideoProcessor:
             self.saved_crops = []
             self.crop_counter = 0
             self.crop_deduplication = {}  # track_key -> crop_path (ONE crop per unique physical trailer)
-            print(f"[VideoProcessor] Crop directory: {self.crops_dir}")
+            # Reset GPS timing so this video re-initializes from its own gps_log (fixes lat/lon null for 2nd+ videos)
+            for attr in ('_video_start_time', '_total_frames', '_gps_log_duration', '_video_end_time'):
+                if hasattr(self, attr):
+                    delattr(self, attr)
+            log.info(f"[VideoProcessor] Crop directory: {self.crops_dir}")
             
             self.stats = {
                 'frames_processed': 0,
@@ -322,22 +372,22 @@ class VideoProcessor:
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             cap.release()
             
-            print(f"[VideoProcessor] Video has {total_frames} frames")
+            log.info(f"[VideoProcessor] Video has {total_frames} frames")
             
             # Split video if it's longer than 1500 frames
             frames_per_chunk = 1500
             if total_frames > frames_per_chunk:
-                print(f"[VideoProcessor] Video is longer than {frames_per_chunk} frames, splitting into chunks...")
+                log.info(f"[VideoProcessor] Video is longer than {frames_per_chunk} frames, splitting into chunks...")
                 split_paths = self._split_video(video_path, frames_per_chunk)
                 
                 # Process each split and combine results
                 global_frame_offset = 0
                 for chunk_idx, split_path in enumerate(split_paths):
                     if self.stop_flag:
-                        print(f"[VideoProcessor] Stop flag set, stopping at chunk {chunk_idx}")
+                        log.info(f"[VideoProcessor] Stop flag set, stopping at chunk {chunk_idx}")
                         break
                     
-                    print(f"[VideoProcessor] Processing chunk {chunk_idx + 1}/{len(split_paths)}: {split_path}")
+                    log.info(f"[VideoProcessor] Processing chunk {chunk_idx + 1}/{len(split_paths)}: {split_path}")
                     
                     # Process this chunk
                     for frame_num, processed_frame, events in self._process_single_video(
@@ -356,24 +406,24 @@ class VideoProcessor:
                         # Estimate based on frames_per_chunk
                         global_frame_offset += frames_per_chunk
                     
-                    print(f"[VideoProcessor] Chunk {chunk_idx + 1} complete. Global frame offset: {global_frame_offset}")
+                    log.info(f"[VideoProcessor] Chunk {chunk_idx + 1} complete. Global frame offset: {global_frame_offset}")
             else:
                 # Process video normally if it's short enough
-                print(f"[VideoProcessor] Video is {total_frames} frames (<= {frames_per_chunk}), processing normally")
+                log.info(f"[VideoProcessor] Video is {total_frames} frames (<= {frames_per_chunk}), processing normally")
                 for frame_num, processed_frame, events in self._process_single_video(
                     video_path, camera_id, detect_every_n, 0
                 ):
                     yield (frame_num, processed_frame, events)
         
         except Exception as e:
-            print(f"[VideoProcessor] Error in process_video: {e}")
+            log.info(f"[VideoProcessor] Error in process_video: {e}")
             import traceback
             traceback.print_exc()
             raise
         finally:
             with self.lock:
                 self.processing = False
-            print(f"[VideoProcessor] Video processing complete")
+            log.info(f"[VideoProcessor] Video processing complete")
     
     def _process_single_video(self, video_path: str, camera_id: str = "test-video", 
                              detect_every_n: int = 5, frame_offset: int = 0) -> Generator[Tuple[int, np.ndarray, List[Dict]], None, None]:
@@ -394,26 +444,26 @@ class VideoProcessor:
             if not cap.isOpened():
                 raise ValueError(f"Failed to open video: {video_path}")
             
-            print(f"[VideoProcessor] Starting to process video: {video_path}")
-            print(f"[VideoProcessor] Detector available: {self.detector is not None}")
-            print(f"[VideoProcessor] OCR available: {self.ocr is not None}")
+            log.info(f"[VideoProcessor] Starting to process video: {video_path}")
+            log.info(f"[VideoProcessor] Detector available: {self.detector is not None}")
+            log.info(f"[VideoProcessor] OCR available: {self.ocr is not None}")
             
             # Get video frame size for logging
             video_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             video_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            print(f"[VideoProcessor] Video frame size: {video_width}x{video_height}")
+            log.info(f"[VideoProcessor] Video frame size: {video_width}x{video_height}")
             
             tracker = self.tracker_factory()
             frame_count = 0
             
             while True:
                 if self.stop_flag:
-                    print(f"[VideoProcessor] Stop flag set, stopping at frame {frame_count}")
+                    log.info(f"[VideoProcessor] Stop flag set, stopping at frame {frame_count}")
                     break
                 
                 ret, frame = cap.read()
                 if not ret:
-                    print(f"[VideoProcessor] End of video reached at frame {frame_count}")
+                    log.info(f"[VideoProcessor] End of video reached at frame {frame_count}")
                     break
                 
                 # Process frame
@@ -456,7 +506,7 @@ class VideoProcessor:
                             all_detections = self.detector.detect(frame)
                         except RuntimeError as e:
                             if 'CUDA' in str(e) or 'cuda' in str(e).lower():
-                                print(f"[VideoProcessor] CUDA error in detection at frame {frame_count}: {e}")
+                                log.info(f"[VideoProcessor] CUDA error in detection at frame {frame_count}: {e}")
                                 # Try to clear CUDA cache
                                 try:
                                     import torch
@@ -468,10 +518,10 @@ class VideoProcessor:
                                 # Continue with empty detections for this frame
                                 all_detections = []
                             else:
-                                print(f"[VideoProcessor] Runtime error in detection at frame {frame_count}: {e}")
+                                log.info(f"[VideoProcessor] Runtime error in detection at frame {frame_count}: {e}")
                                 all_detections = []
                         except Exception as e:
-                            print(f"[VideoProcessor] Error in detection at frame {frame_count}: {e}")
+                            log.info(f"[VideoProcessor] Error in detection at frame {frame_count}: {e}")
                             import traceback
                             traceback.print_exc()
                             all_detections = []
@@ -492,16 +542,16 @@ class VideoProcessor:
                         
                         filtered_low_conf = len(all_detections) - len(detections)
                         if filtered_low_conf > 0:
-                            print(f"[VideoProcessor] Frame {frame_count}: Filtered {filtered_low_conf} low-confidence detections (< {MIN_DETECTION_CONFIDENCE})")
+                            log.info(f"[VideoProcessor] Frame {frame_count}: Filtered {filtered_low_conf} low-confidence detections (< {MIN_DETECTION_CONFIDENCE})")
                         
                         with self.lock:
                             self.stats['detections'] += len(detections)
                         if len(detections) > 0:
                               # Show confidence scores for debugging
                             conf_scores = [f"{d['conf']*100:.1f}%" for d in detections[:5]]
-                            print(f"[VideoProcessor] Frame {frame_count}: Found {len(detections)} detections (confidences: {', '.join(conf_scores)})")
+                            log.info(f"[VideoProcessor] Frame {frame_count}: Found {len(detections)} detections (confidences: {', '.join(conf_scores)})")
                 except Exception as e:
-                    print(f"[VideoProcessor] Error in detection at frame {frame_count}: {e}")
+                    log.info(f"[VideoProcessor] Error in detection at frame {frame_count}: {e}")
                     import traceback
                     traceback.print_exc()
                 
@@ -548,7 +598,7 @@ class VideoProcessor:
                         if any(not np.isfinite(v) for v in bbox):
                             filtered_count += 1
                             if frame_count % 10 == 0:
-                                print(f"[VideoProcessor] Filtered Track {track['track_id']}: invalid bbox (NaN/Inf): {bbox}")
+                                log.info(f"[VideoProcessor] Filtered Track {track['track_id']}: invalid bbox (NaN/Inf): {bbox}")
                             continue
                         
                         try:
@@ -556,7 +606,7 @@ class VideoProcessor:
                         except (ValueError, OverflowError) as e:
                             filtered_count += 1
                             if frame_count % 10 == 0:
-                                print(f"[VideoProcessor] Filtered Track {track['track_id']}: cannot convert bbox to int: {bbox}, error: {e}")
+                                log.info(f"[VideoProcessor] Filtered Track {track['track_id']}: cannot convert bbox to int: {bbox}, error: {e}")
                             continue
                         
                         width = x2 - x1
@@ -574,11 +624,11 @@ class VideoProcessor:
                             filtered_count += 1
                             # Log filtered out tracks for debugging (more frequent)
                             if frame_count % 10 == 0:  # Log more frequently
-                                print(f"[VideoProcessor] Filtered Track {track['track_id']} ({filter_type} mode): size={width}x{height}, area={area}, aspect={aspect_ratio:.2f}")
+                                log.info(f"[VideoProcessor] Filtered Track {track['track_id']} ({filter_type} mode): size={width}x{height}, area={area}, aspect={aspect_ratio:.2f}")
                     
                     # Log filtering summary
                     if len(tracks) > 0 and frame_count % 10 == 0:
-                        print(f"[VideoProcessor] Frame {frame_count}: {len(filtered_tracks)}/{len(tracks)} tracks passed {filter_type} filter ({filtered_count} filtered out)")
+                        log.info(f"[VideoProcessor] Frame {frame_count}: {len(filtered_tracks)}/{len(tracks)} tracks passed {filter_type} filter ({filtered_count} filtered out)")
                     
                     tracks = filtered_tracks
                     
@@ -590,9 +640,9 @@ class VideoProcessor:
                     # We'll count unique tracks when events are created
                     if len(tracks) > 0:
                         object_type = "cars" if is_car_mode else "trailers"
-                        print(f"[VideoProcessor] Frame {frame_count}: Tracking {len(tracks)} valid {object_type}")
+                        log.info(f"[VideoProcessor] Frame {frame_count}: Tracking {len(tracks)} valid {object_type}")
                 except Exception as e:
-                    print(f"[VideoProcessor] Error in tracking at frame {frame_count}: {e}")
+                    log.info(f"[VideoProcessor] Error in tracking at frame {frame_count}: {e}")
                     import traceback
                     traceback.print_exc()
                     tracks = []
@@ -615,7 +665,7 @@ class VideoProcessor:
                                 max_y2 = y2
                                 nearest_track_id = track['track_id']
                 elif frame_count % 30 == 0:  # Log when no tracks available
-                    print(f"[VideoProcessor] Frame {frame_count}: No tracks available for OCR")
+                    log.info(f"[VideoProcessor] Frame {frame_count}: No tracks available for OCR")
                 
                 # Process each track
                 for track in tracks:
@@ -770,29 +820,29 @@ class VideoProcessor:
                                 if self._gps_log_duration > 0 and self._total_frames > 0:
                                     # Calculate FPS for logging/reference only
                                     calculated_fps = self._total_frames / self._gps_log_duration
-                                    print(f"[VideoProcessor] Video timing initialized:")
-                                    print(f"[VideoProcessor]   Start: {self._video_start_time}")
-                                    print(f"[VideoProcessor]   End: {self._video_end_time}")
-                                    print(f"[VideoProcessor]   Duration: {self._gps_log_duration:.2f} seconds")
-                                    print(f"[VideoProcessor]   Total frames: {int(self._total_frames)}")
-                                    print(f"[VideoProcessor]   Calculated FPS: {calculated_fps:.2f}")
+                                    log.info(f"[VideoProcessor] Video timing initialized:")
+                                    log.info(f"[VideoProcessor]   Start: {self._video_start_time}")
+                                    log.info(f"[VideoProcessor]   End: {self._video_end_time}")
+                                    log.info(f"[VideoProcessor]   Duration: {self._gps_log_duration:.2f} seconds")
+                                    log.info(f"[VideoProcessor]   Total frames: {int(self._total_frames)}")
+                                    log.info(f"[VideoProcessor]   Calculated FPS: {calculated_fps:.2f}")
                                 else:
                                     # Fallback to video metadata
                                     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
                                     self._gps_log_duration = self._total_frames / fps
-                                    print(f"[VideoProcessor] Using video metadata:")
-                                    print(f"[VideoProcessor]   Start: {self._video_start_time}")
-                                    print(f"[VideoProcessor]   Frames: {int(self._total_frames)}")
-                                    print(f"[VideoProcessor]   Duration: {self._gps_log_duration:.2f} seconds (estimated)")
+                                    log.info(f"[VideoProcessor] Using video metadata:")
+                                    log.info(f"[VideoProcessor]   Start: {self._video_start_time}")
+                                    log.info(f"[VideoProcessor]   Frames: {int(self._total_frames)}")
+                                    log.info(f"[VideoProcessor]   Duration: {self._gps_log_duration:.2f} seconds (estimated)")
                             except Exception as e:
                                 # Fallback: estimate from video metadata
                                 fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
                                 self._total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
                                 self._gps_log_duration = self._total_frames / fps
                                 self._video_start_time = datetime.utcnow() - timedelta(seconds=self._gps_log_duration)
-                                print(f"[VideoProcessor] Fallback timing (estimated):")
-                                print(f"[VideoProcessor]   Start: {self._video_start_time}")
-                                print(f"[VideoProcessor]   Duration: {self._gps_log_duration:.2f} seconds")
+                                log.info(f"[VideoProcessor] Fallback timing (estimated):")
+                                log.info(f"[VideoProcessor]   Start: {self._video_start_time}")
+                                log.info(f"[VideoProcessor]   Duration: {self._gps_log_duration:.2f} seconds")
                         
                         # Note: Spot resolution requires world coordinates in meters
                         # Since we're using GPS from log (camera position), we can't resolve spots
@@ -867,7 +917,7 @@ class VideoProcessor:
                                 with self.lock:
                                     self.centered_detection_stats['rejected_too_small'] += 1
                                 if frame_count % 30 == 0:
-                                    print(f"[VideoProcessor] Frame {frame_count}: Skipping crop for {track_key} (track_id={track_id}) - crop too small ({width}x{height}, area={width*height}) - need at least {MIN_CROP_WIDTH}x{MIN_CROP_HEIGHT} (area={MIN_CROP_AREA})")
+                                    log.info(f"[VideoProcessor] Frame {frame_count}: Skipping crop for {track_key} (track_id={track_id}) - crop too small ({width}x{height}, area={width*height}) - need at least {MIN_CROP_WIDTH}x{MIN_CROP_HEIGHT} (area={MIN_CROP_AREA})")
                             
                             # Check if crop is significantly clipped (partial trailer near edge)
                             # Calculate how much of the original bbox is visible in the crop
@@ -900,13 +950,13 @@ class VideoProcessor:
                                     with self.lock:
                                         self.centered_detection_stats['rejected_clipped'] += 1
                                     if frame_count % 30 == 0:
-                                        print(f"[VideoProcessor] Frame {frame_count}: Skipping crop for {track_key} (track_id={track_id}) - crop is partially clipped (visible={visible_ratio:.1%}, width={width_ratio:.1%}, height={height_ratio:.1%}, original={original_width}x{original_height}, crop={crop_width}x{crop_height})")
+                                        log.info(f"[VideoProcessor] Frame {frame_count}: Skipping crop for {track_key} (track_id={track_id}) - crop is partially clipped (visible={visible_ratio:.1%}, width={width_ratio:.1%}, height={height_ratio:.1%}, original={original_width}x{original_height}, crop={crop_width}x{crop_height})")
                                 elif aspect_ratio > MAX_ASPECT_RATIO:
                                     should_save_crop = False
                                     with self.lock:
                                         self.centered_detection_stats['rejected_aspect_ratio'] += 1
                                     if frame_count % 30 == 0:
-                                        print(f"[VideoProcessor] Frame {frame_count}: Skipping crop for {track_key} (track_id={track_id}) - crop is too wide (aspect={aspect_ratio:.2f} > {MAX_ASPECT_RATIO}, size={crop_width}x{crop_height}) - likely placard or partial view")
+                                        log.info(f"[VideoProcessor] Frame {frame_count}: Skipping crop for {track_key} (track_id={track_id}) - crop is too wide (aspect={aspect_ratio:.2f} > {MAX_ASPECT_RATIO}, size={crop_width}x{crop_height}) - likely placard or partial view")
                         
                         # CENTERED DETECTION: Only save crop when vehicle is centered in frame
                         # This ensures GPS coordinates are captured at the most accurate moment
@@ -943,7 +993,7 @@ class VideoProcessor:
                                 with self.lock:
                                     self.centered_detection_stats['rejected_not_centered'] += 1
                                 if frame_count % 30 == 0:
-                                    print(f"[VideoProcessor] Frame {frame_count}: Skipping crop for {track_key} (track_id={track_id}) - vehicle not centered " +
+                                    log.info(f"[VideoProcessor] Frame {frame_count}: Skipping crop for {track_key} (track_id={track_id}) - vehicle not centered " +
                                           f"(bbox_center=[{bbox_center_x:.1f}, {bbox_center_y:.1f}], " +
                                           f"frame_center=[{frame_center_x:.1f}, {frame_center_y:.1f}], " +
                                           f"distance=[{horizontal_distance:.1f}, {vertical_distance:.1f}], " +
@@ -954,7 +1004,7 @@ class VideoProcessor:
                                 with self.lock:
                                     self.centered_detection_stats['vehicles_centered'] += 1
                                 if frame_count % 30 == 0:
-                                    print(f"[VideoProcessor] Frame {frame_count}: Vehicle centered for {track_key} (track_id={track_id}) " +
+                                    log.info(f"[VideoProcessor] Frame {frame_count}: Vehicle centered for {track_key} (track_id={track_id}) " +
                                           f"(bbox_center=[{bbox_center_x:.1f}, {bbox_center_y:.1f}], " +
                                           f"frame_center=[{frame_center_x:.1f}, {frame_center_y:.1f}])")
                         
@@ -990,9 +1040,9 @@ class VideoProcessor:
                                             if os.path.exists(old_crop_path):
                                                 try:
                                                     os.remove(old_crop_path)
-                                                    print(f"[VideoProcessor] Frame {frame_count}: Replacing crop for {crop_dedup_key} with better quality crop (existing: {existing_area}px²@{existing_conf:.2f}, current: {current_area}px²@{det_conf:.2f})")
+                                                    log.info(f"[VideoProcessor] Frame {frame_count}: Replacing crop for {crop_dedup_key} with better quality crop (existing: {existing_area}px²@{existing_conf:.2f}, current: {current_area}px²@{det_conf:.2f})")
                                                 except Exception as e:
-                                                    print(f"[VideoProcessor] Error removing old crop {old_crop_path}: {e}")
+                                                    log.info(f"[VideoProcessor] Error removing old crop {old_crop_path}: {e}")
                                             
                                             # Remove old metadata
                                             self.saved_crops = [c for c in self.saved_crops if c.get('track_key') != crop_dedup_key]
@@ -1002,7 +1052,7 @@ class VideoProcessor:
                                             # Crop already exists and new one isn't better - skip saving
                                             should_save_crop = False
                                             if frame_count % 30 == 0:
-                                                print(f"[VideoProcessor] Frame {frame_count}: Skipping crop for {crop_dedup_key} - crop already exists (existing: {existing_area}px²@{existing_conf:.2f}, current: {current_area}px²@{det_conf:.2f})")
+                                                log.info(f"[VideoProcessor] Frame {frame_count}: Skipping crop for {crop_dedup_key} - crop already exists (existing: {existing_area}px²@{existing_conf:.2f}, current: {current_area}px²@{det_conf:.2f})")
                                 
                                 if not should_save_crop:
                                     # Skip saving - crop already exists or not better
@@ -1044,31 +1094,31 @@ class VideoProcessor:
                                                 if self._gps_log_duration > 0 and self._total_frames > 0:
                                                     # Calculate FPS for logging purposes only
                                                     calculated_fps = self._total_frames / self._gps_log_duration
-                                                    print(f"[VideoProcessor] Video timing initialized:")
-                                                    print(f"[VideoProcessor]   Start time: {self._video_start_time}")
-                                                    print(f"[VideoProcessor]   End time: {self._video_end_time}")
-                                                    print(f"[VideoProcessor]   Duration: {self._gps_log_duration:.2f} seconds")
-                                                    print(f"[VideoProcessor]   Total frames: {int(self._total_frames)}")
-                                                    print(f"[VideoProcessor]   Calculated FPS: {calculated_fps:.2f}")
+                                                    log.info(f"[VideoProcessor] Video timing initialized:")
+                                                    log.info(f"[VideoProcessor]   Start time: {self._video_start_time}")
+                                                    log.info(f"[VideoProcessor]   End time: {self._video_end_time}")
+                                                    log.info(f"[VideoProcessor]   Duration: {self._gps_log_duration:.2f} seconds")
+                                                    log.info(f"[VideoProcessor]   Total frames: {int(self._total_frames)}")
+                                                    log.info(f"[VideoProcessor]   Calculated FPS: {calculated_fps:.2f}")
                                                 else:
                                                     # Fallback to video metadata
                                                     fps = cap.get(cv2.CAP_PROP_FPS)
                                                     self._gps_log_duration = self._total_frames / fps if fps > 0 else self._total_frames / 30.0
-                                                    print(f"[VideoProcessor] Using video metadata:")
-                                                    print(f"[VideoProcessor]   Start time: {self._video_start_time}")
-                                                    print(f"[VideoProcessor]   Total frames: {int(self._total_frames)}")
-                                                    print(f"[VideoProcessor]   Estimated duration: {self._gps_log_duration:.2f} seconds")
-                                                    print(f"[VideoProcessor]   Video FPS: {fps:.2f}")
+                                                    log.info(f"[VideoProcessor] Using video metadata:")
+                                                    log.info(f"[VideoProcessor]   Start time: {self._video_start_time}")
+                                                    log.info(f"[VideoProcessor]   Total frames: {int(self._total_frames)}")
+                                                    log.info(f"[VideoProcessor]   Estimated duration: {self._gps_log_duration:.2f} seconds")
+                                                    log.info(f"[VideoProcessor]   Video FPS: {fps:.2f}")
                                             except Exception as e:
                                                 # Fallback: use current time minus video duration
                                                 fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
                                                 self._total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
                                                 self._gps_log_duration = self._total_frames / fps
                                                 self._video_start_time = datetime.utcnow() - timedelta(seconds=self._gps_log_duration)
-                                                print(f"[VideoProcessor] Fallback timing estimation:")
-                                                print(f"[VideoProcessor]   Estimated start time: {self._video_start_time}")
-                                                print(f"[VideoProcessor]   Duration: {self._gps_log_duration:.2f} seconds")
-                                                print(f"[VideoProcessor]   FPS: {fps:.2f}")
+                                                log.info(f"[VideoProcessor] Fallback timing estimation:")
+                                                log.info(f"[VideoProcessor]   Estimated start time: {self._video_start_time}")
+                                                log.info(f"[VideoProcessor]   Duration: {self._gps_log_duration:.2f} seconds")
+                                                log.info(f"[VideoProcessor]   FPS: {fps:.2f}")
                                         
                                         # Calculate frame timestamp using direct proportion method
                                         # Formula: timestamp = start_time + (frame_count / total_frames) × total_duration
@@ -1095,18 +1145,18 @@ class VideoProcessor:
                                                 crop_heading = float(frame_gps['heading'])
                                             if 'speed' in frame_gps and frame_gps['speed'] is not None:
                                                 crop_speed = float(frame_gps['speed'])
-                                            print(f"[VideoProcessor] Frame {frame_count}: GPS retrieved at crop save: ({crop_lat:.6f}, {crop_lon:.6f})" + 
+                                            log.info(f"[VideoProcessor] Frame {frame_count}: GPS retrieved at crop save: ({crop_lat:.6f}, {crop_lon:.6f})" + 
                                                   (f", heading={crop_heading:.2f}°" if crop_heading is not None else "") +
                                                   (f", speed={crop_speed:.2f} mph" if crop_speed is not None else ""))
                                         else:
-                                            print(f"[VideoProcessor] Frame {frame_count}: No GPS match found for crop timestamp {frame_timestamp}")
+                                            log.info(f"[VideoProcessor] Frame {frame_count}: No GPS match found for crop timestamp {frame_timestamp}")
                                     except Exception as e:
-                                        print(f"[VideoProcessor] Error getting GPS for crop at frame {frame_count}: {e}")
+                                        log.info(f"[VideoProcessor] Error getting GPS for crop at frame {frame_count}: {e}")
                                         import traceback
                                         traceback.print_exc()
                                 else:
                                     if frame_count <= 5:
-                                        print(f"[VideoProcessor] WARNING: No GPS log available for crop at frame {frame_count}")
+                                        log.info(f"[VideoProcessor] WARNING: No GPS log available for crop at frame {frame_count}")
                                 
                                 # Save metadata with GPS coordinates from log file
                                 crop_metadata = {
@@ -1129,14 +1179,10 @@ class VideoProcessor:
                                     'track_key': crop_dedup_key,  # Use crop_dedup_key (with track_id) for deduplication
                                     'bbox_hash': bbox_hash,
                                     'timestamp': datetime.utcnow().isoformat(),
-                                    'camera_id': camera_id
+                                    'camera_id': camera_id,
+                                    'heading': crop_heading,  # From GPS log file (None if not in log)
+                                    'speed': crop_speed,  # From GPS log file (None if not in log)
                                 }
-                                
-                                # Add heading and speed if available
-                                if crop_heading is not None:
-                                    crop_metadata['heading'] = crop_heading
-                                if crop_speed is not None:
-                                    crop_metadata['speed'] = crop_speed
                                 
                                 self.saved_crops.append(crop_metadata)
                                 # Store by crop_dedup_key (includes track_id) to ensure one crop per unique track_id
@@ -1147,10 +1193,10 @@ class VideoProcessor:
                                     self.stats['crops_saved'] += 1
                                 
                                 if frame_count % 30 == 0 or len(self.saved_crops) <= 10:
-                                    print(f"[VideoProcessor] Frame {frame_count}: Saved crop for {crop_dedup_key} (track_id={track_id}, size={width}x{height}, area={width*height}, conf={det_conf:.2f}) -> {crop_filename} (total unique tracks: {len(self.crop_deduplication)})")
+                                    log.info(f"[VideoProcessor] Frame {frame_count}: Saved crop for {crop_dedup_key} (track_id={track_id}, size={width}x{height}, area={width*height}, conf={det_conf:.2f}) -> {crop_filename} (total unique tracks: {len(self.crop_deduplication)})")
                                     
                             except Exception as e:
-                                print(f"[VideoProcessor] Error saving crop at frame {frame_count}: {e}")
+                                log.info(f"[VideoProcessor] Error saving crop at frame {frame_count}: {e}")
                         
                         # TWO-STAGE APPROACH: Skip OCR during video processing (will be done in batch later)
                         # Set empty OCR results for now - OCR will be done in Stage 2 (batch processing)
@@ -1232,7 +1278,7 @@ class VideoProcessor:
                                 'height': height
                             }
                     except Exception as e:
-                        print(f"[VideoProcessor] Error processing track at frame {frame_count}: {e}")
+                        log.info(f"[VideoProcessor] Error processing track at frame {frame_count}: {e}")
                         import traceback
                         traceback.print_exc()
                 
@@ -1256,7 +1302,7 @@ class VideoProcessor:
                 # Print progress every 30 frames
                 if frame_count % 30 == 0:
                     with self.lock:
-                        print(f"[VideoProcessor] Processed {frame_count} frames (offset: {frame_offset}), detections: {self.stats['detections']}, tracks: {self.stats['tracks']}, OCR: {self.stats['ocr_results']}")
+                        log.info(f"[VideoProcessor] Processed {frame_count} frames (offset: {frame_offset}), detections: {self.stats['detections']}, tracks: {self.stats['tracks']}, OCR: {self.stats['ocr_results']}")
                 
                 # Yield with adjusted frame number (including offset for split videos)
                 yield (frame_count + frame_offset, processed_frame, frame_events)
@@ -1269,7 +1315,7 @@ class VideoProcessor:
             cap.release()
             
             # Post-processing: Merge nearby clusters and consolidate OCR results
-            print(f"[VideoProcessor] Post-processing: Merging clusters and consolidating OCR...")
+            log.info(f"[VideoProcessor] Post-processing: Merging clusters and consolidating OCR...")
             self._merge_nearby_clusters()
             self._consolidate_ocr_results()
             
@@ -1284,27 +1330,35 @@ class VideoProcessor:
                 metadata_path = self.crops_dir / "crops_metadata.json"
                 
                 if len(self.saved_crops) > 0:
+                    # Ensure every crop has lat, lon, heading, speed keys for downstream (values may be None)
+                    def _norm(c):
+                        d = dict(c)
+                        for key in ('lat', 'lon', 'heading', 'speed'):
+                            if key not in d:
+                                d[key] = None
+                        return d
+                    to_dump = [_norm(c) for c in self.saved_crops]
                     with open(metadata_path, 'w') as f:
-                        json.dump(self.saved_crops, f, indent=2)
+                        json.dump(to_dump, f, indent=2)
                     
                     with self.lock:
                         stats = self.centered_detection_stats.copy()
                     
-                    print(f"[VideoProcessor] ✓ Saved {len(self.saved_crops)} crop metadata to {metadata_path}")
-                    print(f"[VideoProcessor] ")
-                    print(f"[VideoProcessor] Centered Detection Summary:")
-                    print(f"[VideoProcessor]   Vehicles detected (after filters): {stats['vehicles_detected']}")
-                    print(f"[VideoProcessor]   Vehicles centered & saved: {stats['vehicles_centered']} ✓")
-                    print(f"[VideoProcessor]   Rejected - not centered: {stats['rejected_not_centered']}")
-                    print(f"[VideoProcessor]   Rejected - too small: {stats['rejected_too_small']}")
-                    print(f"[VideoProcessor]   Rejected - aspect ratio: {stats['rejected_aspect_ratio']}")
-                    print(f"[VideoProcessor]   Rejected - clipped: {stats['rejected_clipped']}")
+                    log.info(f"[VideoProcessor] ✓ Saved {len(self.saved_crops)} crop metadata to {metadata_path}")
+                    log.info(f"[VideoProcessor] ")
+                    log.info(f"[VideoProcessor] Centered Detection Summary:")
+                    log.info(f"[VideoProcessor]   Vehicles detected (after filters): {stats['vehicles_detected']}")
+                    log.info(f"[VideoProcessor]   Vehicles centered & saved: {stats['vehicles_centered']} ✓")
+                    log.info(f"[VideoProcessor]   Rejected - not centered: {stats['rejected_not_centered']}")
+                    log.info(f"[VideoProcessor]   Rejected - too small: {stats['rejected_too_small']}")
+                    log.info(f"[VideoProcessor]   Rejected - aspect ratio: {stats['rejected_aspect_ratio']}")
+                    log.info(f"[VideoProcessor]   Rejected - clipped: {stats['rejected_clipped']}")
                     if stats['vehicles_centered'] > 0:
                         capture_rate = (stats['vehicles_centered'] / stats['vehicles_detected'] * 100) if stats['vehicles_detected'] > 0 else 0
-                        print(f"[VideoProcessor]   Capture rate: {capture_rate:.1f}% of detected vehicles")
-                    print(f"[VideoProcessor] ")
-                    print(f"[VideoProcessor] Crops directory: {self.crops_dir}")
-                    print(f"[VideoProcessor] Ready for batch OCR processing")
+                        log.info(f"[VideoProcessor]   Capture rate: {capture_rate:.1f}% of detected vehicles")
+                    log.info(f"[VideoProcessor] ")
+                    log.info(f"[VideoProcessor] Crops directory: {self.crops_dir}")
+                    log.info(f"[VideoProcessor] Ready for batch OCR processing")
                 else:
                     # Save empty metadata with explanation when no crops were saved
                     empty_metadata = {
@@ -1323,42 +1377,42 @@ class VideoProcessor:
                         total_tracks = self.stats.get('tracks', 0)
                         stats = self.centered_detection_stats.copy()
                     
-                    print(f"[VideoProcessor] ⚠️  WARNING: No crops saved for this video!")
-                    print(f"[VideoProcessor] Reason: No vehicles were detected as centered in the frame")
-                    print(f"[VideoProcessor] ")
-                    print(f"[VideoProcessor] Processing Summary:")
-                    print(f"[VideoProcessor]   Total frames: {frame_count}")
-                    print(f"[VideoProcessor]   Total detections: {total_detections}")
-                    print(f"[VideoProcessor]   Total tracks: {total_tracks}")
-                    print(f"[VideoProcessor] ")
-                    print(f"[VideoProcessor] Centered Detection Stats:")
-                    print(f"[VideoProcessor]   Vehicles detected (after filters): {stats['vehicles_detected']}")
-                    print(f"[VideoProcessor]   Vehicles centered: {stats['vehicles_centered']} ✓")
-                    print(f"[VideoProcessor]   Rejected - not centered: {stats['rejected_not_centered']}")
-                    print(f"[VideoProcessor]   Rejected - too small: {stats['rejected_too_small']}")
-                    print(f"[VideoProcessor]   Rejected - aspect ratio: {stats['rejected_aspect_ratio']}")
-                    print(f"[VideoProcessor]   Rejected - clipped: {stats['rejected_clipped']}")
-                    print(f"[VideoProcessor] ")
-                    print(f"[VideoProcessor] Current tolerance settings:")
-                    print(f"[VideoProcessor]   Horizontal: 15% of frame width = {int(frame_width*0.15)}px")
-                    print(f"[VideoProcessor]   Vertical: 20% of frame height = {int(frame_height*0.20)}px")
-                    print(f"[VideoProcessor] ")
-                    print(f"[VideoProcessor] Suggestions:")
-                    print(f"[VideoProcessor]   - If vehicles are passing through but not being captured,")
-                    print(f"[VideoProcessor]     increase tolerance in video_processor.py (line ~920)")
-                    print(f"[VideoProcessor]   - Try: horizontal_threshold = frame_width * 0.25")
-                    print(f"[VideoProcessor]   - Try: vertical_threshold = frame_height * 0.30")
-                    print(f"[VideoProcessor] ")
-                    print(f"[VideoProcessor] Empty metadata saved to: {metadata_path}")
+                    log.info(f"[VideoProcessor] ⚠️  WARNING: No crops saved for this video!")
+                    log.info(f"[VideoProcessor] Reason: No vehicles were detected as centered in the frame")
+                    log.info(f"[VideoProcessor] ")
+                    log.info(f"[VideoProcessor] Processing Summary:")
+                    log.info(f"[VideoProcessor]   Total frames: {frame_count}")
+                    log.info(f"[VideoProcessor]   Total detections: {total_detections}")
+                    log.info(f"[VideoProcessor]   Total tracks: {total_tracks}")
+                    log.info(f"[VideoProcessor] ")
+                    log.info(f"[VideoProcessor] Centered Detection Stats:")
+                    log.info(f"[VideoProcessor]   Vehicles detected (after filters): {stats['vehicles_detected']}")
+                    log.info(f"[VideoProcessor]   Vehicles centered: {stats['vehicles_centered']} ✓")
+                    log.info(f"[VideoProcessor]   Rejected - not centered: {stats['rejected_not_centered']}")
+                    log.info(f"[VideoProcessor]   Rejected - too small: {stats['rejected_too_small']}")
+                    log.info(f"[VideoProcessor]   Rejected - aspect ratio: {stats['rejected_aspect_ratio']}")
+                    log.info(f"[VideoProcessor]   Rejected - clipped: {stats['rejected_clipped']}")
+                    log.info(f"[VideoProcessor] ")
+                    log.info(f"[VideoProcessor] Current tolerance settings:")
+                    log.info(f"[VideoProcessor]   Horizontal: 15% of frame width = {int(frame_width*0.15)}px")
+                    log.info(f"[VideoProcessor]   Vertical: 20% of frame height = {int(frame_height*0.20)}px")
+                    log.info(f"[VideoProcessor] ")
+                    log.info(f"[VideoProcessor] Suggestions:")
+                    log.info(f"[VideoProcessor]   - If vehicles are passing through but not being captured,")
+                    log.info(f"[VideoProcessor]     increase tolerance in video_processor.py (line ~920)")
+                    log.info(f"[VideoProcessor]   - Try: horizontal_threshold = frame_width * 0.25")
+                    log.info(f"[VideoProcessor]   - Try: vertical_threshold = frame_height * 0.30")
+                    log.info(f"[VideoProcessor] ")
+                    log.info(f"[VideoProcessor] Empty metadata saved to: {metadata_path}")
             
             with self.lock:
                 final_stats = self.stats.copy()
-            print(f"[VideoProcessor] Finished processing {frame_count} frames")
-            print(f"[VideoProcessor] Final stats: {final_stats}")
-            print(f"[VideoProcessor] Total frames stored: {len(self.processed_frames)}")
+            log.info(f"[VideoProcessor] Finished processing {frame_count} frames")
+            log.info(f"[VideoProcessor] Final stats: {final_stats}")
+            log.info(f"[VideoProcessor] Total frames stored: {len(self.processed_frames)}")
         
         except Exception as e:
-            print(f"[VideoProcessor] Fatal error during video processing: {e}")
+            log.info(f"[VideoProcessor] Fatal error during video processing: {e}")
             import traceback
             traceback.print_exc()
             # Even on error, mark processing as done
@@ -1586,9 +1640,9 @@ class VideoProcessor:
                     if crop_path_obj.exists():
                         try:
                             crop_path_obj.unlink()
-                            print(f"[VideoProcessor] Removed duplicate/small crop: {crop_path_obj}")
+                            log.info(f"[VideoProcessor] Removed duplicate/small crop: {crop_path_obj}")
                         except Exception as e:
-                            print(f"[VideoProcessor] Error removing crop {crop_path_obj}: {e}")
+                            log.info(f"[VideoProcessor] Error removing crop {crop_path_obj}: {e}")
                 
                 # Remove from crop_deduplication
                 track_key = crop_metadata.get('track_key', '')
@@ -1623,9 +1677,9 @@ class VideoProcessor:
                             if file_track_id in kept_track_ids:
                                 try:
                                     crop_file.unlink()
-                                    print(f"[VideoProcessor] Removed orphaned crop file for track_id {file_track_id}: {crop_file.name}")
+                                    log.info(f"[VideoProcessor] Removed orphaned crop file for track_id {file_track_id}: {crop_file.name}")
                                 except Exception as e:
-                                    print(f"[VideoProcessor] Error removing orphaned crop {crop_file}: {e}")
+                                    log.info(f"[VideoProcessor] Error removing orphaned crop {crop_file}: {e}")
                     except (ValueError, IndexError):
                         # Can't parse track_id from filename, skip
                         pass
@@ -1641,7 +1695,7 @@ class VideoProcessor:
             }
             
             if len(crops_to_remove) > 0:
-                print(f"[VideoProcessor] Cleaned up {len(crops_to_remove)} duplicate/small crops, kept {len(crops_to_keep)} best quality crops (one per unique track_id)")
+                log.info(f"[VideoProcessor] Cleaned up {len(crops_to_remove)} duplicate/small crops, kept {len(crops_to_keep)} best quality crops (one per unique track_id)")
             
             # After cleanup, check if any track_ids are missing crops
             # This handles cases where track_ids had crops that were filtered out during cleanup
@@ -1673,7 +1727,7 @@ class VideoProcessor:
             
             # Try to create crops for missing track_ids from unique_tracks events
             if track_ids_needing_crops and len(self.processed_frames) > 0:
-                print(f"[VideoProcessor] Found {len(track_ids_needing_crops)} track_ids without crops, attempting to create crops from stored frames...")
+                log.info(f"[VideoProcessor] Found {len(track_ids_needing_crops)} track_ids without crops, attempting to create crops from stored frames...")
                 for track_id, spot, cluster_id in track_ids_needing_crops:
                     crop_dedup_key = f"{spot}_cluster_{cluster_id}_track_{track_id}"
                     
@@ -1913,7 +1967,7 @@ class VideoProcessor:
                                         
                                         if not is_valid_crop:
                                             aspect_info = f", aspect={aspect_ratio:.2f}" if original_area > 0 else ""
-                                            print(f"[VideoProcessor] Skipping partial crop for {crop_dedup_key} from frame {frame_num} - visible={visible_ratio:.1%}, width={width_ratio:.1%}, height={height_ratio:.1%}{aspect_info}, near_edges={near_left_edge + near_right_edge + near_top_edge + near_bottom_edge}, is_fallback={is_fallback}")
+                                            log.info(f"[VideoProcessor] Skipping partial crop for {crop_dedup_key} from frame {frame_num} - visible={visible_ratio:.1%}, width={width_ratio:.1%}, height={height_ratio:.1%}{aspect_info}, near_edges={near_left_edge + near_right_edge + near_top_edge + near_bottom_edge}, is_fallback={is_fallback}")
                                             continue
                                         
                                         crop = frame[crop_y1:crop_y2, crop_x1:crop_x2]
@@ -1982,7 +2036,7 @@ class VideoProcessor:
                                                                 if 'speed' in frame_gps and frame_gps['speed'] is not None:
                                                                     crop_speed = float(frame_gps['speed'])
                                                 except Exception as e:
-                                                    print(f"[VideoProcessor] Error getting GPS for missing crop metadata at frame {frame_num}: {e}")
+                                                    log.info(f"[VideoProcessor] Error getting GPS for missing crop metadata at frame {frame_num}: {e}")
                                             
                                             crop_metadata = {
                                                 'crop_path': str(crop_path),
@@ -2003,24 +2057,20 @@ class VideoProcessor:
                                                 'track_key': crop_dedup_key,  # Use crop_dedup_key (with track_id)
                                                 'bbox_hash': bbox_hash,
                                                 'timestamp': datetime.utcnow().isoformat(),
-                                                'camera_id': event.get('camera_id', 'test-video')
+                                                'camera_id': event.get('camera_id', 'test-video'),
+                                                'heading': crop_heading,  # From GPS log file (None if not in log)
+                                                'speed': crop_speed,  # From GPS log file (None if not in log)
                                             }
-                                            
-                                            # Add heading and speed if available
-                                            if crop_heading is not None:
-                                                crop_metadata['heading'] = crop_heading
-                                            if crop_speed is not None:
-                                                crop_metadata['speed'] = crop_speed
                                             
                                             crops_to_keep.append(crop_metadata)
                                             self.crop_deduplication[crop_dedup_key] = str(crop_path)
-                                            print(f"[VideoProcessor] Created missing crop for {crop_dedup_key} from frame {frame_num} (size={width}x{height}, area={width*height}, conf={event.get('det_conf', 0.0):.2f})")
+                                            log.info(f"[VideoProcessor] Created missing crop for {crop_dedup_key} from frame {frame_num} (size={width}x{height}, area={width*height}, conf={event.get('det_conf', 0.0):.2f})")
                                             crop_created = True
                             except Exception as e:
-                                print(f"[VideoProcessor] Error creating crop for {crop_dedup_key}: {e}")
+                                log.info(f"[VideoProcessor] Error creating crop for {crop_dedup_key}: {e}")
                     
                     if not crop_created:
-                        print(f"[VideoProcessor] Could not create valid crop for {crop_dedup_key} - all available detections were too partial or invalid")
+                        log.info(f"[VideoProcessor] Could not create valid crop for {crop_dedup_key} - all available detections were too partial or invalid")
                 
                 # Update saved_crops with newly created crops
                 self.saved_crops = crops_to_keep
@@ -2092,11 +2142,11 @@ class VideoProcessor:
                     if conf_i >= conf_j:
                         keep_indices.discard(j)  # Remove j, keep i
                         if frame_count % 30 == 0:
-                            print(f"[VideoProcessor] Frame {frame_count}: Deduplicated overlapping tracks {tracks[i].get('track_id', '?')} and {tracks[j].get('track_id', '?')} (IoU={iou:.2f}), keeping track {tracks[i].get('track_id', '?')}")
+                            log.info(f"[VideoProcessor] Frame {frame_count}: Deduplicated overlapping tracks {tracks[i].get('track_id', '?')} and {tracks[j].get('track_id', '?')} (IoU={iou:.2f}), keeping track {tracks[i].get('track_id', '?')}")
                     else:
                         keep_indices.discard(i)  # Remove i, keep j
                         if frame_count % 30 == 0:
-                            print(f"[VideoProcessor] Frame {frame_count}: Deduplicated overlapping tracks {tracks[i].get('track_id', '?')} and {tracks[j].get('track_id', '?')} (IoU={iou:.2f}), keeping track {tracks[j].get('track_id', '?')}")
+                            log.info(f"[VideoProcessor] Frame {frame_count}: Deduplicated overlapping tracks {tracks[i].get('track_id', '?')} and {tracks[j].get('track_id', '?')} (IoU={iou:.2f}), keeping track {tracks[j].get('track_id', '?')}")
         
         # Return only kept tracks
         return [tracks[i] for i in sorted(keep_indices)]
@@ -2248,7 +2298,7 @@ class VideoProcessor:
                             # Even if they're far apart, they're probably the same trailer moving
                             if dist <= 15.0:
                                 should_merge = True
-                                print(f"[VideoProcessor] Merging substantial clusters {cid1} and {cid2} in same spot {spot1} (dist={dist:.2f}m, counts={cluster1['count']}/{cluster2['count']})")
+                                log.info(f"[VideoProcessor] Merging substantial clusters {cid1} and {cid2} in same spot {spot1} (dist={dist:.2f}m, counts={cluster1['count']}/{cluster2['count']})")
                         elif dist <= MERGE_DISTANCE_THRESHOLD:
                             # Both smaller clusters in same spot - use strict 3m threshold
                             should_merge = True
@@ -2437,11 +2487,11 @@ class VideoProcessor:
             # Cluster merging only handles spatial proximity, not track identity.
             
             if merged_into:
-                print(f"[VideoProcessor] Merged {len(merged_into)} clusters, remaining: {len(self.position_clusters)}")
+                log.info(f"[VideoProcessor] Merged {len(merged_into)} clusters, remaining: {len(self.position_clusters)}")
                 if spot_cluster_updates:
-                    print(f"[VideoProcessor] Updated {len(spot_cluster_updates)} track keys after cluster merge")
+                    log.info(f"[VideoProcessor] Updated {len(spot_cluster_updates)} track keys after cluster merge")
             else:
-                print(f"[VideoProcessor] No clusters merged (found {len(cluster_ids)} clusters)")
+                log.info(f"[VideoProcessor] No clusters merged (found {len(cluster_ids)} clusters)")
             
             # Filter out small clusters (likely false positives) and unrealistic positions
             # This is done AFTER merging to catch any remaining small clusters
@@ -2478,10 +2528,10 @@ class VideoProcessor:
             
             # Remove invalid clusters
             if clusters_to_remove:
-                print(f"[VideoProcessor] Filtering out {len(clusters_to_remove)} invalid clusters:")
+                log.info(f"[VideoProcessor] Filtering out {len(clusters_to_remove)} invalid clusters:")
                 for cid, reasons in clusters_to_remove:
                     cluster = self.position_clusters[cid]
-                    print(f"  Removing Cluster {cid}: center=({cluster['center_x']:.2f}, {cluster['center_y']:.2f}), count={cluster['count']} - {', '.join(reasons)}")
+                    log.info(f"  Removing Cluster {cid}: center=({cluster['center_x']:.2f}, {cluster['center_y']:.2f}), count={cluster['count']} - {', '.join(reasons)}")
                     
                     # Remove cluster
                     del self.position_clusters[cid]
@@ -2513,13 +2563,13 @@ class VideoProcessor:
                         if track_key in self.track_ocr_results:
                             del self.track_ocr_results[track_key]
                 
-                print(f"[VideoProcessor] After filtering: {len(self.position_clusters)} valid clusters remaining")
+                log.info(f"[VideoProcessor] After filtering: {len(self.position_clusters)} valid clusters remaining")
             
             # Debug: print remaining cluster positions
             if len(self.position_clusters) > 0:
-                print(f"[VideoProcessor] Valid clusters:")
+                log.info(f"[VideoProcessor] Valid clusters:")
                 for cid, cluster in self.position_clusters.items():
-                    print(f"  Cluster {cid}: center=({cluster['center_x']:.2f}, {cluster['center_y']:.2f}), count={cluster['count']}")
+                    log.info(f"  Cluster {cid}: center=({cluster['center_x']:.2f}, {cluster['center_y']:.2f}), count={cluster['count']}")
     
     def _consolidate_ocr_results(self):
         """Consolidate all OCR results per track into a single best result."""
@@ -2733,9 +2783,9 @@ class VideoProcessor:
                     best_text = combined_text
                     best_score = combined_score
                     best_avg_conf = combined_conf
-                    print(f"[VideoProcessor] OCR consolidation for {track_key}: Combined '{combined_text}' (score: {combined_score:.2f})")
+                    log.info(f"[VideoProcessor] OCR consolidation for {track_key}: Combined '{combined_text}' (score: {combined_score:.2f})")
                 elif combined_text:
-                    print(f"[VideoProcessor] OCR consolidation for {track_key}: Combined '{combined_text}' (score: {combined_score:.2f}) < best '{best_text}' (score: {best_score:.2f})")
+                    log.info(f"[VideoProcessor] OCR consolidation for {track_key}: Combined '{combined_text}' (score: {combined_score:.2f}) < best '{best_text}' (score: {best_score:.2f})")
                 
                 # Store consolidated result
                 consolidated[track_key] = {
@@ -2749,7 +2799,7 @@ class VideoProcessor:
             # Replace the list-based storage with consolidated results
             self.track_ocr_results = consolidated
             
-            print(f"[VideoProcessor] Consolidated OCR results for {len(consolidated)} tracks")
+            log.info(f"[VideoProcessor] Consolidated OCR results for {len(consolidated)} tracks")
     
     def stop_processing(self):
         """Stop video processing."""

@@ -467,20 +467,21 @@ class OlmOCRRecognizer:
                     "phone numbers, and any other visible text. "
                     "For vertical text, read each character from top to bottom. "
                     "List each unique text element only once, separated by spaces. "
-                    "Do not skip any text, even if it appears faint or low-contrast."
+                    "Do not skip any text, even if it appears faint or low-contrast. "
+                    "Output ONLY text that actually appears in the image. Do not output example strings from this instruction."
                 )
             else:
                 # Enhanced prompt for cropped regions to focus on trailer IDs and company names
                 # Trailer IDs often have company prefixes (like "JBHU", "INYU") followed by numbers
                 # Company names (like "J.B. HUNT", "THERMO KING") should also be detected
-                # IMPORTANT: Extract ALL trailer IDs and company names if multiple are present
+                # IMPORTANT: Do NOT use example strings from this prompt when no text is visible (avoids hallucination).
                 prompt = (
                     "Extract ALL trailer identification codes and/or company names from this image. "
                     "Trailer IDs can have these formats: "
-                    "1) Company prefix followed by numbers (e.g., 'JBHU 342345', 'INYU 500434','3000R7560','TSFZ 562124', 'HMKD 808154'), "
+                    "1) Company prefix followed by numbers (e.g., 'INYU 500434', '3000R7560', 'TSFZ 562124', 'HMKD 808154'), "
                     "2) Alphanumeric codes (e.g., 'A96904', '538148', '53124'), "
-                    "3) Numbers only (e.g., '711538', '342345', '500434', '372') - these are also valid trailer IDs. "
-                    "The company prefix is usually 2-6 letters (like 'JBHU', 'INYU', 'TSFZ', 'HMKD', 'NSPZ') followed by a space and numbers. "
+                    "3) Numbers only (e.g., '711538', '500434', '372') - these are also valid trailer IDs. "
+                    "The company prefix is usually 2-6 letters (like 'INYU', 'TSFZ', 'HMKD', 'NSPZ') followed by a space and numbers. "
                     "Also extract company names if present (e.g., 'J.B. HUNT', 'THERMO KING', 'ADVANCE Pallet Inc.', 'DCLI'). "
                     "CRITICAL: If multiple trailer IDs are present (e.g., 'INYU 500501' and 'TSFZ 562124'), extract ALL of them. "
                     "CRITICAL: Look for numeric-only trailer IDs (like '711538', '372') which may appear vertically or in different locations. "
@@ -490,7 +491,11 @@ class OlmOCRRecognizer:
                     "(e.g., if you see '72' on left and '3' vertically on right, the correct reading is likely '372', not '72 3'). "
                     "Return all trailer identification codes and/or company names separated by spaces. "
                     "Ignore logos, phone numbers, state codes, or other text that is not a trailer ID or company name. "
-                    "Return only the identification codes and/or company names, no explanations."
+                    "If NO trailer ID or company name is visible in the image, respond with exactly: NONE. "
+                    "Do not guess or invent text. "
+                    "CRITICAL: The strings in parentheses above (e.g. 'INYU 500434', 'TSFZ 562124', 'A96904', '372') are FORMAT EXAMPLES ONLY. "
+                    "Never output those exact strings or any variation of them unless they actually appear in the image. "
+                    "Output ONLY text you see in the image. Return only the identification codes and/or company names, no explanations."
                 )
             
             # Calculate max_tokens before preprocessing
@@ -950,6 +955,16 @@ class OlmOCRRecognizer:
             
             if not output_text or len(output_text.strip()) < 1:
                 print(f"[oLmOCR] Warning: Model returned empty or very short output")
+                return {'text': '', 'conf': 0.0}
+            
+            # Treat "NONE" (no text visible) and known prompt-hallucination example as empty
+            output_stripped = output_text.strip().upper()
+            if output_stripped == 'NONE':
+                print(f"[oLmOCR] Model reported no text visible (NONE)")
+                return {'text': '', 'conf': 0.0}
+            # Reject known hallucination: model sometimes outputs the old prompt example when no text is detected
+            if output_stripped.replace(' ', '') == 'JBHU342345':
+                print(f"[oLmOCR] Rejected prompt-hallucination output: JBHU342345")
                 return {'text': '', 'conf': 0.0}
             
             # Check for garbage outputs (repeated characters, etc.) BEFORE any processing

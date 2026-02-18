@@ -6,7 +6,7 @@ End-to-end processing pipeline:
 2. Detection (YOLO TensorRT)
 3. Tracking (ByteTrack)
 4. OCR (TrOCR/PaddleOCR/CRNN TensorRT)
-5. BEV projection (image -> world using deep learning)
+5. GPS coordinates from GPS sensor/log files
 6. Spot resolution (GeoJSON polygons)
 7. Logging, publishing, metrics
 """
@@ -19,7 +19,7 @@ import cv2
 import numpy as np
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 import signal
 import threading
 import gc
@@ -53,7 +53,11 @@ from app.image_preprocessing import ImagePreprocessor
 from app.gps_sensor import GPSSensor
 from app.video_recorder import VideoRecorder
 from app.processing_queue import ProcessingQueueManager
+from app.video_frame_db import VideoFrameDB
+from app.app_logger import setup_logging, get_logger
 import requests
+
+log = get_logger(__name__)
 
 
 class TrailerVisionApp:
@@ -68,6 +72,7 @@ class TrailerVisionApp:
         Args:
             config_path: Path to cameras.yaml configuration
         """
+        setup_logging()
         self.config_path = config_path
         self.config = self._load_config()
         self.running = False
@@ -83,11 +88,11 @@ class TrailerVisionApp:
         self.metrics_server = None
         self.preprocessor = None
         self.processing_queue = None  # Processing queue manager for automated workflow
+        self.video_frame_db = None  # Database for storing video frame records
         
-        # Per-camera trackers and BEV projectors
+        # Per-camera trackers
         self.trackers = {}
         self.camera_3d_projectors = {}  # camera_id -> Camera3DProjector (priority)
-        self.bev_projectors = {}  # camera_id -> BEVProjector (fallback)
         
         # Check if OCR is oLmOCR (needs GPU memory cleanup)
         self.is_olmocr = False  # Will be set after OCR initialization
@@ -119,6 +124,8 @@ class TrailerVisionApp:
         self.recording_stopped = False  # True when recording stopped but processing continues
         self.shutdown_lock = threading.Lock()  # Lock for thread-safe state access
         
+        # Detection mode for automatic pipeline (car vs trailer); can be overridden in config
+        self.detection_mode = 'trailer'
         self._initialize_components()
     
     def _load_config(self) -> Dict:
@@ -129,6 +136,10 @@ class TrailerVisionApp:
     def _initialize_components(self):
         """Initialize all application components."""
         globals_cfg = self.config.get('globals', {})
+        # Detection mode for recording/auto pipeline: 'car' or 'trailer'
+        dm = (globals_cfg.get('detection_mode') or 'trailer').strip().lower()
+        self.detection_mode = dm if dm in ('car', 'trailer') else 'trailer'
+        log.info(f"[TrailerVisionApp] Detection mode: {self.detection_mode}")
         
         # Initialize detector - prefer fine-tuned YOLO model over TensorRT engine
         fine_tuned_model_path = "runs/detect/truck_detector_finetuned/weights/best.pt"
@@ -136,53 +147,53 @@ class TrailerVisionApp:
         
         if os.path.exists(fine_tuned_model_path):
             # Use fine-tuned YOLO model
-            print(f"Loading fine-tuned YOLO model: {fine_tuned_model_path}")
+            log.info(f"Loading fine-tuned YOLO model: {fine_tuned_model_path}")
             try:
                 self.detector = YOLOv8Detector(
                     model_name=fine_tuned_model_path,
                     conf_threshold=globals_cfg.get('detector_conf', 0.35),
                     target_class=0  # Fine-tuned model is single-class (trailer = class 0)
                 )
-                print(f"✓ Fine-tuned YOLO model loaded successfully")
+                log.info(f"✓ Fine-tuned YOLO model loaded successfully")
             except Exception as e:
-                print(f"Error loading fine-tuned YOLO model: {e}")
-                print(f"Falling back to TensorRT engine...")
+                log.info(f"Error loading fine-tuned YOLO model: {e}")
+                log.info(f"Falling back to TensorRT engine...")
                 self.detector = None
         else:
-            print(f"Fine-tuned model not found: {fine_tuned_model_path}")
+            log.info(f"Fine-tuned model not found: {fine_tuned_model_path}")
             self.detector = None
         
         # Fallback to TensorRT engine if fine-tuned model not available or failed
         if self.detector is None and os.path.exists(engine_path):
-            print(f"Loading TensorRT engine: {engine_path}")
+            log.info(f"Loading TensorRT engine: {engine_path}")
             try:
                 self.detector = TrtEngineYOLO(
                     engine_path,
                     conf_threshold=globals_cfg.get('detector_conf', 0.35)
                 )
-                print(f"✓ TensorRT engine loaded successfully")
+                log.info(f"✓ TensorRT engine loaded successfully")
             except Exception as e:
-                print(f"Error loading TensorRT engine: {e}")
+                log.info(f"Error loading TensorRT engine: {e}")
                 self.detector = None
         
         if self.detector is None:
-            print(f"Warning: No detector available. Tried:")
-            print(f"  - Fine-tuned model: {fine_tuned_model_path}")
-            print(f"  - TensorRT engine: {engine_path}")
+            log.warning("No detector available. Tried:")
+            log.info(f"  - Fine-tuned model: {fine_tuned_model_path}")
+            log.info(f"  - TensorRT engine: {engine_path}")
         
         # Initialize OCR - Lazy loading: Don't load OCR initially to save memory
         # OCR will be loaded on-demand when explicitly requested (not automatically)
         # This prevents memory issues when processing large videos
         self.ocr = None
         self.is_olmocr = False
-        print(f"[TrailerVisionApp] OCR loading deferred - will be loaded on-demand when requested")
+        log.info(f"[TrailerVisionApp] OCR loading deferred - will be loaded on-demand when requested")
         
         # Initialize spot resolver
         spots_path = "config/spots.geojson"
         if os.path.exists(spots_path):
             self.spot_resolver = SpotResolver(spots_path)
         else:
-            print(f"Warning: Spots GeoJSON not found: {spots_path}")
+            log.warning("Spots GeoJSON not found: %s", spots_path)
         
         # Initialize uploader
         self.uploader = UploadManager()
@@ -234,12 +245,12 @@ class TrailerVisionApp:
             if gps_port:
                 self.gps_sensor = GPSSensor(port=gps_port, baudrate=4800)
                 self.gps_sensor.start()
-                print(f"[TrailerVisionApp] GPS sensor initialized on {gps_port} at 4800 baud")
+                log.info(f"[TrailerVisionApp] GPS sensor initialized on {gps_port} at 4800 baud")
             else:
-                print(f"[TrailerVisionApp] No GPS port found, GPS sensor disabled")
+                log.info(f"[TrailerVisionApp] No GPS port found, GPS sensor disabled")
                 self.gps_sensor = None
         except Exception as e:
-            print(f"[TrailerVisionApp] Failed to initialize GPS sensor: {e}")
+            log.warning("[TrailerVisionApp] Failed to initialize GPS sensor: %s", e)
             self.gps_sensor = None
         
         # Initialize video recorder with 45-second auto-chunking
@@ -247,10 +258,10 @@ class TrailerVisionApp:
         self.video_recorder = VideoRecorder(
             output_dir="out/recordings",
             gps_sensor=self.gps_sensor,
-            chunk_duration_seconds=45.0,  # 45-second chunks
+            chunk_duration_seconds=30.0,  # 30-second chunks
             on_chunk_saved=None  # Will be set after processing queue initialization
         )
-        print(f"[TrailerVisionApp] Video recorder initialized with 45-second auto-chunking")
+        log.info(f"[TrailerVisionApp] Video recorder initialized with 45-second auto-chunking")
         
         # Initialize image preprocessor
         # IMPORTANT: Disable rotation for oLmOCR and EasyOCR because they handle rotation internally.
@@ -269,20 +280,19 @@ class TrailerVisionApp:
             ocr_strategy=preproc_cfg.get('ocr_strategy', 'multi'),
             enable_rotation=enable_rotation
         )
-        print(f"[TrailerVisionApp] Image preprocessing enabled:")
-        print(f"  YOLO: {self.preprocessor.enable_yolo_preprocessing} ({self.preprocessor.yolo_strategy})")
-        print(f"  OCR: {self.preprocessor.enable_ocr_preprocessing} ({self.preprocessor.ocr_strategy})")
+        log.info(f"[TrailerVisionApp] Image preprocessing enabled:")
+        log.info(f"  YOLO: {self.preprocessor.enable_yolo_preprocessing} ({self.preprocessor.yolo_strategy})")
+        log.info(f"  OCR: {self.preprocessor.enable_ocr_preprocessing} ({self.preprocessor.ocr_strategy})")
         if is_olmocr:
             rotation_msg = "Disabled (oLmOCR handles rotation internally)"
         elif is_easyocr:
             rotation_msg = "Disabled (EasyOCR handles rotation internally)"
         else:
             rotation_msg = "Enabled"
-        print(f"  Rotation: {rotation_msg}")
+        log.info(f"  Rotation: {rotation_msg}")
         
-        # Load 3D projectors and BEV projectors for each camera
+        # Load 3D projectors for each camera (GPS coordinates come from GPS sensor/log files)
         self.gps_references = {}  # Store GPS reference for each camera
-        from app.bev_utils import BEVProjector
         
         for camera in self.config.get('cameras', []):
             camera_id = camera['id']
@@ -301,9 +311,9 @@ class TrailerVisionApp:
                         gps_reference = gps_ref
                         gps_msg = f"with GPS reference: ({gps_ref['lat']:.6f}, {gps_ref['lon']:.6f})"
                         self.gps_references[camera_id] = gps_ref
-                    print(f"Loaded 3D projector for {camera_id} {gps_msg}")
+                    log.info(f"Loaded 3D projector for {camera_id} {gps_msg}")
                 except Exception as e:
-                    print(f"Error loading 3D projector for {camera_id}: {e}")
+                    log.info(f"Error loading 3D projector for {camera_id}: {e}")
                     import traceback
                     traceback.print_exc()
             
@@ -321,27 +331,6 @@ class TrailerVisionApp:
                                 'lon': gps_ref['lon']
                             }
                             self.gps_references[camera_id] = gps_reference
-            
-            # Priority 2: Load BEV transformer if configured (fallback)
-            bev_model_path = f"models/bev/{camera_id}_bev.pth"
-            if os.path.exists(bev_model_path):
-                try:
-                    # Get input size from camera config or use default
-                    input_size = (camera.get('height', 720), camera.get('width', 1280))
-                    
-                    self.bev_projectors[camera_id] = BEVProjector(
-                        model_path=bev_model_path,
-                        gps_reference=gps_reference,
-                        input_size=input_size
-                    )
-                    gps_msg = f"with GPS reference: ({gps_reference['lat']:.6f}, {gps_reference['lon']:.6f})" if gps_reference else "(no GPS reference - using local meters)"
-                    print(f"Loaded BEV projector for {camera_id} {gps_msg}")
-                except Exception as e:
-                    print(f"Error loading BEV projector for {camera_id}: {e}")
-                    import traceback
-                    traceback.print_exc()
-            else:
-                print(f"Warning: BEV model not found for {camera_id}: {bev_model_path}")
         
         # Initialize trackers for each camera
         # Use lower track threshold to match detector confidence
@@ -361,21 +350,19 @@ class TrailerVisionApp:
         def create_tracker():
             return ByteTrackWrapper(track_thresh=track_thresh)
         
-        # Get BEV projector and GPS reference for first camera (or None) for video processing
-        test_bev_projector = None
+        # Get GPS reference for first camera (or None) for video processing
+        # Note: GPS coordinates come from GPS sensor/log files, not from projection
         test_gps_reference = None
         cameras_list = self.config.get('cameras', [])
         if cameras_list:
             first_camera_id = cameras_list[0]['id']
-            if first_camera_id in self.bev_projectors:
-                test_bev_projector = self.bev_projectors[first_camera_id]
-                if first_camera_id in self.gps_references:
-                    test_gps_reference = self.gps_references[first_camera_id]
+            if first_camera_id in self.gps_references:
+                test_gps_reference = self.gps_references[first_camera_id]
         
-        print(f"[TrailerVisionApp] Initializing video processor:")
-        print(f"  - Detector: {'Available' if self.detector else 'NOT AVAILABLE'}")
-        print(f"  - OCR: {'Available' if self.ocr else 'NOT AVAILABLE'}")
-        print(f"  - Spot Resolver: {'Available' if self.spot_resolver else 'NOT AVAILABLE'}")
+        log.info(f"[TrailerVisionApp] Initializing video processor:")
+        log.info(f"  - Detector: {'Available' if self.detector else 'NOT AVAILABLE'}")
+        log.info(f"  - OCR: {'Available' if self.ocr else 'NOT AVAILABLE'}")
+        log.info(f"  - Spot Resolver: {'Available' if self.spot_resolver else 'NOT AVAILABLE'}")
         # Check for 3D projector
         test_3d_projector = None
         if cameras_list:
@@ -383,10 +370,10 @@ class TrailerVisionApp:
             if first_camera_id in self.camera_3d_projectors:
                 test_3d_projector = self.camera_3d_projectors[first_camera_id]
         
-        print(f"  - 3D Projector: {'Available' if test_3d_projector is not None else 'NOT AVAILABLE'}")
-        print(f"  - BEV Projector: {'Available' if test_bev_projector is not None else 'NOT AVAILABLE'}")
+        log.info(f"  - 3D Projector: {'Available' if test_3d_projector is not None else 'NOT AVAILABLE'}")
+        log.info(f"  - GPS Method: GPS Sensor/Log Files (BEV projection removed)")
         if test_gps_reference:
-            print(f"  - GPS Reference: ({test_gps_reference['lat']:.6f}, {test_gps_reference['lon']:.6f})")
+            log.info(f"  - GPS Reference: ({test_gps_reference['lat']:.6f}, {test_gps_reference['lon']:.6f})")
         
         try:
             # Determine camera_id for homography loading (use first camera or "test-video")
@@ -400,13 +387,13 @@ class TrailerVisionApp:
                 ocr=self.ocr,
                 tracker_factory=create_tracker,
                 spot_resolver=self.spot_resolver,
-                bev_projector=test_bev_projector,
+                bev_projector=None,  # BEV projection removed - using GPS sensor/log files
                 gps_reference=test_gps_reference,
                 camera_id=test_camera_id
             )
-            print(f"[TrailerVisionApp] Video processor created successfully")
+            log.info(f"[TrailerVisionApp] Video processor created successfully")
         except Exception as e:
-            print(f"[TrailerVisionApp] ERROR: Failed to create video processor: {e}")
+            log.error("[TrailerVisionApp] Failed to create video processor: %s", e)
             import traceback
             traceback.print_exc()
             self.video_processor = None
@@ -415,14 +402,22 @@ class TrailerVisionApp:
         if self.metrics_server:
             self.metrics_server.video_processor = self.video_processor
             self.metrics_server.frame_storage = self
-            print(f"[TrailerVisionApp] Video processor assigned to metrics server: {self.metrics_server.video_processor is not None}")
+            log.info(f"[TrailerVisionApp] Video processor assigned to metrics server: {self.metrics_server.video_processor is not None}")
         else:
-            print(f"[TrailerVisionApp] ERROR: Metrics server not initialized!")
+            log.error("[TrailerVisionApp] Metrics server not initialized!")
         
         # Processing queue will be initialized when Start Application is called
         # This allows lazy loading of OCR to save memory until needed
         self.processing_queue = None
-        print(f"[TrailerVisionApp] Processing queue will be initialized when application starts")
+        log.info(f"[TrailerVisionApp] Processing queue will be initialized when application starts")
+        
+        # Initialize database for video frame records
+        try:
+            self.video_frame_db = VideoFrameDB(db_path="data/video_frames.db")
+            log.info(f"[TrailerVisionApp] Video frame database initialized")
+        except Exception as e:
+            log.warning("[TrailerVisionApp] Failed to initialize database: %s", e)
+            self.video_frame_db = None
     
     def initialize_assets(self):
         """
@@ -448,12 +443,11 @@ class TrailerVisionApp:
                     'assets_loaded': assets_loaded
                 }
             
-            # 2. Load OCR if not already loaded
+            # 2. Load OCR for per-video pipeline (OCR runs after each video)
             if self.ocr is None:
-                print(f"[TrailerVisionApp] Loading OCR for automated processing...")
+                log.info(f"[TrailerVisionApp] Loading OCR for automated processing...")
                 self._initialize_ocr()
                 assets_loaded['ocr'] = self.ocr is not None
-            
             if not self.ocr:
                 return {
                     'success': False,
@@ -471,23 +465,31 @@ class TrailerVisionApp:
             
             # 4. Initialize processing queue if not already initialized
             if self.processing_queue is None:
-                print(f"[TrailerVisionApp] Initializing processing queue...")
+                log.info(f"[TrailerVisionApp] Initializing processing queue...")
                 
                 # Define callbacks for extensibility
                 def on_video_complete(video_path, crops_dir, results):
                     """Called when video processing completes."""
-                    print(f"[TrailerVisionApp] Video processing complete: {Path(video_path).name}")
-                    print(f"  - Crops directory: {crops_dir}")
+                    log.info(f"[TrailerVisionApp] Video processing complete: {Path(video_path).name}")
+                    log.info(f"  - Crops directory: {crops_dir}")
                     # Extensibility point: Add server upload or other processing here
                     if results:
                         self.upload_to_server(video_path, crops_dir, {'type': 'video_processing', 'results': results})
                 
                 def on_ocr_complete(video_path, crops_dir, ocr_results):
                     """Called when OCR processing completes."""
-                    print(f"[TrailerVisionApp] OCR processing complete: {Path(video_path).name}")
-                    print(f"  - Processed {len(ocr_results)} crops with OCR")
+                    log.info(f"[TrailerVisionApp] OCR processing complete: {Path(video_path).name}")
+                    log.info(f"  - Processed {len(ocr_results)} crops with OCR")
+                    
+                    # Store results in database (as per diagram requirement)
+                    if self.video_frame_db and ocr_results:
+                        self._store_ocr_results_in_db(video_path, crops_dir, ocr_results)
+                    
                     # Extensibility point: Add server upload here
                     self.upload_to_server(video_path, crops_dir, {'type': 'ocr_complete', 'ocr_results': ocr_results})
+                    
+                    # Delete video, crops, and GPS log permanently after processing is done
+                    self._delete_processed_video_assets(video_path, crops_dir)
                 
                 try:
                     self.processing_queue = ProcessingQueueManager(
@@ -495,9 +497,11 @@ class TrailerVisionApp:
                         ocr=self.ocr,
                         preprocessor=self.preprocessor,
                         on_video_complete=on_video_complete,
-                        on_ocr_complete=on_ocr_complete
+                        on_ocr_complete=on_ocr_complete,
+                        defer_ocr=False,
+                        on_video_queue_drained=None
                     )
-                    print(f"[TrailerVisionApp] Processing queue manager initialized")
+                    log.info(f"[TrailerVisionApp] Processing queue manager initialized (OCR per video)")
                     assets_loaded['processing_queue'] = True
                     
                     # Set up video recorder callback for auto-processing
@@ -509,25 +513,25 @@ class TrailerVisionApp:
                         parts = video_name.split('_')
                         camera_id = parts[0] if parts else "unknown"
                         
-                        print(f"[TrailerVisionApp] Chunk saved: {Path(video_path).name}")
-                        print(f"  - Queueing for processing...")
+                        log.info(f"[TrailerVisionApp] Chunk saved: {Path(video_path).name}")
+                        log.info(f"  - Queueing for processing...")
                         
-                        # Queue video processing
+                        # Queue video processing (use app detection_mode so car/trailer matches config)
                         if self.processing_queue:
                             self.processing_queue.queue_video_processing(
                                 video_path=video_path,
                                 camera_id=camera_id,
                                 gps_log_path=gps_log_path,
                                 detect_every_n=5,
-                                detection_mode='trailer'
+                                detection_mode=getattr(self, 'detection_mode', 'trailer')
                             )
                     
                     # Update video recorder with callback
                     self.video_recorder.on_chunk_saved = on_chunk_saved
-                    print(f"[TrailerVisionApp] Video recorder callback configured for auto-processing")
+                    log.info(f"[TrailerVisionApp] Video recorder callback configured for auto-processing")
                     
                 except Exception as e:
-                    print(f"[TrailerVisionApp] ERROR: Failed to initialize processing queue: {e}")
+                    log.error("[TrailerVisionApp] Failed to initialize processing queue: %s", e)
                     import traceback
                     traceback.print_exc()
                     return {
@@ -544,7 +548,7 @@ class TrailerVisionApp:
             }
             
         except Exception as e:
-            print(f"[TrailerVisionApp] ERROR: Failed to initialize assets: {e}")
+            log.error("[TrailerVisionApp] Failed to initialize assets: %s", e)
             import traceback
             traceback.print_exc()
             return {
@@ -588,7 +592,8 @@ class TrailerVisionApp:
         """
         Project image coordinates to world coordinates.
         
-        Priority: 3D Projection > Homography > BEV Transformer
+        Priority: 3D Projection > Homography
+        Note: BEV projection has been removed - GPS coordinates come from GPS sensor/log files.
         
         Args:
             camera_id: Camera identifier
@@ -596,7 +601,7 @@ class TrailerVisionApp:
             y_img: Image Y coordinate
             return_gps: If True and GPS reference available, return GPS coordinates (lat, lon).
                        If False or no GPS reference, return local meters (x, y).
-            frame: Optional frame image (required for BEV projection, not needed for 3D/homography)
+            frame: Optional frame image (not used, kept for API compatibility)
             
         Returns:
             Tuple of (lat, lon) if return_gps=True and GPS reference available,
@@ -614,38 +619,13 @@ class TrailerVisionApp:
                 )
                 return (x_world, y_world)
             except Exception as e:
-                print(f"Warning: 3D projection failed for {camera_id}: {e}")
-                # Fall through to other methods
+                log.warning("3D projection failed for %s: %s", camera_id, e)
+                # Fall through - return None if no projection available
         
-        # Priority 2: Use BEV transformer if available
-        if camera_id in self.bev_projectors:
-            if frame is None:
-                # Try to get latest frame from storage
-                if camera_id in self.latest_frames:
-                    frame = self.latest_frames[camera_id]
-                else:
-                    print(f"Warning: No frame available for BEV projection for camera {camera_id}")
-                    return None
-            
-            bev_projector = self.bev_projectors[camera_id]
-            
-            # Project using BEV transformer
-            x_world, y_world = bev_projector.project_to_world(
-                frame,
-                x_img,
-                y_img,
-                return_gps=False  # Get meters first, convert to GPS below if needed
-            )
-        
-        # Convert to GPS if requested and reference available
-        if return_gps:
-            gps_ref = self._get_gps_reference(camera_id)
-            if gps_ref:
-                from app.gps_utils import meters_to_gps
-                lat, lon = meters_to_gps(x_world, y_world, gps_ref['lat'], gps_ref['lon'])
-                return (float(lat), float(lon))
-        
-        return (float(x_world), float(y_world))
+        # Note: BEV projection removed - GPS coordinates come from GPS sensor/log files
+        # If 3D projection is not available, return None
+        # GPS coordinates should be obtained from GPS log files during video processing
+        return None
     
     def _cleanup_gpu_memory(self, force: bool = False):
         """
@@ -691,12 +671,12 @@ class TrailerVisionApp:
         This is called after YOLO video processing is complete to save memory.
         """
         if self.ocr is not None:
-            print(f"[TrailerVisionApp] OCR already initialized, skipping...")
+            log.info(f"[TrailerVisionApp] OCR already initialized, skipping...")
             return
         
         globals_cfg = self.config.get('globals', {})
         
-        print(f"[TrailerVisionApp] Initializing OCR...")
+        log.info(f"[TrailerVisionApp] Initializing OCR...")
         
         # Initialize OCR - Priority: oLmOCR > EasyOCR > TrOCR > PaddleOCR English-only > Multilingual > Legacy CRNN
         # oLmOCR (Qwen3-VL/Qwen2.5-VL) is recommended for best accuracy, especially for vertical text and complex layouts
@@ -715,22 +695,22 @@ class TrailerVisionApp:
                 fast_preprocessing=globals_cfg.get('ocr_fast_preprocessing', False)  # Enable via config
             )
             self.is_olmocr = True  # Mark as oLmOCR for GPU memory cleanup
-            print(f"✓ Using oLmOCR (Qwen3-VL-4B-Instruct) - recommended for high accuracy, especially vertical text")
+            log.info(f"✓ Using oLmOCR (Qwen3-VL-4B-Instruct) - recommended for high accuracy, especially vertical text")
         except ImportError:
-            print("oLmOCR not available (pip3 install transformers torch qwen-vl-utils), trying EasyOCR...")
+            log.info("oLmOCR not available (pip3 install transformers torch qwen-vl-utils), trying EasyOCR...")
         except Exception as e:
-            print(f"oLmOCR initialization failed: {e}, trying EasyOCR...")
+            log.info(f"oLmOCR initialization failed: {e}, trying EasyOCR...")
         
         # Try EasyOCR if oLmOCR failed (self.ocr is still None)
         if self.ocr is None:
             try:
                 from app.ocr.easyocr_recognizer import EasyOCRRecognizer
                 self.ocr = EasyOCRRecognizer(languages=['en'], gpu=True)
-                print(f"✓ Using EasyOCR (fallback - good accuracy for printed text)")
+                log.info(f"✓ Using EasyOCR (fallback - good accuracy for printed text)")
             except ImportError:
-                print("EasyOCR not available (pip3 install easyocr), trying TrOCR...")
+                log.info("EasyOCR not available (pip3 install easyocr), trying TrOCR...")
             except Exception as e:
-                print(f"EasyOCR initialization failed: {e}, trying TrOCR...")
+                log.info(f"EasyOCR initialization failed: {e}, trying TrOCR...")
         
         # Only try TrOCR if oLmOCR and EasyOCR failed (self.ocr is still None)
         if self.ocr is None:
@@ -758,14 +738,14 @@ class TrailerVisionApp:
                                 break
                         
                         self.ocr = TrOCRRecognizer(trocr_path, model_dir=model_dir)
-                        print(f"✓ Using TrOCR model: {trocr_path} (fallback - oLmOCR/EasyOCR not available)")
+                        log.info(f"✓ Using TrOCR model: {trocr_path} (fallback - oLmOCR/EasyOCR not available)")
                         trocr_loaded = True
                         break
                     except ImportError:
-                        print("TrOCR not available (transformers not installed), trying other OCR models...")
+                        log.info("TrOCR not available (transformers not installed), trying other OCR models...")
                         break
                     except Exception as e:
-                        print(f"TrOCR initialization failed ({trocr_path}): {e}, trying other OCR models...")
+                        log.info(f"TrOCR initialization failed ({trocr_path}): {e}, trying other OCR models...")
                         continue
         
         # Fallback to PaddleOCR models if oLmOCR, EasyOCR, and TrOCR not available
@@ -778,41 +758,41 @@ class TrailerVisionApp:
             if os.path.exists("models/paddleocr_rec_english.engine") and os.path.exists("app/ocr/ppocr_keys_en.txt"):
                 ocr_path = "models/paddleocr_rec_english.engine"
                 alphabet_path = "app/ocr/ppocr_keys_en.txt"
-                print("Using PaddleOCR English-only model (fallback)")
+                log.info("Using PaddleOCR English-only model (fallback)")
             # Fallback to PaddleOCR multilingual
             elif os.path.exists("models/paddleocr_rec.engine") and os.path.exists("app/ocr/ppocr_keys_v1.txt"):
                 ocr_path = "models/paddleocr_rec.engine"
                 alphabet_path = "app/ocr/ppocr_keys_v1.txt"
-                print("Using PaddleOCR multilingual model (fallback)")
+                log.info("Using PaddleOCR multilingual model (fallback)")
             # Fallback to legacy CRNN engine
             elif os.path.exists("models/ocr_crnn.engine") and os.path.exists("app/ocr/alphabet.txt"):
                 ocr_path = "models/ocr_crnn.engine"
                 alphabet_path = "app/ocr/alphabet.txt"
                 input_size = None  # CRNN uses default size
-                print("Using legacy CRNN model (fallback)")
+                log.info("Using legacy CRNN model (fallback)")
             
             if ocr_path and alphabet_path:
                 if "paddleocr" in ocr_path.lower():
                     self.ocr = PlateRecognizer(ocr_path, alphabet_path, input_size=input_size)
                 else:
                     self.ocr = PlateRecognizer(ocr_path, alphabet_path)
-                print(f"Loaded OCR engine: {ocr_path} with alphabet: {alphabet_path}")
+                log.info(f"Loaded OCR engine: {ocr_path} with alphabet: {alphabet_path}")
         
         if self.ocr is None:
-            print(f"Warning: No OCR engine found. Tried:")
-            print(f"  - oLmOCR (recommended - install: pip3 install transformers torch qwen-vl-utils)")
-            print(f"  - EasyOCR (fallback - install: pip3 install easyocr)")
-            print(f"  - models/trocr.engine (TrOCR)")
-            print(f"  - models/paddleocr_rec_english.engine (English-only)")
-            print(f"  - models/paddleocr_rec.engine (multilingual)")
-            print(f"  - models/ocr_crnn.engine (legacy)")
+            log.warning("No OCR engine found. Tried:")
+            log.info(f"  - oLmOCR (recommended - install: pip3 install transformers torch qwen-vl-utils)")
+            log.info(f"  - EasyOCR (fallback - install: pip3 install easyocr)")
+            log.info(f"  - models/trocr.engine (TrOCR)")
+            log.info(f"  - models/paddleocr_rec_english.engine (English-only)")
+            log.info(f"  - models/paddleocr_rec.engine (multilingual)")
+            log.info(f"  - models/ocr_crnn.engine (legacy)")
         else:
             # Update video processor OCR if it exists
             if hasattr(self, 'video_processor') and self.video_processor is not None:
                 self.video_processor.ocr = self.ocr
                 # Update is_olmocr flag in video processor
                 self.video_processor.is_olmocr = self.is_olmocr
-                print(f"[TrailerVisionApp] Updated video processor with OCR")
+                log.info(f"[TrailerVisionApp] Updated video processor with OCR")
     
     def _unload_detector(self):
         """
@@ -820,10 +800,10 @@ class TrailerVisionApp:
         This is called after YOLO video processing is complete.
         """
         if self.detector is None:
-            print(f"[TrailerVisionApp] Detector already unloaded, skipping...")
+            log.info(f"[TrailerVisionApp] Detector already unloaded, skipping...")
             return
         
-        print(f"[TrailerVisionApp] Unloading YOLO detector to free GPU memory...")
+        log.info(f"[TrailerVisionApp] Unloading YOLO detector to free GPU memory...")
         
         # Clean up detector based on type
         detector_type = type(self.detector).__name__
@@ -838,7 +818,7 @@ class TrailerVisionApp:
                     del self.detector.model
                 del self.detector
             except Exception as e:
-                print(f"[TrailerVisionApp] Warning: Error unloading YOLOv8 detector: {e}")
+                log.warning("[TrailerVisionApp] Error unloading YOLOv8 detector: %s", e)
         elif detector_type == "TrtEngineYOLO":
             # TensorRT engine - delete the engine
             try:
@@ -848,7 +828,7 @@ class TrailerVisionApp:
                     del self.detector.context
                 del self.detector
             except Exception as e:
-                print(f"[TrailerVisionApp] Warning: Error unloading TensorRT detector: {e}")
+                log.warning("[TrailerVisionApp] Error unloading TensorRT detector: %s", e)
         
         self.detector = None
         
@@ -859,9 +839,9 @@ class TrailerVisionApp:
                 gc.collect()
                 torch.cuda.empty_cache()
             except Exception as e:
-                print(f"[TrailerVisionApp] Warning: Error cleaning GPU memory: {e}")
+                log.warning("[TrailerVisionApp] Error cleaning GPU memory: %s", e)
         
-        print(f"[TrailerVisionApp] YOLO detector unloaded successfully")
+        log.info(f"[TrailerVisionApp] YOLO detector unloaded successfully")
     
     def _process_frame(self, camera_id: str, frame: np.ndarray, frame_count: int) -> None:
         """
@@ -903,7 +883,7 @@ class TrailerVisionApp:
                     detections.append(det)
                 # Optional: Log filtered detections for debugging
                 # elif frame_count % 100 == 0:
-                #     print(f"[TrailerVisionApp] Filtered non-trailer detection: cls={det.get('cls', -1)}, conf={det.get('conf', 0.0):.2f}")
+                #     log.info(f"[TrailerVisionApp] Filtered non-trailer detection: cls={det.get('cls', -1)}, conf={det.get('conf', 0.0):.2f}")
         
         # Update tracker (now only contains trailer detections)
         tracks = tracker.update(detections, frame)
@@ -924,7 +904,7 @@ class TrailerVisionApp:
             # Note: If tracker doesn't preserve 'cls', this check is skipped (track_cls = -1)
             if track_cls != -1 and track_cls != trailer_class_id:
                 if frame_count % 50 == 0:  # Log occasionally
-                    print(f"[TrailerVisionApp] Skipping OCR for non-trailer track {track_id}: cls={track_cls}")
+                    log.info(f"[TrailerVisionApp] Skipping OCR for non-trailer track {track_id}: cls={track_cls}")
                 continue  # Skip this track - not a trailer
             
             # Refine bounding box to rear face (focus on back side only)
@@ -1031,7 +1011,7 @@ class TrailerVisionApp:
                                     break
                         except Exception as e:
                             if frame_count % 50 == 0:  # Log occasionally
-                                print(f"[TrailerVisionApp] OCR error with {prep['method']}: {e}")
+                                log.info(f"[TrailerVisionApp] OCR error with {prep['method']}: {e}")
                     
                     # Select best result
                     if ocr_results:
@@ -1048,7 +1028,7 @@ class TrailerVisionApp:
                             ocr_method = 'original-fallback'
                         except Exception as e:
                             if frame_count % 50 == 0:
-                                print(f"[TrailerVisionApp] OCR fallback failed: {e}")
+                                log.info(f"[TrailerVisionApp] OCR fallback failed: {e}")
                             text = ""
                             conf_ocr = 0.0
                             ocr_method = 'error'
@@ -1061,7 +1041,7 @@ class TrailerVisionApp:
                         ocr_method = 'original'
                     except Exception as e:
                         if frame_count % 50 == 0:
-                            print(f"[TrailerVisionApp] OCR error: {e}")
+                            log.info(f"[TrailerVisionApp] OCR error: {e}")
                         text = ""
                         conf_ocr = 0.0
                         ocr_method = 'error'
@@ -1105,7 +1085,7 @@ class TrailerVisionApp:
                     bottom_y = float(y2)
                     image_coords = [float(center_x), float(bottom_y)]
                 except Exception as e:
-                    print(f"[TrailerVisionApp] Error in 3D bbox projection: {e}")
+                    log.info(f"[TrailerVisionApp] Error in 3D bbox projection: {e}")
                     # Fall through to standard method
                     ground_x, ground_y = calculate_image_coords_from_bbox_with_config(bbox)
                     image_coords = [float(ground_x), float(ground_y)]
@@ -1160,8 +1140,8 @@ class TrailerVisionApp:
                 'method': method
             }
             
-            # Log to CSV
-            self.csv_logger.log(event)
+            # Log to CSV - COMMENTED OUT: Data is now stored in database instead
+            # self.csv_logger.log(event)
             
             # Publish to event buses
             self.publisher.publish(event)
@@ -1175,7 +1155,7 @@ class TrailerVisionApp:
                         timeout=1.0
                     )
                 except Exception as e:
-                    print(f"Error posting to ingest API: {e}")
+                    log.info(f"Error posting to ingest API: {e}")
             
             # Update last publish time
             metrics['last_publish'] = datetime.utcnow()
@@ -1223,11 +1203,11 @@ class TrailerVisionApp:
         globals_cfg = self.config.get('globals', {})
         use_gstreamer = globals_cfg.get('use_gstreamer', False)
         
-        print(f"Opening stream for {camera_id}: {rtsp_url}")
+        log.info(f"Opening stream for {camera_id}: {rtsp_url}")
         cap = open_stream(rtsp_url, width, height, fps_cap, use_gstreamer)
         
         if cap is None:
-            print(f"Failed to open stream for {camera_id}")
+            log.warning("Failed to open stream for %s", camera_id)
             return
         
         frame_count = 0
@@ -1244,23 +1224,23 @@ class TrailerVisionApp:
                 frame_count += 1
                 
         except KeyboardInterrupt:
-            print(f"Interrupted processing for {camera_id}")
+            log.info(f"Interrupted processing for {camera_id}")
         except Exception as e:
-            print(f"Error processing {camera_id}: {e}")
+            log.info(f"Error processing {camera_id}: {e}")
         finally:
             cap.release()
-            print(f"Closed stream for {camera_id}")
+            log.info(f"Closed stream for {camera_id}")
     
     def run(self):
         """Run the main application loop."""
-        print("Starting Trailer Vision Edge application...")
+        log.info("Starting Trailer Vision Edge application...")
         self.running = True
         
         # CAMERA FEED PROCESSING - Only for display, no full processing
         # Enable camera feeds for dashboard display (demo stage)
         # Full processing is disabled, but we need to stream camera feeds for dashboard
-        print("Camera feed display enabled (demo stage).")
-        print("Full processing disabled - only displaying camera feeds.")
+        log.info("Camera feed display enabled (demo stage).")
+        log.info("Full processing disabled - only displaying camera feeds.")
         
         # Process each camera in a separate thread for display only
         import threading
@@ -1280,7 +1260,7 @@ class TrailerVisionApp:
             for thread in threads:
                 thread.join()
         except KeyboardInterrupt:
-            print("\nShutting down...")
+            log.info("\nShutting down...")
             self.stop()
     
     def _process_camera_display_only(self, camera: Dict):
@@ -1300,11 +1280,11 @@ class TrailerVisionApp:
         globals_cfg = self.config.get('globals', {})
         use_gstreamer = globals_cfg.get('use_gstreamer', False)
         
-        print(f"Opening camera stream for display: {camera_id}: {rtsp_url}")
+        log.info(f"Opening camera stream for display: {camera_id}: {rtsp_url}")
         cap = open_stream(rtsp_url, width, height, fps_cap, use_gstreamer)
         
         if cap is None:
-            print(f"Failed to open stream for {camera_id}")
+            log.warning("Failed to open stream for %s", camera_id)
             # Still register camera in metrics so dashboard shows it (even if stream failed)
             if self.metrics_server:
                 self.metrics_server.update_camera_metrics(
@@ -1365,14 +1345,14 @@ class TrailerVisionApp:
                 time.sleep(0.033)  # ~30 FPS
                 
         except KeyboardInterrupt:
-            print(f"Interrupted display stream for {camera_id}")
+            log.info(f"Interrupted display stream for {camera_id}")
         except Exception as e:
-            print(f"Error displaying {camera_id}: {e}")
+            log.info(f"Error displaying {camera_id}: {e}")
         finally:
             if camera_id in self.camera_captures:
                 del self.camera_captures[camera_id]
             cap.release()
-            print(f"Closed display stream for {camera_id}")
+            log.info(f"Closed display stream for {camera_id}")
     
     def start_recording(self, camera_id: str = None) -> Dict:
         """
@@ -1420,6 +1400,13 @@ class TrailerVisionApp:
         width = camera.get('width', 1920)
         height = camera.get('height', 1080)
         fps = camera.get('fps_cap', 30)
+        
+        # Reset app state so we are no longer "gracefully shutting down" (new recording session)
+        with self.shutdown_lock:
+            self.recording_stopped = False
+        # Notify queue that recording started (reset deferred-OCR state for this session)
+        if self.processing_queue and getattr(self.processing_queue, 'notify_recording_started', None):
+            self.processing_queue.notify_recording_started()
         
         # Start recording
         success = self.video_recorder.start_recording(camera_id, width, height, fps)
@@ -1472,6 +1459,10 @@ class TrailerVisionApp:
         # Mark recording as stopped (but processing continues)
         with self.shutdown_lock:
             self.recording_stopped = True
+        
+        # Notify queue so deferred OCR can run when video queue drains
+        if self.processing_queue and getattr(self.processing_queue, 'notify_recording_stopped', None):
+            self.processing_queue.notify_recording_stopped()
         
         # Check if there are remaining videos to process
         is_processing = self.is_processing_ongoing()
@@ -1535,6 +1526,138 @@ class TrailerVisionApp:
             }
         }
     
+    def _run_deferred_ocr(self, pending_jobs: List[Dict]):
+        """
+        Run OCR once on all pending crop directories (called when recording stopped and video queue drained).
+        Loads OCR on first use, then processes each job and stores/uploads results.
+        """
+        if not pending_jobs:
+            log.info("[TrailerVisionApp] Deferred OCR: no pending jobs")
+            return
+        log.info(f"[TrailerVisionApp] Deferred OCR: loading OCR and processing {len(pending_jobs)} crop directory(ies)")
+        # Load OCR if not already loaded (only now to avoid GPU use during capture/video processing)
+        if self.ocr is None:
+            self._initialize_ocr()
+        if not self.ocr:
+            log.error("[TrailerVisionApp] Deferred OCR: failed to load OCR, skipping")
+            return
+        from app.batch_ocr_processor import BatchOCRProcessor
+        for i, job in enumerate(pending_jobs):
+            video_path = job.get('video_path', '')
+            crops_dir = job.get('crops_dir', '')
+            camera_id = job.get('camera_id', '')
+            if not crops_dir or not Path(crops_dir).exists():
+                log.warning(f"[TrailerVisionApp] Deferred OCR: skip missing crops_dir {crops_dir}")
+                continue
+            try:
+                batch_processor = BatchOCRProcessor(self.ocr, self.preprocessor)
+                ocr_results = batch_processor.process_crops_directory(crops_dir)
+                combined_results = batch_processor.match_ocr_to_detections(crops_dir, ocr_results)
+                if self.video_frame_db and combined_results:
+                    self._store_ocr_results_in_db(video_path, crops_dir, combined_results)
+                self.upload_to_server(video_path, crops_dir, {'type': 'ocr_complete', 'ocr_results': combined_results})
+                log.info(f"[TrailerVisionApp] Deferred OCR: completed {i+1}/{len(pending_jobs)} {Path(crops_dir).name}")
+            except Exception as e:
+                log.exception(f"[TrailerVisionApp] Deferred OCR error for {crops_dir}: {e}")
+            finally:
+                self._cleanup_gpu_memory()
+        log.info("[TrailerVisionApp] Deferred OCR: all jobs completed")
+    
+    def _store_ocr_results_in_db(self, video_path: str, crops_dir: str, ocr_results: List[Dict]):
+        """
+        Store OCR results in database (as per diagram requirement).
+        
+        Args:
+            video_path: Path to source video
+            crops_dir: Directory containing crops
+            ocr_results: List of combined OCR results with GPS data
+        """
+        if not self.video_frame_db:
+            return
+        
+        stored_count = 0
+        for result in ocr_results:
+            try:
+                # Extract data from combined result
+                licence_plate = result.get('ocr_text', '').strip()
+                if not licence_plate:
+                    continue  # Skip records without OCR text
+                
+                # Get GPS coordinates: combined results have 'lat'/'lon' from crop metadata (from GPS log during video processing)
+                latitude = result.get('lat')
+                longitude = result.get('lon')
+                if latitude is None or longitude is None:
+                    world_coords = result.get('world_coords')
+                    if isinstance(world_coords, (list, tuple)) and len(world_coords) >= 2:
+                        latitude, longitude = world_coords[0], world_coords[1]
+                    elif isinstance(world_coords, dict):
+                        latitude = world_coords.get('lat') or world_coords.get('x_world')
+                        longitude = world_coords.get('lon') or world_coords.get('y_world')
+                
+                # Get other fields
+                timestamp_str = result.get('timestamp', '')
+                confidence = result.get('ocr_conf', 0.0)
+                image_path = result.get('crop_path', '')
+                camera_id = result.get('camera_id', '')
+                frame_number = result.get('frame_count', 0)
+                track_id = result.get('track_id')
+                
+                # Speed and barrier from GPS (if available in result)
+                speed = result.get('speed')
+                barrier = result.get('barrier') or result.get('heading')
+                
+                # Convert timestamp
+                timestamp = None
+                if timestamp_str:
+                    try:
+                        timestamp = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+                    except:
+                        pass
+                
+                # Store in database
+                if latitude is not None and longitude is not None:
+                    self.video_frame_db.insert_frame_record(
+                        licence_plate_trailer=licence_plate,
+                        latitude=float(latitude),
+                        longitude=float(longitude),
+                        speed=speed,
+                        barrier=barrier,
+                        confidence=confidence,
+                        image_path=image_path,
+                        camera_id=camera_id,
+                        video_path=video_path,
+                        frame_number=frame_number,
+                        track_id=track_id,
+                        timestamp=timestamp
+                    )
+                    stored_count += 1
+            except Exception as e:
+                log.info(f"[TrailerVisionApp] Error storing OCR result in database: {e}")
+        
+        log.info(f"[TrailerVisionApp] Stored {stored_count} records in database")
+    
+    def _delete_processed_video_assets(self, video_path: str, crops_dir: str):
+        """
+        Permanently delete video file and GPS log after processing is complete.
+        Crops folder is kept. Called from on_ocr_complete once DB and upload are done.
+        """
+        video_p = Path(video_path)
+        # 1. Delete video file
+        if video_p.is_file():
+            try:
+                video_p.unlink()
+                log.info(f"[TrailerVisionApp] Deleted video: {video_p.name}")
+            except Exception as e:
+                log.warning(f"[TrailerVisionApp] Failed to delete video {video_path}: {e}")
+        # 2. Delete GPS log (naming: same stem as video + _gps.json)
+        gps_p = video_p.parent / f"{video_p.stem}_gps.json"
+        if gps_p.is_file():
+            try:
+                gps_p.unlink()
+                log.info(f"[TrailerVisionApp] Deleted GPS log: {gps_p.name}")
+            except Exception as e:
+                log.warning(f"[TrailerVisionApp] Failed to delete GPS log {gps_p}: {e}")
+    
     def upload_to_server(self, video_path: str, crops_dir: str, data: Dict):
         """
         Upload processed data to server.
@@ -1553,15 +1676,15 @@ class TrailerVisionApp:
         # response = requests.post('https://your-server.com/api/upload', json=data)
         # return response.status_code == 200
         
-        print(f"[TrailerVisionApp] Server upload hook called (not implemented)")
-        print(f"  - Video: {Path(video_path).name}")
-        print(f"  - Crops: {crops_dir}")
-        print(f"  - Data keys: {list(data.keys()) if isinstance(data, dict) else 'N/A'}")
+        log.info(f"[TrailerVisionApp] Server upload hook called (not implemented)")
+        log.info(f"  - Video: {Path(video_path).name}")
+        log.info(f"  - Crops: {crops_dir}")
+        log.info(f"  - Data keys: {list(data.keys()) if isinstance(data, dict) else 'N/A'}")
         pass
     
     def stop(self):
         """Stop the application and cleanup."""
-        print("Stopping application...")
+        log.info("Stopping application...")
         self.running = False
         
         # Stop recording if active
@@ -1592,11 +1715,12 @@ class TrailerVisionApp:
         if self.metrics_server:
             self.metrics_server.stop()
         
-        print("Application stopped.")
+        log.info("Application stopped.")
 
 
 def main():
     """Main entry point."""
+    setup_logging()
     # Initialize CUDA context in main thread before loading TensorRT engines
     # This ensures all worker threads can access the same context
     try:
@@ -1616,11 +1740,11 @@ def main():
                 sys.modules['app.main_trt_demo']._cuda_primary_context = primary_ctx
             # Also store in this module's globals
             globals()['_cuda_primary_context'] = primary_ctx
-            print(f"CUDA context initialized in main thread (via autoinit), context: {primary_ctx}")
+            log.info("CUDA context initialized in main thread (via autoinit), context: %s", primary_ctx)
         else:
-            print("Warning: CUDA context initialization returned None")
+            log.warning("CUDA context initialization returned None")
     except Exception as e:
-        print(f"Warning: Failed to initialize CUDA context: {e}")
+        log.warning("Failed to initialize CUDA context: %s", e)
         # Continue anyway - might work with autoinit in worker threads
     
     app = TrailerVisionApp()

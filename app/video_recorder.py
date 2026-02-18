@@ -15,6 +15,10 @@ import threading
 import time
 from typing import Optional, Dict, Callable
 
+from app.app_logger import get_logger
+
+log = get_logger(__name__)
+
 
 class VideoRecorder:
     """
@@ -72,7 +76,7 @@ class VideoRecorder:
             fps: Video frame rate
         """
         if self.recording:
-            print(f"[VideoRecorder] Already recording, stop current recording first")
+            log.info(f"[VideoRecorder] Already recording, stop current recording first")
             return False
         
         self.camera_id = camera_id
@@ -99,9 +103,9 @@ class VideoRecorder:
                 daemon=True
             )
             self.gps_logging_thread.start()
-            print(f"[VideoRecorder] Started GPS logging thread")
+            log.info(f"[VideoRecorder] Started GPS logging thread")
         
-        print(f"[VideoRecorder] Started recording with {self.chunk_duration_seconds}s auto-chunking")
+        log.info(f"[VideoRecorder] Started recording with {self.chunk_duration_seconds}s auto-chunking")
         return True
     
     def _start_new_chunk(self):
@@ -140,7 +144,7 @@ class VideoRecorder:
         self.frame_count = 0
         self.current_chunk_gps_log = {}
         
-        print(f"[VideoRecorder] Started chunk {self.chunk_index}: {self.video_path.name}")
+        log.info(f"[VideoRecorder] Started chunk {self.chunk_index}: {self.video_path.name}")
     
     def _save_chunk(self):
         """Save current chunk and trigger callback."""
@@ -152,21 +156,21 @@ class VideoRecorder:
             try:
                 with open(self.gps_log_path, 'w') as f:
                     json.dump(self.current_chunk_gps_log, f, indent=2)
-                print(f"[VideoRecorder] Saved GPS log for chunk {self.chunk_index}: {self.gps_log_path.name} ({len(self.current_chunk_gps_log)} entries)")
+                log.info(f"[VideoRecorder] Saved GPS log for chunk {self.chunk_index}: {self.gps_log_path.name} ({len(self.current_chunk_gps_log)} entries)")
             except Exception as e:
-                print(f"[VideoRecorder] Error saving GPS log for chunk {self.chunk_index}: {e}")
+                log.warning("Error saving GPS log for chunk %s: %s", self.chunk_index, e)
         
         video_path = str(self.video_path)
         gps_log_path = str(self.gps_log_path) if self.gps_log_path else None
         
-        print(f"[VideoRecorder] Saved chunk {self.chunk_index}: {Path(video_path).name} ({self.frame_count} frames, {time.time() - self.chunk_start_time:.1f}s)")
+        log.info(f"[VideoRecorder] Saved chunk {self.chunk_index}: {Path(video_path).name} ({self.frame_count} frames, {time.time() - self.chunk_start_time:.1f}s)")
         
         # Trigger callback if provided
         if self.on_chunk_saved:
             try:
                 self.on_chunk_saved(video_path, gps_log_path)
             except Exception as e:
-                print(f"[VideoRecorder] Error in chunk saved callback: {e}")
+                log.warning("Error in chunk saved callback: %s", e)
         
         self.chunk_index += 1
     
@@ -201,7 +205,7 @@ class VideoRecorder:
                     
                     # Log every 10 seconds for debugging
                     if len(self.gps_log) % 10 == 0:
-                        print(f"[VideoRecorder] GPS logged: ({gps_data['lat']:.6f}, {gps_data['lon']:.6f}) - Total entries: {len(self.gps_log)}")
+                        log.info(f"[VideoRecorder] GPS logged: ({gps_data['lat']:.6f}, {gps_data['lon']:.6f}) - Total entries: {len(self.gps_log)}")
             
             # Sleep for 0.1 seconds (check 10 times per second)
             time.sleep(0.1)
@@ -266,7 +270,7 @@ class VideoRecorder:
         video_path = str(self.video_path) if self.video_path and Path(self.video_path).exists() else None
         gps_log_path = str(self.gps_log_path) if self.gps_log_path and Path(self.gps_log_path).exists() else None
         
-        print(f"[VideoRecorder] Stopped recording. Total chunks: {self.chunk_index}")
+        log.info(f"[VideoRecorder] Stopped recording. Total chunks: {self.chunk_index}")
         
         # Reset paths
         self.video_path = None

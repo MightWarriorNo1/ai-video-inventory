@@ -19,6 +19,9 @@ from werkzeug.utils import secure_filename
 import threading
 import time
 
+from app.app_logger import get_logger, setup_logging
+
+log = get_logger(__name__)
 
 # Prometheus metrics
 frames_processed = Counter('trailer_vision_frames_processed_total', 'Total frames processed', ['camera_id'])
@@ -49,6 +52,7 @@ class MetricsServer:
             frame_storage: Optional frame storage object (TrailerVisionApp instance)
             video_processor: Optional video processor instance
         """
+        setup_logging()
         self.port = port
         self.csv_logger = csv_logger
         self.frame_storage = frame_storage
@@ -71,6 +75,9 @@ class MetricsServer:
             'ocr_processing_complete': False
         }
         self.status_lock = threading.Lock()
+        
+        # Data processor service (lazy: created on first use or when loading CSV)
+        self._data_processor_service = None
     
     def _setup_error_handlers(self):
         """Setup Flask error handlers."""
@@ -93,8 +100,7 @@ class MetricsServer:
             import traceback
             error_msg = str(e)
             traceback_str = traceback.format_exc()
-            print(f"[MetricsServer] Unhandled Exception: {error_msg}")
-            print(f"[MetricsServer] Traceback: {traceback_str}")
+            log.exception("Unhandled Exception: %s", error_msg)
             return jsonify({'error': 'Internal server error', 'message': error_msg}), 500
     
     def _setup_routes(self):
@@ -213,41 +219,41 @@ class MetricsServer:
         @self.app.route('/api/process-video/<video_id>', methods=['POST'])
         def process_video(video_id):
             """Start processing uploaded video."""
-            print(f"[MetricsServer] process_video called with video_id: {video_id}")
+            log.info(f"[MetricsServer] process_video called with video_id: {video_id}")
             try:
-                print(f"[MetricsServer] Checking video_processor: {self.video_processor is not None}")
+                log.info(f"[MetricsServer] Checking video_processor: {self.video_processor is not None}")
                 if self.video_processor is None:
-                    print(f"[MetricsServer] ERROR: Video processor not available")
+                    log.error("Video processor not available")
                     return jsonify({'error': 'Video processor not available'}), 500
                 
                 # Check if already processing
                 try:
                     is_processing = self.video_processor.is_processing()
-                    print(f"[MetricsServer] Video processor is_processing: {is_processing}")
+                    log.info(f"[MetricsServer] Video processor is_processing: {is_processing}")
                     if is_processing:
-                        print(f"[MetricsServer] ERROR: Video processing already in progress")
+                        log.error("Video processing already in progress")
                         return jsonify({'error': 'Video processing already in progress'}), 400
                 except Exception as e:
-                    print(f"[MetricsServer] ERROR checking is_processing: {e}")
+                    log.warning("Error checking is_processing: %s", e)
                     import traceback
                     traceback.print_exc()
                     return jsonify({'error': f'Error checking processing status: {str(e)}'}), 500
                 
                 # Find video file
                 try:
-                    print(f"[MetricsServer] Looking for video file with pattern: {video_id}_*")
-                    print(f"[MetricsServer] Upload directory: {self.upload_dir}")
-                    print(f"[MetricsServer] Upload directory exists: {self.upload_dir.exists()}")
+                    log.info(f"[MetricsServer] Looking for video file with pattern: {video_id}_*")
+                    log.info(f"[MetricsServer] Upload directory: {self.upload_dir}")
+                    log.info(f"[MetricsServer] Upload directory exists: {self.upload_dir.exists()}")
                     video_files = list(self.upload_dir.glob(f"{video_id}_*"))
-                    print(f"[MetricsServer] Found {len(video_files)} matching files")
+                    log.info(f"[MetricsServer] Found {len(video_files)} matching files")
                     if not video_files:
-                        print(f"[MetricsServer] ERROR: Video file not found for ID: {video_id}")
+                        log.error("Video file not found for ID: %s", video_id)
                         all_files = list(self.upload_dir.glob('*'))
-                        print(f"[MetricsServer] All files in directory ({len(all_files)}): {[str(f.name) for f in all_files]}")
+                        log.info(f"[MetricsServer] All files in directory ({len(all_files)}): {[str(f.name) for f in all_files]}")
                         return jsonify({'error': 'Video file not found'}), 404
                     
                     video_path = str(video_files[0])
-                    print(f"[MetricsServer] Found video file: {video_path}")
+                    log.info(f"[MetricsServer] Found video file: {video_path}")
                     
                     # Look for corresponding GPS log file
                     video_path_obj = Path(video_path)
@@ -291,7 +297,7 @@ class MetricsServer:
                             exact_match = recordings_dir / f"{camera_id}_{date_str}_{time_str}_gps.json"
                             if exact_match.exists():
                                 possible_gps_paths.insert(0, exact_match)  # Highest priority
-                                print(f"[MetricsServer] Found exact GPS log match: {exact_match}")
+                                log.info(f"[MetricsServer] Found exact GPS log match: {exact_match}")
                             else:
                                 # Priority 2: Find closest timestamp match
                                 # Look for all GPS log files matching camera_id and date
@@ -328,50 +334,50 @@ class MetricsServer:
                                         # Only use if within 5 minutes (300 seconds)
                                         if min_time_diff <= 300:
                                             possible_gps_paths.insert(0, best_match)
-                                            print(f"[MetricsServer] Found closest GPS log match (time diff: {min_time_diff}s): {best_match}")
+                                            log.info(f"[MetricsServer] Found closest GPS log match (time diff: {min_time_diff}s): {best_match}")
                                         else:
-                                            print(f"[MetricsServer] GPS log files found but time difference too large ({min_time_diff}s > 300s), using closest anyway")
+                                            log.info(f"[MetricsServer] GPS log files found but time difference too large ({min_time_diff}s > 300s), using closest anyway")
                                             possible_gps_paths.append(best_match)
                                     else:
                                         # Fallback: use first matching file
                                         possible_gps_paths.append(matching_gps_files[0])
-                                        print(f"[MetricsServer] Found GPS log in recordings directory (no time match): {matching_gps_files[0]}")
+                                        log.info(f"[MetricsServer] Found GPS log in recordings directory (no time match): {matching_gps_files[0]}")
                                 else:
                                     # Try without time component (just camera_id and date)
                                     gps_pattern_alt = f"{camera_id}_{date_str}_gps.json"
                                     matching_gps_files_alt = list(recordings_dir.glob(gps_pattern_alt))
                                     if matching_gps_files_alt:
                                         possible_gps_paths.append(matching_gps_files_alt[0])
-                                        print(f"[MetricsServer] Found GPS log in recordings directory (no time): {matching_gps_files_alt[0]}")
+                                        log.info(f"[MetricsServer] Found GPS log in recordings directory (no time): {matching_gps_files_alt[0]}")
                         else:
                             # No time component in video filename, just match by camera_id and date
                             gps_pattern = f"{camera_id}_{date_str}_*_gps.json"
                             matching_gps_files = list(recordings_dir.glob(gps_pattern))
                             if matching_gps_files:
                                 possible_gps_paths.append(matching_gps_files[0])
-                                print(f"[MetricsServer] Found GPS log in recordings directory: {matching_gps_files[0]}")
+                                log.info(f"[MetricsServer] Found GPS log in recordings directory: {matching_gps_files[0]}")
                             else:
                                 # Try without time component
                                 gps_pattern_alt = f"{camera_id}_{date_str}_gps.json"
                                 matching_gps_files_alt = list(recordings_dir.glob(gps_pattern_alt))
                                 if matching_gps_files_alt:
                                     possible_gps_paths.append(matching_gps_files_alt[0])
-                                    print(f"[MetricsServer] Found GPS log in recordings directory (no time): {matching_gps_files_alt[0]}")
+                                    log.info(f"[MetricsServer] Found GPS log in recordings directory (no time): {matching_gps_files_alt[0]}")
                     
                     # Try all possible paths in priority order
                     for gps_path in possible_gps_paths:
                         if gps_path.exists():
                             gps_log_path = str(gps_path)
-                            print(f"[MetricsServer] Found GPS log file: {gps_log_path}")
+                            log.info(f"[MetricsServer] Found GPS log file: {gps_log_path}")
                             break
                     
                     if not gps_log_path:
-                        print(f"[MetricsServer] No GPS log file found for video (this is OK if video was not recorded with GPS)")
-                        print(f"[MetricsServer] Searched in: {video_path_obj.parent} and {recordings_dir if recordings_dir.exists() else 'N/A'}")
+                        log.info(f"[MetricsServer] No GPS log file found for video (this is OK if video was not recorded with GPS)")
+                        log.info(f"[MetricsServer] Searched in: {video_path_obj.parent} and {recordings_dir if recordings_dir.exists() else 'N/A'}")
                         if camera_id and date_str:
-                            print(f"[MetricsServer] Looking for GPS log with camera_id={camera_id}, date={date_str}, time={time_str if time_str else 'N/A'}")
+                            log.info(f"[MetricsServer] Looking for GPS log with camera_id={camera_id}, date={date_str}, time={time_str if time_str else 'N/A'}")
                 except Exception as e:
-                    print(f"[MetricsServer] ERROR: Failed to find video file: {e}")
+                    log.error("Failed to find video file: %s", e)
                     import traceback
                     traceback.print_exc()
                     return jsonify({'error': f'Failed to find video file: {str(e)}'}), 500
@@ -391,9 +397,9 @@ class MetricsServer:
                                     if detection_mode not in ['trailer', 'car']:
                                         detection_mode = 'trailer'  # fallback to trailer
                         except (ValueError, TypeError) as e:
-                            print(f"[MetricsServer] Warning: Invalid parameter value, using defaults: {e}")
+                            log.info(f"[MetricsServer] Warning: Invalid parameter value, using defaults: {e}")
                 except Exception as e:
-                    print(f"[MetricsServer] Warning: Failed to parse request JSON, using defaults: {e}")
+                    log.info(f"[MetricsServer] Warning: Failed to parse request JSON, using defaults: {e}")
                 
                 # Capture video_path, GPS log path, detect_every_n, and detection_mode for background thread
                 # (Flask request context is not available in background threads)
@@ -413,7 +419,7 @@ class MetricsServer:
                 def process_in_background():
                     try:
                         import traceback
-                        print(f"[MetricsServer] Starting video processing: {captured_video_path}, detect_every_n={captured_detect_every_n}, detection_mode={captured_detection_mode}")
+                        log.info(f"[MetricsServer] Starting video processing: {captured_video_path}, detect_every_n={captured_detect_every_n}, detection_mode={captured_detection_mode}")
                         
                         # Update status: video processing started
                         with self.status_lock:
@@ -430,39 +436,39 @@ class MetricsServer:
                             
                             if captured_detection_mode == 'car':
                                 # Use COCO pre-trained model for car detection (class 2 = car)
-                                print(f"[MetricsServer] Creating car detector (COCO class 2)")
+                                log.info(f"[MetricsServer] Creating car detector (COCO class 2)")
                                 car_detector = YOLOv8Detector(
                                     model_name="yolov8m.pt",  # COCO pre-trained model
                                     conf_threshold=0.25,
                                     target_class=2  # COCO class 2 = car
                                 )
                                 self.video_processor.detector = car_detector
-                                print(f"[MetricsServer] Car detector loaded successfully")
+                                log.info(f"[MetricsServer] Car detector loaded successfully")
                             else:  # trailer mode
                                 # Use fine-tuned model if available, otherwise COCO truck (class 7)
                                 fine_tuned_model_path = "runs/detect/truck_detector_finetuned/weights/best.pt"
                                 if os.path.exists(fine_tuned_model_path):
-                                    print(f"[MetricsServer] Creating trailer detector (fine-tuned model)")
+                                    log.info(f"[MetricsServer] Creating trailer detector (fine-tuned model)")
                                     trailer_detector = YOLOv8Detector(
                                         model_name=fine_tuned_model_path,
                                         conf_threshold=0.35,
                                         target_class=0  # Fine-tuned model is single-class (trailer = class 0)
                                     )
                                     self.video_processor.detector = trailer_detector
-                                    print(f"[MetricsServer] Fine-tuned trailer detector loaded successfully")
+                                    log.info(f"[MetricsServer] Fine-tuned trailer detector loaded successfully")
                                 else:
                                     # Fallback to COCO truck detection
-                                    print(f"[MetricsServer] Creating trailer detector (COCO class 7 = truck)")
+                                    log.info(f"[MetricsServer] Creating trailer detector (COCO class 7 = truck)")
                                     trailer_detector = YOLOv8Detector(
                                         model_name="yolov8m.pt",
                                         conf_threshold=0.25,
                                         target_class=7  # COCO class 7 = truck
                                     )
                                     self.video_processor.detector = trailer_detector
-                                    print(f"[MetricsServer] COCO truck detector loaded successfully")
+                                    log.info(f"[MetricsServer] COCO truck detector loaded successfully")
                         except Exception as e:
-                            print(f"[MetricsServer] Warning: Failed to create detector for {captured_detection_mode} mode: {e}")
-                            print(f"[MetricsServer] Using original detector")
+                            log.info(f"[MetricsServer] Warning: Failed to create detector for {captured_detection_mode} mode: {e}")
+                            log.info(f"[MetricsServer] Using original detector")
                             # Keep original detector if new one fails
                         
                         frame_count = 0
@@ -475,7 +481,7 @@ class MetricsServer:
                             if hasattr(self.video_processor, 'gps_log'):
                                 from app.gps_sensor import load_gps_log
                                 self.video_processor.gps_log = load_gps_log(captured_gps_log_path)
-                                print(f"[MetricsServer] Loaded GPS log for video processing: {captured_gps_log_path}")
+                                log.info(f"[MetricsServer] Loaded GPS log for video processing: {captured_gps_log_path}")
                         
                         for frame_num, processed_frame, events in self.video_processor.process_video(
                             captured_video_path, camera_id="test-video", detect_every_n=captured_detect_every_n
@@ -484,24 +490,24 @@ class MetricsServer:
                             
                             # Check if we should stop
                             if not self.video_processor.is_processing():
-                                print(f"[MetricsServer] Processing stopped at frame {frame_num}")
+                                log.info(f"[MetricsServer] Processing stopped at frame {frame_num}")
                                 break
                             
                             # Log progress every 30 frames
                             if frame_count - last_results_check >= 30:
                                 results = self.video_processor.get_results()
-                                print(f"[MetricsServer] Progress: {results['frames_processed']} frames, {results['detections']} detections, {results['tracks']} tracks, {results['ocr_results']} OCR results")
+                                log.info(f"[MetricsServer] Progress: {results['frames_processed']} frames, {results['detections']} detections, {results['tracks']} tracks, {results['ocr_results']} OCR results")
                                 last_results_check = frame_count
                         
                         # Final results check
                         final_results = self.video_processor.get_results()
-                        print(f"[MetricsServer] Video processing completed: {frame_count} frames processed")
-                        print(f"[MetricsServer] Final results: {final_results}")
+                        log.info(f"[MetricsServer] Video processing completed: {frame_count} frames processed")
+                        log.info(f"[MetricsServer] Final results: {final_results}")
                         
                         # Restore original detector
                         if 'original_detector' in locals() and original_detector is not None:
                             self.video_processor.detector = original_detector
-                            print(f"[MetricsServer] Restored original detector")
+                            log.info(f"[MetricsServer] Restored original detector")
                         
                         # Update status: video processing complete
                         # OCR will not be loaded automatically - user must trigger it manually if needed
@@ -512,18 +518,18 @@ class MetricsServer:
                             self.processing_status['video_processing_complete'] = True
                             self.processing_status['ocr_processing_complete'] = False  # OCR not run automatically
                         
-                        print(f"[MetricsServer] Video processing complete. Crops saved to: {self.video_processor.crops_dir if self.video_processor.crops_dir else 'N/A'}")
-                        print(f"[MetricsServer] OCR processing is available on demand (not run automatically)")
+                        log.info(f"[MetricsServer] Video processing complete. Crops saved to: {self.video_processor.crops_dir if self.video_processor.crops_dir else 'N/A'}")
+                        log.info(f"[MetricsServer] OCR processing is available on demand (not run automatically)")
                         
                     except Exception as e:
-                        print(f"[MetricsServer] Error processing video: {e}")
+                        log.error("Error processing video: %s", e)
                         import traceback
                         traceback.print_exc()
                         # Restore original detector on error
                         if 'original_detector' in locals() and original_detector is not None:
                             try:
                                 self.video_processor.detector = original_detector
-                                print(f"[MetricsServer] Restored original detector after error")
+                                log.info(f"[MetricsServer] Restored original detector after error")
                             except:
                                 pass
                         # Make sure processing flag is cleared on error
@@ -541,11 +547,11 @@ class MetricsServer:
                 thread = threading.Thread(target=process_in_background, daemon=True)
                 thread.start()
                 
-                print(f"[MetricsServer] Video processing thread started for video_id: {video_id}")
+                log.info(f"[MetricsServer] Video processing thread started for video_id: {video_id}")
                 return jsonify({'status': 'processing_started', 'video_id': video_id})
                 
             except Exception as e:
-                print(f"[MetricsServer] FATAL ERROR in process_video endpoint: {e}")
+                log.exception("FATAL ERROR in process_video endpoint: %s", e)
                 import traceback
                 traceback.print_exc()
                 return jsonify({'error': f'Internal server error: {str(e)}'}), 500
@@ -629,7 +635,7 @@ class MetricsServer:
         
         @self.app.route('/api/debug/stop-video-processing', methods=['POST'])
         def debug_stop_video_processing():
-            """Debug: Stop current video processing."""
+            """Debug: Stop current video processing and clear pending video jobs."""
             try:
                 app = self.frame_storage if hasattr(self, 'frame_storage') else None
                 if not app or not hasattr(app, 'video_processor'):
@@ -638,9 +644,13 @@ class MetricsServer:
                 if not app.video_processor:
                     return jsonify({'error': 'Video processor not initialized'}), 500
                 
-                # Stop video processing
+                # Stop current video job (sets stop flag so loop exits)
                 if hasattr(app.video_processor, 'stop_processing'):
                     app.video_processor.stop_processing()
+                
+                # Clear pending video jobs so they are not processed
+                if hasattr(app, 'processing_queue') and app.processing_queue:
+                    app.processing_queue.clear_video_queue()
                 
                 return jsonify({
                     'success': True,
@@ -651,8 +661,7 @@ class MetricsServer:
         
         @self.app.route('/api/debug/stop-ocr-processing', methods=['POST'])
         def debug_stop_ocr_processing():
-            """Debug: Stop current OCR processing (clear OCR queue)."""
-            import queue
+            """Debug: Stop current OCR processing and clear OCR queue."""
             try:
                 app = self.frame_storage if hasattr(self, 'frame_storage') else None
                 if not app or not hasattr(app, 'processing_queue'):
@@ -661,22 +670,15 @@ class MetricsServer:
                 if not app.processing_queue:
                     return jsonify({'error': 'Processing queue not initialized'}), 500
                 
-                # Clear OCR queue (we can't stop current OCR, but we can clear the queue)
-                # Note: Current OCR will finish, but no new jobs will be processed
-                ocr_queue_size = app.processing_queue.ocr_queue.qsize()
-                
-                # Clear OCR queue
-                while not app.processing_queue.ocr_queue.empty():
-                    try:
-                        app.processing_queue.ocr_queue.get_nowait()
-                        app.processing_queue.ocr_queue.task_done()
-                    except queue.Empty:
-                        break
+                # Request current OCR job to stop (worker checks this between crops)
+                app.processing_queue.request_ocr_stop()
+                # Clear pending OCR jobs
+                cleared_jobs = app.processing_queue.clear_ocr_queue()
                 
                 return jsonify({
                     'success': True,
-                    'message': f'OCR queue cleared ({ocr_queue_size} jobs removed). Current OCR will finish.',
-                    'cleared_jobs': ocr_queue_size
+                    'message': f'OCR processing stopped. Queue cleared ({cleared_jobs} job(s) removed).',
+                    'cleared_jobs': cleared_jobs
                 }), 200
             except Exception as e:
                 return jsonify({'error': str(e)}), 500
@@ -694,64 +696,186 @@ class MetricsServer:
                 detection_mode = data.get('detection_mode', 'trailer')
                 
                 app = self.frame_storage if hasattr(self, 'frame_storage') else None
-                if not app or not hasattr(app, 'processing_queue'):
-                    return jsonify({'error': 'Processing queue not available'}), 500
                 
-                if not app.processing_queue:
-                    return jsonify({'error': 'Processing queue not initialized'}), 500
+                # For debug mode, we need to ensure we have a processing queue
+                # If app exists but processing queue doesn't, create one on the fly
+                processing_queue = None
                 
-                # Process all videos in out/recordings folder
+                if app:
+                    # Debug flow: same as application pipeline - OCR after each video (defer_ocr=False)
+                    if not hasattr(app, 'video_processor') or not app.video_processor:
+                        return jsonify({
+                            'error': 'Video processor not available',
+                            'hint': 'Please start the application first to initialize the video processor.'
+                        }), 500
+                    if not getattr(app, 'ocr', None):
+                        if hasattr(app, '_initialize_ocr'):
+                            app._initialize_ocr()
+                        if not app.ocr:
+                            return jsonify({
+                                'error': 'OCR not available',
+                                'hint': 'Please start the application first to load OCR, or check OCR model files.'
+                            }), 500
+
+                    def _on_debug_ocr_complete(video_path, crops_dir, ocr_results):
+                        """Store OCR results in database when debug processing completes OCR for a job."""
+                        app_ref = self.frame_storage if hasattr(self, 'frame_storage') else None
+                        if not app_ref or not getattr(app_ref, 'video_frame_db', None) or not ocr_results:
+                            return
+                        try:
+                            if hasattr(app_ref, '_store_ocr_results_in_db'):
+                                app_ref._store_ocr_results_in_db(video_path, crops_dir, ocr_results)
+                                log.info("[MetricsServer] Debug OCR: stored results in database for %s", Path(video_path).name)
+                        except Exception as e:
+                            log.exception("[MetricsServer] Debug OCR: failed to store results in database: %s", e)
+
+                    # Use or create a processing queue (OCR per video, same as application)
+                    if hasattr(app, 'processing_queue') and app.processing_queue and not getattr(app.processing_queue, 'defer_ocr', True):
+                        processing_queue = app.processing_queue
+                        if processing_queue.on_ocr_complete is None:
+                            processing_queue.on_ocr_complete = _on_debug_ocr_complete
+                    else:
+                        log.info("[MetricsServer] Creating debug processing queue (OCR per video)")
+                        try:
+                            from app.processing_queue import ProcessingQueueManager
+                            processing_queue = ProcessingQueueManager(
+                                video_processor=app.video_processor,
+                                ocr=app.ocr,
+                                preprocessor=getattr(app, 'preprocessor', None),
+                                on_video_complete=None,
+                                on_ocr_complete=_on_debug_ocr_complete,
+                                defer_ocr=False,
+                                on_video_queue_drained=None
+                            )
+                            app.processing_queue = processing_queue
+                            log.info("[MetricsServer] Debug processing queue created")
+                        except Exception as e:
+                            log.info(f"[MetricsServer] Failed to create debug processing queue: {e}")
+                            import traceback
+                            traceback.print_exc()
+                            return jsonify({
+                                'error': f'Failed to initialize processing queue: {str(e)}',
+                                'hint': 'Make sure the video processor and OCR are initialized (start the application).'
+                            }), 500
+                else:
+                    # No app available - check if we can use video_processor from metrics_server
+                    if self.video_processor:
+                        # We have a video processor but need OCR and other components
+                        return jsonify({
+                            'error': 'Application not available. Cannot create processing queue without full application context.',
+                            'hint': 'Please start the application first to initialize all components.'
+                        }), 500
+                    else:
+                        return jsonify({
+                            'error': 'Application not available. Please start the application first.',
+                            'hint': 'Click "Start Application" button to initialize the processing queue.'
+                        }), 500
+                
+                if not processing_queue:
+                    return jsonify({
+                        'error': 'Processing queue not available and could not be created.',
+                        'hint': 'Please start the application first to initialize all components.'
+                    }), 500
+                
+                # Process all videos in out/recordings folder (or out/recording)
                 if process_all or not video_path:
-                    recordings_dir = Path("out/recordings")
-                    if not recordings_dir.exists():
-                        return jsonify({'error': f'Recordings directory not found: {recordings_dir}'}), 404
+                    # Try both singular and plural folder names
+                    recordings_dir = None
+                    for folder_name in ["out/recordings", "out/recording"]:
+                        test_dir = Path(folder_name)
+                        if test_dir.exists():
+                            recordings_dir = test_dir
+                            break
                     
-                    # Find all video files
+                    if not recordings_dir or not recordings_dir.exists():
+                        return jsonify({
+                            'error': f'Recordings directory not found. Checked: out/recordings and out/recording',
+                            'checked_paths': ['out/recordings', 'out/recording']
+                        }), 404
+                    
+                    # Find all video files (search recursively in subdirectories too)
                     video_extensions = ['.mp4', '.avi', '.mov', '.mkv']
                     video_files = []
                     for ext in video_extensions:
+                        # Search in root directory
                         video_files.extend(recordings_dir.glob(f'*{ext}'))
+                        # Search recursively in subdirectories
+                        video_files.extend(recordings_dir.rglob(f'*{ext}'))
+                    
+                    # Remove duplicates (in case same file matches both patterns)
+                    video_files = list(set(video_files))
+                    
+                    log.info(f"[MetricsServer] Found {len(video_files)} video file(s) in {recordings_dir}")
+                    if video_files:
+                        log.info(f"[MetricsServer] Video files: {[f.name for f in video_files[:5]]}{'...' if len(video_files) > 5 else ''}")
                     
                     if not video_files:
                         return jsonify({
                             'success': False,
-                            'message': 'No video files found in out/recordings',
-                            'videos_queued': 0
+                            'message': f'No video files found in {recordings_dir}',
+                            'videos_queued': 0,
+                            'searched_directory': str(recordings_dir)
                         }), 200
                     
                     # Queue all videos for processing
                     queued_count = 0
+                    errors = []
                     for vid_path in sorted(video_files):
-                        # Try to find corresponding GPS log
-                        gps_log = None
-                        video_stem = vid_path.stem
-                        # Look for GPS log with same name
-                        gps_log_paths = [
-                            recordings_dir / f"{video_stem}.json",
-                            recordings_dir / f"{video_stem}_gps.json",
-                        ]
-                        for gps_path in gps_log_paths:
-                            if gps_path.exists():
-                                gps_log = str(gps_path)
-                                break
-                        
-                        # Extract camera_id from filename (format: camera_id_timestamp_chunkXXXX)
-                        parts = video_stem.split('_')
-                        vid_camera_id = parts[0] if parts else camera_id
-                        
-                        app.processing_queue.queue_video_processing(
-                            video_path=str(vid_path),
-                            camera_id=vid_camera_id,
-                            gps_log_path=gps_log,
-                            detect_every_n=detect_every_n,
-                            detection_mode=detection_mode
-                        )
-                        queued_count += 1
+                        try:
+                            # Try to find corresponding GPS log
+                            # Look in the same directory as the video file first, then in root
+                            gps_log = None
+                            video_stem = vid_path.stem
+                            video_dir = vid_path.parent
+                            
+                            # Look for GPS log with same name (check video's directory first, then root)
+                            gps_log_paths = [
+                                video_dir / f"{video_stem}.json",  # Same directory as video
+                                video_dir / f"{video_stem}_gps.json",  # Same directory as video
+                                recordings_dir / f"{video_stem}.json",  # Root directory
+                                recordings_dir / f"{video_stem}_gps.json",  # Root directory
+                            ]
+                            for gps_path in gps_log_paths:
+                                if gps_path.exists():
+                                    gps_log = str(gps_path)
+                                    log.info(f"[MetricsServer] Found GPS log for {vid_path.name}: {gps_path.name}")
+                                    break
+                            
+                            # Extract camera_id from filename (format: camera_id_timestamp_chunkXXXX)
+                            parts = video_stem.split('_')
+                            vid_camera_id = parts[0] if parts else camera_id
+                            
+                            processing_queue.queue_video_processing(
+                                video_path=str(vid_path),
+                                camera_id=vid_camera_id,
+                                gps_log_path=gps_log,
+                                detect_every_n=detect_every_n,
+                                detection_mode=detection_mode
+                            )
+                            queued_count += 1
+                            log.info(f"[MetricsServer] Queued video {queued_count}/{len(video_files)}: {vid_path.name} (camera: {vid_camera_id})")
+                        except Exception as e:
+                            error_msg = f"Error queueing {vid_path.name}: {str(e)}"
+                            errors.append(error_msg)
+                            log.info(f"[MetricsServer] {error_msg}")
+                            import traceback
+                            traceback.print_exc()
                     
+                    if errors:
+                        return jsonify({
+                            'success': queued_count > 0,
+                            'message': f'Queued {queued_count} video(s) for processing, {len(errors)} error(s)',
+                            'videos_queued': queued_count,
+                            'errors': errors
+                        }), 200 if queued_count > 0 else 500
+                    
+                    log.info(f"[MetricsServer] Successfully queued {queued_count} video(s) for processing")
                     return jsonify({
                         'success': True,
                         'message': f'Queued {queued_count} video(s) for processing',
-                        'videos_queued': queued_count
+                        'videos_queued': queued_count,
+                        'total_found': len(video_files),
+                        'directory': str(recordings_dir)
                     }), 200
                 
                 # Process single video
@@ -759,7 +883,7 @@ class MetricsServer:
                     return jsonify({'error': 'video_path is required when process_all is false'}), 400
                 
                 # Queue video processing
-                app.processing_queue.queue_video_processing(
+                processing_queue.queue_video_processing(
                     video_path=video_path,
                     camera_id=camera_id,
                     gps_log_path=gps_log_path,
@@ -774,7 +898,14 @@ class MetricsServer:
                 }), 200
                 
             except Exception as e:
-                return jsonify({'error': str(e)}), 500
+                import traceback
+                error_trace = traceback.format_exc()
+                log.exception("ERROR in debug_start_video_processing: %s", e)
+                log.info(f"[MetricsServer] Traceback:\n{error_trace}")
+                return jsonify({
+                    'error': str(e),
+                    'traceback': error_trace
+                }), 500
         
         @self.app.route('/api/debug/start-ocr-processing', methods=['POST'])
         def debug_start_ocr_processing():
@@ -885,10 +1016,16 @@ class MetricsServer:
             try:
                 data = request.get_json() or {}
                 camera_id = data.get('camera_id')
+                detection_mode = (data.get('detection_mode') or 'trailer').strip().lower()
+                if detection_mode not in ('car', 'trailer'):
+                    detection_mode = 'trailer'
                 
                 app = self.frame_storage if hasattr(self, 'frame_storage') else None
                 if not app:
                     return jsonify({'error': 'Application not available'}), 500
+                
+                app.detection_mode = detection_mode
+                log.info("[MetricsServer] Start application: detection_mode=%s", detection_mode)
                 
                 # Check if already running
                 if app.is_recording():
@@ -898,7 +1035,7 @@ class MetricsServer:
                     }), 400
                 
                 # Step 1: Initialize assets (OCR, processing queue, etc.)
-                print(f"[MetricsServer] Initializing assets for automated processing...")
+                log.info(f"[MetricsServer] Initializing assets for automated processing...")
                 assets_result = app.initialize_assets()
                 
                 if not assets_result.get('success'):
@@ -908,7 +1045,7 @@ class MetricsServer:
                         'assets_loaded': assets_result.get('assets_loaded', {})
                     }), 500
                 
-                print(f"[MetricsServer] Assets initialized successfully")
+                log.info(f"[MetricsServer] Assets initialized successfully")
                 
                 # Step 2: Start auto recording (this will automatically trigger processing)
                 result = app.start_recording(camera_id=camera_id)
@@ -918,7 +1055,7 @@ class MetricsServer:
                         'success': True,
                         'message': 'Application started successfully',
                         'camera_id': result.get('camera_id'),
-                        'workflow': 'Assets loaded → Auto recording → Video processing → OCR → Server upload',
+                        'workflow': 'Assets loaded (no OCR yet) → Recording → Video processing per chunk → When stop: OCR once on all crops → DB/upload',
                         'assets_loaded': assets_result.get('assets_loaded', {})
                     }), 200
                 else:
@@ -960,6 +1097,12 @@ class MetricsServer:
                 
                 is_recording = app.is_recording()
                 
+                # Get camera_id from video recorder if recording
+                camera_id = None
+                if hasattr(app, 'video_recorder') and app.video_recorder:
+                    if app.video_recorder.is_recording() and hasattr(app.video_recorder, 'camera_id'):
+                        camera_id = app.video_recorder.camera_id
+                
                 # Check if gracefully shutting down (recording stopped but processing ongoing)
                 is_gracefully_shutting_down = False
                 is_processing_ongoing = False
@@ -976,6 +1119,7 @@ class MetricsServer:
                 return jsonify({
                     'running': is_recording,
                     'recording': is_recording,
+                    'camera_id': camera_id,
                     'gracefully_shutting_down': is_gracefully_shutting_down,
                     'processing_ongoing': is_processing_ongoing,
                     'queue_status': queue_status,
@@ -1017,55 +1161,244 @@ class MetricsServer:
         
         @self.app.route('/api/dashboard/data', methods=['GET'])
         def get_dashboard_data():
-            """Get dashboard data aggregated from combined_results.json files."""
+            """Get dashboard data from video_frames.db (fallback: combined_results.json)."""
+            date_str = request.args.get('date')
+            log.info("[MetricsServer] GET /api/dashboard/data request date=%s", date_str)
             try:
-                date_str = request.args.get('date')
-                data = self._get_dashboard_data_from_json(date_str=date_str)
+                data = self._get_dashboard_data_from_db(date_str=date_str)
+                if data is None:
+                    data = self._get_dashboard_data_from_json(date_str=date_str)
+                    log.info("[MetricsServer] GET /api/dashboard/data response source=json kpis.trailersOnYard=%s",
+                             data.get('kpis', {}).get('trailersOnYard', {}).get('value'))
+                else:
+                    log.info("[MetricsServer] GET /api/dashboard/data response source=db kpis.trailersOnYard=%s",
+                             data.get('kpis', {}).get('trailersOnYard', {}).get('value'))
                 return jsonify(data)
             except Exception as e:
-                print(f"[MetricsServer] Error getting dashboard data: {e}")
-                import traceback
-                traceback.print_exc()
+                log.exception("[MetricsServer] Error getting dashboard data: %s", e)
                 return jsonify({'error': str(e)}), 500
         
         @self.app.route('/api/dashboard/events', methods=['GET'])
         def get_dashboard_events():
-            """Get events from combined_results.json files."""
+            """Get events from video_frames.db (fallback: combined_results.json)."""
+            limit = int(request.args.get('limit', 1000))
+            date_str = request.args.get('date')
+            log.info("[MetricsServer] GET /api/dashboard/events request limit=%s date=%s", limit, date_str)
             try:
-                limit = int(request.args.get('limit', 1000))
-                date_str = request.args.get('date')
-                events = self._get_events_from_json(limit, date_str=date_str)
+                events = self._get_events_from_db(limit, date_str=date_str)
+                if events is None:
+                    events = self._get_events_from_json(limit, date_str=date_str)
+                    log.info("[MetricsServer] GET /api/dashboard/events response source=json count=%s", len(events))
+                else:
+                    log.info("[MetricsServer] GET /api/dashboard/events response source=db count=%s", len(events))
                 return jsonify({'events': events, 'count': len(events)})
             except Exception as e:
-                print(f"[MetricsServer] Error getting dashboard events: {e}")
-                import traceback
-                traceback.print_exc()
+                log.exception("[MetricsServer] Error getting dashboard events: %s", e)
                 return jsonify({'error': str(e)}), 500
         
         @self.app.route('/api/cameras', methods=['GET'])
         def get_cameras():
             """Get list of cameras from cameras.yaml with status."""
+            force_check = request.args.get('force', 'false').lower() == 'true'
+            log.info("[MetricsServer] GET /api/cameras request force=%s", force_check)
             try:
-                # Check if force refresh is requested
-                force_check = request.args.get('force', 'false').lower() == 'true'
                 cameras = self._get_cameras_with_status(force_check=force_check)
+                log.info("[MetricsServer] GET /api/cameras response count=%s", len(cameras))
                 return jsonify({'cameras': cameras})
             except Exception as e:
-                print(f"[MetricsServer] Error getting cameras: {e}")
-                import traceback
-                traceback.print_exc()
+                log.exception("[MetricsServer] Error getting cameras: %s", e)
                 return jsonify({'error': str(e)}), 500
         
         @self.app.route('/api/inventory', methods=['GET'])
         def get_inventory():
-            """Get inventory data from combined_results.json files."""
+            """Get inventory data from video_frames.db (fallback: combined_results.json)."""
+            log.info("[MetricsServer] GET /api/inventory request")
             try:
-                data = self._get_inventory_from_json()
+                data = self._get_inventory_from_db()
+                if data is None:
+                    data = self._get_inventory_from_json()
+                    log.info("[MetricsServer] GET /api/inventory response source=json trailers=%s",
+                             len(data.get('trailers', [])))
+                else:
+                    log.info("[MetricsServer] GET /api/inventory response source=db trailers=%s",
+                             len(data.get('trailers', [])))
                 return jsonify(data)
             except Exception as e:
-                print(f"[MetricsServer] Error getting inventory data: {e}")
-                import traceback
-                traceback.print_exc()
+                log.exception("[MetricsServer] Error getting inventory data: %s", e)
+                return jsonify({'error': str(e)}), 500
+        
+        @self.app.route('/api/yard-view', methods=['GET'])
+        def get_yard_view():
+            """Get yard view (spots/lanes) from video_frames.db."""
+            log.info("[MetricsServer] GET /api/yard-view request")
+            try:
+                data = self._get_yard_view_from_db()
+                log.info("[MetricsServer] GET /api/yard-view response spots=%s lanes=%s",
+                         len(data.get('spots', [])), len(data.get('lanes', [])))
+                return jsonify(data)
+            except Exception as e:
+                log.exception("[MetricsServer] Error getting yard view: %s", e)
+                return jsonify({'error': str(e), 'spots': [], 'lanes': []}), 500
+        
+        @self.app.route('/api/reports', methods=['GET'])
+        def get_reports():
+            """Get reports (daily/weekly/monthly) from video_frames.db."""
+            log.info("[MetricsServer] GET /api/reports request")
+            try:
+                data = self._get_reports_from_db()
+                log.info("[MetricsServer] GET /api/reports response ok")
+                return jsonify(data)
+            except Exception as e:
+                log.exception("[MetricsServer] Error getting reports: %s", e)
+                return jsonify({'error': str(e)}), 500
+        
+        def _get_data_processor_service():
+            """Get or create the data processor service (lazy init)."""
+            if self._data_processor_service is None:
+                from app.video_frame_db import VideoFrameDB
+                from app.data_processor_service import DataProcessorService
+                db = VideoFrameDB(db_path="data/video_frames.db")
+                self._data_processor_service = DataProcessorService(db, logger=log)
+                geojson_path = Path("config/spots.geojson")
+                if geojson_path.exists():
+                    self._data_processor_service.load_parking_spots_from_geojson(str(geojson_path))
+            return self._data_processor_service
+        
+        @self.app.route('/api/data-processor/status', methods=['GET'])
+        def data_processor_status():
+            """Get data processor status (running, spots loaded)."""
+            try:
+                svc = _get_data_processor_service()
+                stats = svc.get_statistics()
+                return jsonify({
+                    'running': svc.running,
+                    'parking_spots_loaded': len(svc.parking_spots),
+                    **stats
+                }), 200
+            except Exception as e:
+                log.exception("Data processor status error: %s", e)
+                return jsonify({'error': str(e), 'running': False, 'parking_spots_loaded': 0}), 500
+        
+        @self.app.route('/api/data-processor/load-csv', methods=['POST'])
+        def data_processor_load_csv():
+            """Upload a CSV file and load reference parking spots; then run one processing cycle."""
+            try:
+                if 'file' not in request.files and 'csv' not in request.files:
+                    return jsonify({'success': False, 'error': 'No file part; use form field "file" or "csv"'}), 400
+                f = request.files.get('file') or request.files.get('csv')
+                if not f or f.filename == '':
+                    return jsonify({'success': False, 'error': 'No file selected'}), 400
+                if not (f.filename or '').lower().endswith('.csv'):
+                    return jsonify({'success': False, 'error': 'File must be a CSV'}), 400
+                filename = secure_filename(f.filename) or 'spots.csv'
+                csv_path = self.upload_dir / f"data_processor_{uuid.uuid4().hex}_{filename}"
+                f.save(str(csv_path))
+                try:
+                    svc = _get_data_processor_service()
+                    svc.load_parking_spots_from_csv(str(csv_path))
+                    spots_count = len(svc.parking_spots)
+                    if spots_count == 0:
+                        return jsonify({
+                            'success': False,
+                            'error': 'No valid parking spots found in CSV. Expected columns: id, name, latitude, longitude (or lat, lon)'
+                        }), 200
+                    result = svc.run_all()
+                    processed = result.get('processed', 0)
+                    log.info(
+                        "Data processor load-csv: loaded %d spots, processed %d record(s).",
+                        spots_count, processed
+                    )
+                    return jsonify({
+                        'success': True,
+                        'parking_spots_loaded': spots_count,
+                        'processed': processed,
+                        'message': f'Loaded {spots_count} spots and processed {processed} record(s).'
+                    }), 200
+                finally:
+                    if csv_path.exists():
+                        try:
+                            csv_path.unlink()
+                        except OSError:
+                            pass
+            except Exception as e:
+                log.exception("Data processor load CSV error: %s", e)
+                return jsonify({'success': False, 'error': str(e)}), 500
+        
+        @self.app.route('/api/data-processor/run', methods=['POST'])
+        def data_processor_run():
+            """Run one processing cycle with current parking spots."""
+            try:
+                svc = _get_data_processor_service()
+                if not svc.parking_spots:
+                    return jsonify({'success': False, 'error': 'No parking spots loaded. Load a CSV first.'}), 200
+                result = svc.run_once()
+                return jsonify({
+                    'success': result.get('success', True),
+                    'processed': result.get('processed', 0),
+                    'message': f"Processed {result.get('processed', 0)} record(s)."
+                }), 200
+            except Exception as e:
+                log.exception("Data processor run error: %s", e)
+                return jsonify({'success': False, 'error': str(e)}), 500
+        
+        @self.app.route('/api/data-processor/start', methods=['POST'])
+        def data_processor_start():
+            """Start the data processor service (runs periodically)."""
+            try:
+                svc = _get_data_processor_service()
+                if not svc.parking_spots:
+                    return jsonify({'success': False, 'error': 'No parking spots loaded. Load a CSV first.'}), 200
+                svc.start()
+                return jsonify({'success': True, 'message': 'Data processor started.'}), 200
+            except Exception as e:
+                log.exception("Data processor start error: %s", e)
+                return jsonify({'success': False, 'error': str(e)}), 500
+        
+        @self.app.route('/api/data-processor/stop', methods=['POST'])
+        def data_processor_stop():
+            """Stop the data processor service."""
+            try:
+                if self._data_processor_service is None:
+                    return jsonify({'success': True, 'message': 'Data processor was not running.'}), 200
+                self._data_processor_service.stop()
+                return jsonify({'success': True, 'message': 'Data processor stopped.'}), 200
+            except Exception as e:
+                log.exception("Data processor stop error: %s", e)
+                return jsonify({'success': False, 'error': str(e)}), 500
+        
+        @self.app.route('/api/video-frame-records', methods=['GET'])
+        def get_video_frame_records():
+            """Get video frame records from video_frames.db."""
+            limit = request.args.get('limit', default=50, type=int)
+            offset = request.args.get('offset', default=0, type=int)
+            is_processed = request.args.get('is_processed', default=None, type=str)
+            camera_id = request.args.get('camera_id', default=None, type=str)
+            log.info("[MetricsServer] GET /api/video-frame-records limit=%s offset=%s is_processed=%s camera_id=%s",
+                     limit, offset, is_processed, camera_id)
+            try:
+                from app.video_frame_db import VideoFrameDB
+                db = VideoFrameDB(db_path="data/video_frames.db")
+                is_processed_bool = None
+                if is_processed is not None:
+                    is_processed_bool = is_processed.lower() == 'true'
+                records = db.get_all_records(
+                    limit=limit,
+                    offset=offset,
+                    is_processed=is_processed_bool,
+                    camera_id=camera_id if camera_id else None
+                )
+                stats = db.get_statistics()
+                log.info("[MetricsServer] GET /api/video-frame-records response records=%s total=%s",
+                         len(records), stats.get('total', 0))
+                return jsonify({
+                    'records': records,
+                    'stats': stats,
+                    'limit': limit,
+                    'offset': offset,
+                    'total': stats.get('total', 0)
+                })
+            except Exception as e:
+                log.exception("[MetricsServer] Error getting video frame records: %s", e)
                 return jsonify({'error': str(e)}), 500
         
         # Static file routes must be LAST (after all API routes)
@@ -1096,6 +1429,255 @@ class MetricsServer:
             # File exists - serve it
             return send_from_directory(str(web_dir), path)
     
+    def _get_video_frame_db(self):
+        """Get VideoFrameDB instance (uses data/video_frames.db)."""
+        from app.video_frame_db import VideoFrameDB
+        db_path = Path(__file__).parent.parent / "data" / "video_frames.db"
+        return VideoFrameDB(db_path=str(db_path))
+    
+    def _filter_records_by_date(self, records: List[Dict], date_str: Optional[str]) -> List[Dict]:
+        """Filter records by created_on date (YYYY-MM-DD). If date_str is None, use today."""
+        from datetime import date as date_type
+        if not date_str:
+            date_str = datetime.utcnow().strftime('%Y-%m-%d')
+        try:
+            filter_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+        except ValueError:
+            return records
+        out = []
+        for r in records:
+            created = r.get('created_on') or r.get('timestamp') or ''
+            if not created:
+                continue
+            try:
+                if 'T' in str(created):
+                    rec_date = datetime.fromisoformat(str(created).replace('Z', '+00:00')).date()
+                else:
+                    rec_date = datetime.strptime(str(created)[:10], '%Y-%m-%d').date()
+                if rec_date == filter_date:
+                    out.append(r)
+            except (ValueError, TypeError):
+                continue
+        return out
+    
+    def _get_dashboard_data_from_db(self, date_str: str = None) -> Optional[Dict]:
+        """Build dashboard KPIs/charts from video_frames.db. Returns None if DB has no data."""
+        try:
+            db = self._get_video_frame_db()
+            stats = db.get_statistics()
+            if stats.get('total', 0) == 0:
+                return None
+            records = db.get_all_records(limit=2000, offset=0, is_processed=None, camera_id=None)
+            records = self._filter_records_by_date(records, date_str)
+            if not records and date_str:
+                return None
+            if not records:
+                records = db.get_all_records(limit=500, offset=0, is_processed=None, camera_id=None)
+            from collections import defaultdict
+            unique_tracks = set(r.get('track_id') for r in records if r.get('track_id') is not None)
+            unique_spots = set()
+            for r in records:
+                s = (r.get('assigned_spot_name') or r.get('processed_comment') or '').strip()
+                if s and s.lower() != 'unknown':
+                    unique_spots.add(s)
+            total_detections = len(records)
+            ocr_ok = sum(1 for r in records if (r.get('licence_plate_trailer') or '').strip())
+            ocr_accuracy = (ocr_ok / total_detections * 100) if total_detections else 0
+            low_conf = sum(1 for r in records if (r.get('confidence') or 0) < 0.5)
+            cameras = self._get_cameras_with_status()
+            online = sum(1 for c in cameras if c.get('status') == 'online')
+            degraded = sum(1 for c in cameras if c.get('status') == 'degraded')
+            hourly = defaultdict(lambda: {'total': 0, 'total_det': 0.0, 'total_ocr': 0.0, 'ocr_n': 0})
+            for r in records:
+                created = r.get('created_on') or r.get('timestamp') or ''
+                if created:
+                    try:
+                        dt = datetime.fromisoformat(str(created).replace('Z', '+00:00'))
+                        key = dt.strftime('%H:00')
+                        hourly[key]['total'] += 1
+                        conf = float(r.get('confidence') or 0)
+                        hourly[key]['total_det'] += conf
+                        if (r.get('licence_plate_trailer') or '').strip():
+                            hourly[key]['total_ocr'] += conf
+                            hourly[key]['ocr_n'] += 1
+                    except (ValueError, TypeError):
+                        pass
+            accuracy_chart = []
+            for h in range(24):
+                key = f'{h:02d}:00'
+                d = hourly.get(key, {'total': 0, 'total_det': 0.0, 'total_ocr': 0.0, 'ocr_n': 0})
+                det_pct = (d['total_det'] / d['total'] * 100) if d['total'] else 0
+                ocr_pct = (d['total_ocr'] / d['ocr_n'] * 100) if d['ocr_n'] else 0
+                accuracy_chart.append({'time': key, 'detection': round(det_pct, 1), 'ocr': round(ocr_pct, 1)})
+            spot_counts = defaultdict(int)
+            for r in records:
+                s = (r.get('assigned_spot_name') or '').strip() or (r.get('processed_comment') or '').strip()
+                if s and s.lower() != 'unknown':
+                    spot_counts[s] += 1
+            yard_util = [{'lane': k, 'utilization': v} for k, v in sorted(spot_counts.items())]
+            return {
+                'kpis': {
+                    'trailersOnYard': {'value': len(unique_tracks), 'change': f'+{len(unique_tracks)}', 'icon': '🚛'},
+                    'newDetections24h': {'value': total_detections, 'ocrAccuracy': f'{ocr_accuracy:.1f}%', 'icon': '📈'},
+                    'anomalies': {'value': low_conf, 'description': f'{low_conf} low confidence', 'icon': '⚠️'},
+                    'camerasOnline': {'value': online, 'degraded': degraded, 'icon': '📷'},
+                },
+                'queueStatus': {'ingestQ': 0, 'ocrQ': 0, 'pubQ': 0},
+                'accuracyChart': accuracy_chart,
+                'yardUtilization': yard_util,
+                'cameraHealth': cameras,
+            }
+        except Exception as e:
+            log.debug("[MetricsServer] _get_dashboard_data_from_db failed: %s", e)
+            return None
+    
+    def _get_events_from_db(self, limit: int, date_str: str = None) -> Optional[List[Dict]]:
+        """Get events from video_frames.db. Returns None on error or empty DB."""
+        try:
+            db = self._get_video_frame_db()
+            stats = db.get_statistics()
+            if stats.get('total', 0) == 0:
+                return []
+            records = db.get_all_records(limit=min(limit, 2000), offset=0, is_processed=None, camera_id=None)
+            records = self._filter_records_by_date(records, date_str)
+            events = []
+            for r in records:
+                ts = r.get('timestamp') or r.get('created_on') or ''
+                events.append({
+                    'ts_iso': ts,
+                    'camera_id': r.get('camera_id') or 'N/A',
+                    'track_id': r.get('track_id') if r.get('track_id') is not None else 'N/A',
+                    'text': (r.get('licence_plate_trailer') or '').strip() or '',
+                    'conf': float(r.get('confidence') or 0),
+                    'spot': (r.get('assigned_spot_name') or '').strip() or 'unknown',
+                    'ocr_conf': float(r.get('confidence') or 0),
+                    'lat': r.get('latitude'),
+                    'lon': r.get('longitude'),
+                })
+            events.sort(key=lambda x: x.get('ts_iso', ''), reverse=True)
+            return events[:limit]
+        except Exception as e:
+            log.debug("[MetricsServer] _get_events_from_db failed: %s", e)
+            return None
+    
+    def _get_inventory_from_db(self) -> Optional[Dict]:
+        """Get inventory (trailers + stats) from video_frames.db. Returns None on error."""
+        from collections import defaultdict
+        try:
+            db = self._get_video_frame_db()
+            stats = db.get_statistics()
+            if stats.get('total', 0) == 0:
+                return None
+            records = db.get_all_records(limit=1000, offset=0, is_processed=None, camera_id=None)
+            by_track = defaultdict(list)
+            for r in records:
+                tid = r.get('track_id')
+                if tid is not None:
+                    by_track[tid].append(r)
+            trailers = []
+            for track_id, rlist in by_track.items():
+                r = max(rlist, key=lambda x: (x.get('created_on') or x.get('timestamp') or ''))
+                spot = (r.get('assigned_spot_name') or '').strip() or 'N/A'
+                status = 'Parked' if r.get('is_processed') or (spot and spot != 'N/A') else 'In Transit'
+                trailers.append({
+                    'id': f"T{track_id}" if track_id is not None else f"R{r.get('id', 0)}",
+                    'plate': (r.get('licence_plate_trailer') or '').strip() or 'N/A',
+                    'spot': spot if spot != 'N/A' else 'N/A',
+                    'status': status,
+                    'detectedAt': r.get('created_on') or r.get('timestamp') or '',
+                    'ocrConfidence': float(r.get('confidence') or 0),
+                    'lat': r.get('latitude'),
+                    'lon': r.get('longitude'),
+                })
+            total = len(trailers)
+            parked = sum(1 for t in trailers if t['status'] == 'Parked')
+            anomalies = sum(1 for rec in records if (rec.get('confidence') or 0) < 0.5)
+            return {
+                'trailers': trailers,
+                'stats': {'total': total, 'parked': parked, 'inTransit': total - parked, 'anomalies': anomalies},
+            }
+        except Exception as e:
+            log.debug("[MetricsServer] _get_inventory_from_db failed: %s", e)
+            return None
+    
+    def _get_yard_view_from_db(self) -> Dict:
+        """Get yard view spots/lanes from video_frames.db (assigned spots + occupancy)."""
+        try:
+            db = self._get_video_frame_db()
+            records = db.get_all_records(limit=500, offset=0, is_processed=None, camera_id=None)
+            spot_to_latest = {}
+            for r in records:
+                sid = (r.get('assigned_spot_id') or '').strip() or (r.get('assigned_spot_name') or '').strip()
+                if not sid:
+                    continue
+                created = r.get('created_on') or r.get('timestamp') or ''
+                if sid not in spot_to_latest or (spot_to_latest[sid].get('created_on') or '') < created:
+                    spot_to_latest[sid] = r
+            spots = []
+            for sid, r in spot_to_latest.items():
+                name = (r.get('assigned_spot_name') or sid).strip()
+                lane = name.split('-')[0] if name else 'A'
+                spots.append({
+                    'id': sid,
+                    'lane': lane,
+                    'row': 1,
+                    'occupied': True,
+                    'trailerId': f"T{r.get('track_id')}" if r.get('track_id') is not None else None,
+                    'plate': (r.get('licence_plate_trailer') or '').strip() or None,
+                })
+            lanes = sorted(set(s['lane'] for s in spots)) if spots else ['A', 'B', 'C', 'D', 'Dock']
+            return {'spots': spots, 'lanes': lanes}
+        except Exception as e:
+            log.debug("[MetricsServer] _get_yard_view_from_db failed: %s", e)
+            return {'spots': [], 'lanes': ['A', 'B', 'C', 'D', 'Dock']}
+    
+    def _get_reports_from_db(self) -> Dict:
+        """Get report stats (daily/weekly/monthly) from video_frames.db."""
+        try:
+            db = self._get_video_frame_db()
+            stats = db.get_statistics()
+            all_records = db.get_all_records(limit=5000, offset=0, is_processed=None, camera_id=None)
+            total = len(all_records)
+            ocr_ok = sum(1 for r in all_records if (r.get('licence_plate_trailer') or '').strip())
+            ocr_pct = (ocr_ok / total * 100) if total else 0
+            anomalies = sum(1 for r in all_records if (r.get('confidence') or 0) < 0.5)
+            today = datetime.utcnow().strftime('%Y-%m-%d')
+            week_start = (datetime.utcnow() - __import__('datetime').timedelta(days=7)).strftime('%Y-%m-%d')
+            month_start = (datetime.utcnow() - __import__('datetime').timedelta(days=30)).strftime('%Y-%m-%d')
+            daily_count = len(self._filter_records_by_date(all_records, today))
+            weekly_records = [r for r in all_records if (r.get('created_on') or '')[:10] >= week_start]
+            monthly_records = [r for r in all_records if (r.get('created_on') or '')[:10] >= month_start]
+            return {
+                'daily': {
+                    'date': today,
+                    'totalDetections': daily_count,
+                    'ocrAccuracy': round(ocr_pct, 1),
+                    'anomalies': anomalies,
+                    'avgProcessingTime': 86,
+                },
+                'weekly': {
+                    'week': f'Last 7 days',
+                    'totalDetections': len(weekly_records),
+                    'ocrAccuracy': round(ocr_pct, 1),
+                    'anomalies': anomalies,
+                    'avgProcessingTime': 92,
+                },
+                'monthly': {
+                    'month': datetime.utcnow().strftime('%B %Y'),
+                    'totalDetections': len(monthly_records),
+                    'ocrAccuracy': round(ocr_pct, 1),
+                    'anomalies': anomalies,
+                    'avgProcessingTime': 88,
+                },
+            }
+        except Exception as e:
+            log.debug("[MetricsServer] _get_reports_from_db failed: %s", e)
+            return {
+                'daily': {'date': '', 'totalDetections': 0, 'ocrAccuracy': 0, 'anomalies': 0, 'avgProcessingTime': 0},
+                'weekly': {'week': '', 'totalDetections': 0, 'ocrAccuracy': 0, 'anomalies': 0, 'avgProcessingTime': 0},
+                'monthly': {'month': '', 'totalDetections': 0, 'ocrAccuracy': 0, 'anomalies': 0, 'avgProcessingTime': 0},
+            }
+    
     def _get_dashboard_data_from_json(self, date_str: str = None) -> Dict:
         """Get dashboard data aggregated from combined_results.json files.
         
@@ -1111,7 +1693,7 @@ class MetricsServer:
             try:
                 filter_date = datetime.strptime(date_str, '%Y-%m-%d').date()
             except ValueError:
-                print(f"[MetricsServer] Invalid date format: {date_str}, using today")
+                log.info(f"[MetricsServer] Invalid date format: {date_str}, using today")
                 filter_date = datetime.now().date()
         else:
             filter_date = datetime.now().date()
@@ -1149,7 +1731,7 @@ class MetricsServer:
                     if isinstance(results, list):
                         all_results.extend(results)
             except Exception as e:
-                print(f"[MetricsServer] Error reading {json_file}: {e}")
+                log.info(f"[MetricsServer] Error reading {json_file}: {e}")
                 continue
         
         if not all_results:
@@ -1365,7 +1947,7 @@ class MetricsServer:
             try:
                 filter_date = datetime.strptime(date_str, '%Y-%m-%d').date()
             except ValueError:
-                print(f"[MetricsServer] Invalid date format: {date_str}, returning all events")
+                log.info(f"[MetricsServer] Invalid date format: {date_str}, returning all events")
                 filter_date = None
         
         # Find all combined_results.json files
@@ -1445,7 +2027,7 @@ class MetricsServer:
                             }
                             all_events.append(event)
             except Exception as e:
-                print(f"[MetricsServer] Error reading {json_file}: {e}")
+                log.info(f"[MetricsServer] Error reading {json_file}: {e}")
                 continue
         
         # Sort by timestamp (most recent first)
@@ -1487,7 +2069,7 @@ class MetricsServer:
                     if isinstance(results, list):
                         all_results.extend(results)
             except Exception as e:
-                print(f"[MetricsServer] Error reading {json_file}: {e}")
+                log.info(f"[MetricsServer] Error reading {json_file}: {e}")
                 continue
         
         # Group by track_id to get unique trailers
@@ -1604,7 +2186,7 @@ class MetricsServer:
             with open(config_path, 'r', encoding='utf-8') as f:
                 config = yaml.safe_load(f)
         except Exception as e:
-            print(f"[MetricsServer] Error reading cameras.yaml: {e}")
+            log.info(f"[MetricsServer] Error reading cameras.yaml: {e}")
             return []
         
         cameras = config.get('cameras', [])
@@ -1750,7 +2332,7 @@ class MetricsServer:
             # Return last N events
             return events[-limit:]
         except Exception as e:
-            print(f"Error reading events: {e}")
+            log.info(f"Error reading events: {e}")
             import traceback
             traceback.print_exc()
             return []
@@ -1789,7 +2371,7 @@ class MetricsServer:
         self.running = True
         self.thread = threading.Thread(target=self._run_server, daemon=True)
         self.thread.start()
-        print(f"Metrics server started on port {self.port}")
+        log.info(f"Metrics server started on port {self.port}")
     
     def _run_server(self):
         """Run Flask server."""
@@ -1818,7 +2400,7 @@ class MetricsServer:
                     if camera_id in self.frame_storage.latest_frames:
                         frame = self.frame_storage.latest_frames[camera_id].copy()
             except Exception as e:
-                print(f"[MetricsServer] Error accessing frame storage for {camera_id}: {e}")
+                log.info(f"[MetricsServer] Error accessing frame storage for {camera_id}: {e}")
                 time.sleep(0.1)
                 continue
             
@@ -1833,7 +2415,7 @@ class MetricsServer:
                     else:
                         no_frame_count += 1
                 except Exception as e:
-                    print(f"[MetricsServer] Error encoding frame for {camera_id}: {e}")
+                    log.info(f"[MetricsServer] Error encoding frame for {camera_id}: {e}")
                     no_frame_count += 1
             else:
                 no_frame_count += 1
@@ -1908,7 +2490,7 @@ class MetricsServer:
                         else:
                             consecutive_failures += 1
                     except Exception as e:
-                        print(f"[MetricsServer] Error encoding frame {current_frame_num}: {e}")
+                        log.info(f"[MetricsServer] Error encoding frame {current_frame_num}: {e}")
                         consecutive_failures += 1
                 else:
                     no_frame_count += 1

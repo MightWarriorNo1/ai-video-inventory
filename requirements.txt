@@ -16,6 +16,7 @@ uvicorn>=0.24.0
 psycopg2-binary>=2.9.9
 python-dotenv>=1.0.0
 requests>=2.31.0
+# Database support (SQLite is built-in, but listed for clarity)
 # GPS sensor support (optional, for GPS-enabled recording)
 pyserial>=3.5
 pynmea2>=1.19.0

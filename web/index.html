@@ -40,8 +40,11 @@
                     <div class="app-controls">
                         <button id="startApplicationBtn" class="btn-app-start">▶ Start Application</button>
                         <button id="stopApplicationBtn" class="btn-app-stop" disabled>⏹ Stop Application</button>
+                        <input type="file" id="dataProcessorCsvInput" accept=".csv" style="display: none;">
+                        <button id="runProcessorBtn" class="btn-app-processor" title="Select a CSV with parking spots (id, name, latitude, longitude) and run data processor">📋 Run Processor</button>
                         <span id="applicationStatus" class="app-status">Ready</span>
                     </div>
+                    <div id="processorResult" class="processor-result" style="display: none;" aria-live="polite"></div>
                     <div id="applicationInfo" class="app-info" style="display: none;">
                         <div class="app-info-item">
                             <strong>Status:</strong> <span id="appStatusText">-</span>
@@ -62,6 +65,13 @@
                 </div>
             </div>
 
+            <div id="automaticCameraPreviewContainer" class="camera-preview-container">
+                <h3>Live Camera Feed</h3>
+                <div class="camera-preview-wrapper">
+                    <img id="automaticCameraPreview" class="camera-preview-stream" alt="Camera preview" />
+                </div>
+            </div>
+
             <div class="debug-section">
                 <h2>Debug Controls</h2>
                 <div class="debug-controls">
@@ -75,7 +85,7 @@
                 </div>
                 <div class="debug-control-group">
                     <h3>Video Processing</h3>
-                    <p class="debug-hint">Processes all videos in out/recordings folder automatically</p>
+                    <p class="debug-hint">Processes all videos in out/recordings folder automatically. Uses Detection Mode from header.</p>
                     <input type="text" id="debugVideoPathInput" placeholder="Video file path (optional, currently ignored - processes all)" class="debug-input" style="opacity: 0.6;">
                     <input type="text" id="debugGpsLogPathInput" placeholder="GPS log path (optional)" class="debug-input" style="opacity: 0.6;">
                     <div class="debug-button-group">
@@ -116,7 +126,7 @@
                     <p><strong>Recording:</strong> <span id="recordingCameraId">-</span></p>
                     <p><strong>GPS Status:</strong> <span id="gpsStatus">Unknown</span></p>
                 </div>
-                <div id="cameraPreviewContainer" class="camera-preview-container" style="display: none;">
+                <div id="cameraPreviewContainer" class="camera-preview-container">
                     <h3>Live Camera Feed</h3>
                     <div class="camera-preview-wrapper">
                         <img id="cameraPreview" class="camera-preview-stream" alt="Camera preview" />

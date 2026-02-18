@@ -589,12 +589,18 @@ tbody tr:hover {
 
 .camera-preview-container {
     margin-top: 20px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
 }
 
 .camera-preview-container h3 {
     font-size: 18px;
     margin-bottom: 15px;
     color: #111827;
+    text-align: center;
 }
 
 .camera-preview-wrapper {
@@ -602,12 +608,18 @@ tbody tr:hover {
     border-radius: 8px;
     padding: 10px;
     border: 1px solid #e5e7eb;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    max-width: 400px;
+    margin: 0 auto;
 }
 
 .camera-preview-stream {
     width: 100%;
     height: auto;
-    max-height: 500px;
+    max-height: 300px;
+    max-width: 400px;
     object-fit: contain;
     border-radius: 4px;
     display: block;
@@ -654,6 +666,14 @@ tbody tr:hover {
     margin-bottom: 15px;
     color: #111827;
     font-weight: 600;
+}
+
+.debug-label {
+    display: block;
+    font-size: 13px;
+    font-weight: 500;
+    color: #374151;
+    margin-bottom: 4px;
 }
 
 .debug-input {
@@ -899,6 +919,29 @@ tbody tr:hover {
     box-shadow: none;
 }
 
+.btn-app-processor {
+    padding: 15px 30px;
+    border: none;
+    border-radius: 8px;
+    font-size: 16px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s;
+    background: #3b82f6;
+    color: white;
+    box-shadow: 0 4px 12px rgba(59, 130, 246, 0.3);
+}
+.btn-app-processor:hover:not(:disabled) {
+    background: #2563eb;
+    transform: translateY(-2px);
+    box-shadow: 0 6px 16px rgba(59, 130, 246, 0.4);
+}
+.btn-app-processor:disabled {
+    background: #6b7280;
+    cursor: not-allowed;
+    box-shadow: none;
+}
+
 .app-status {
     display: inline-block;
     padding: 12px 20px;
@@ -939,6 +982,22 @@ tbody tr:hover {
     background: rgba(239, 68, 68, 0.2);
     color: #ef4444;
     border: 1px solid rgba(239, 68, 68, 0.5);
+}
+
+.processor-result {
+    margin-top: 10px;
+    padding: 12px 16px;
+    border-radius: 8px;
+    font-size: 0.95rem;
+    border: 1px solid rgba(16, 185, 129, 0.4);
+    background: rgba(16, 185, 129, 0.15);
+    color: #10b981;
+}
+
+.processor-result.error {
+    border-color: rgba(239, 68, 68, 0.5);
+    background: rgba(239, 68, 68, 0.15);
+    color: #ef4444;
 }
 
 @keyframes pulse-green {

@@ -1,11 +1,39 @@
-import { yardViewData } from '../data/mockData'
+import { useState, useEffect } from 'react'
+import { fetchYardViewData } from '../services/api'
+import { yardViewData as fallbackData } from '../data/mockData'
 import './YardView.css'
 
 const YardView = () => {
-  const { spots, lanes } = yardViewData
+  const [data, setData] = useState(fallbackData)
+  const [loading, setLoading] = useState(true)
+
+  useEffect(() => {
+    const load = async () => {
+      setLoading(true)
+      const res = await fetchYardViewData()
+      if (res && (res.spots?.length > 0 || res.lanes?.length > 0)) {
+        setData(res)
+      }
+      setLoading(false)
+    }
+    load()
+    const handleRefresh = () => load()
+    window.addEventListener('refresh-data', handleRefresh)
+    return () => window.removeEventListener('refresh-data', handleRefresh)
+  }, [])
+
+  const { spots, lanes } = data
 
   const getSpotsByLane = (lane) => {
     return spots.filter(spot => spot.lane === lane)
+  }
+
+  if (loading) {
+    return (
+      <div className="yard-view-page">
+        <div className="loading-message">Loading yard view...</div>
+      </div>
+    )
   }
 
   return (

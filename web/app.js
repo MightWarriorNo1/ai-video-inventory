@@ -1,6 +1,14 @@
 // Trailer Vision Edge Dashboard JavaScript
 
-const METRICS_URL = '/metrics.json';
+// Use empty string when dashboard is served from the same origin as the API.
+// If the dashboard is on a different host/port, set to the API origin, e.g. 'http://127.0.0.1:5000'
+const API_BASE = '';
+function apiUrl(path) {
+    const base = (typeof API_BASE === 'string' && API_BASE) ? API_BASE.replace(/\/$/, '') : '';
+    return base + (path.startsWith('/') ? path : '/' + path);
+}
+
+const METRICS_URL = apiUrl('/metrics.json');
 const REFRESH_INTERVAL = 2000; // 2 seconds
 
 let metricsInterval;
@@ -18,6 +26,9 @@ document.addEventListener('DOMContentLoaded', () => {
     setupVideoRecording();
     setupDebugControls();
     setupApplicationControls();
+    
+    // Start camera feed automatically (always visible)
+    initializeCameraFeed();
     
     // Auto-refresh
     metricsInterval = setInterval(loadMetrics, REFRESH_INTERVAL);
@@ -94,7 +105,7 @@ function setupVideoProcessing() {
             const formData = new FormData();
             formData.append('video', file);
             
-            const response = await fetch('/api/upload-video', {
+            const response = await fetch(apiUrl('/api/upload-video'), {
                 method: 'POST',
                 body: formData
             });
@@ -130,7 +141,7 @@ function setupVideoProcessing() {
             // Get detection mode from dropdown
             const detectionMode = document.getElementById('detectionMode').value;
             
-            const response = await fetch(`/api/process-video/${currentVideoId}`, {
+            const response = await fetch(apiUrl(`/api/process-video/${currentVideoId}`), {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json'
@@ -161,7 +172,7 @@ function setupVideoProcessing() {
     
     stopBtn.addEventListener('click', async () => {
         try {
-            await fetch('/api/stop-processing', { method: 'POST' });
+            await fetch(apiUrl('/api/stop-processing'), { method: 'POST' });
             stopProcessing();
         } catch (error) {
             console.error('Error stopping processing:', error);
@@ -211,8 +222,8 @@ function startResultsPolling() {
         try {
             // Poll both processing results and status
             const [resultsResponse, statusResponse] = await Promise.all([
-                fetch('/api/processing-results'),
-                fetch('/api/processing-status')
+                fetch(apiUrl('/api/processing-results')),
+                fetch(apiUrl('/api/processing-status'))
             ]);
             
             if (resultsResponse.ok) {
@@ -299,7 +310,7 @@ function setupVideoRecording() {
             startBtn.disabled = true;
             statusEl.textContent = 'Starting...';
             
-            const response = await fetch('/api/start-recording', {
+            const response = await fetch(apiUrl('/api/start-recording'), {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json'
@@ -341,7 +352,7 @@ function setupVideoRecording() {
             stopBtn.disabled = true;
             statusEl.textContent = 'Stopping...';
             
-            const response = await fetch('/api/stop-recording', {
+            const response = await fetch(apiUrl('/api/stop-recording'), {
                 method: 'POST'
             });
             
@@ -353,8 +364,8 @@ function setupVideoRecording() {
                 statusEl.textContent = 'Not recording';
                 statusEl.className = 'recording-status';
                 infoEl.style.display = 'none';
-                // Stop camera preview
-                stopCameraPreview();
+                // Keep camera preview visible (always displayed)
+                // stopCameraPreview(); // Commented out - camera feed always visible
                 updateRecordingStatus('Recording stopped. Video: ' + (data.video_path || 'N/A'), 'success');
             } else {
                 stopBtn.disabled = false;
@@ -370,7 +381,7 @@ function setupVideoRecording() {
 
 async function checkRecordingStatus() {
     try {
-        const response = await fetch('/api/recording-status');
+        const response = await fetch(apiUrl('/api/recording-status'));
         const data = await response.json();
         
         const startBtn = document.getElementById('startRecordingBtn');
@@ -394,8 +405,8 @@ async function checkRecordingStatus() {
             statusEl.textContent = 'Not recording';
             statusEl.className = 'recording-status';
             document.getElementById('recordingInfo').style.display = 'none';
-            // Stop camera preview
-            stopCameraPreview();
+            // Keep camera preview visible (always displayed)
+            // stopCameraPreview(); // Commented out - camera feed always visible
         }
         
         // Update GPS status
@@ -413,14 +424,48 @@ function updateRecordingStatus(message, type) {
     console.log(`Recording: ${message} (${type})`);
 }
 
-// Camera preview functions
+// Initialize camera feed on page load
+async function initializeCameraFeed() {
+    try {
+        // Get list of cameras
+        const response = await fetch(apiUrl('/api/cameras'));
+        const data = await response.json();
+        
+        if (data.cameras && data.cameras.length > 0) {
+            // Use the first available camera
+            const firstCamera = data.cameras[0];
+            const cameraId = firstCamera.id;
+            
+            console.log(`[Dashboard] Starting camera feed for: ${cameraId}`);
+            
+            // Start camera feed in both tabs (automatic and manual)
+            startCameraPreview(cameraId); // Manual tab
+            startAutomaticCameraPreview(cameraId); // Automatic tab
+        } else {
+            console.log('[Dashboard] No cameras available for feed, trying default camera ID');
+            // Try with a default camera ID if cameras list is empty
+            const defaultCameraId = 'test-video';
+            startCameraPreview(defaultCameraId);
+            startAutomaticCameraPreview(defaultCameraId);
+        }
+    } catch (error) {
+        console.error('[Dashboard] Error initializing camera feed:', error);
+        // Try with default camera ID as fallback
+        console.log('[Dashboard] Trying fallback camera ID: test-video');
+        const defaultCameraId = 'test-video';
+        startCameraPreview(defaultCameraId);
+        startAutomaticCameraPreview(defaultCameraId);
+    }
+}
+
+// Camera preview functions (for manual tab)
 function startCameraPreview(cameraId) {
     const container = document.getElementById('cameraPreviewContainer');
     const previewImg = document.getElementById('cameraPreview');
     
-    if (!container || !previewImg) return;
+    if (!container || !previewImg || !cameraId) return;
     
-    // Show the preview container
+    // Show the preview container (always visible)
     container.style.display = 'block';
     
     // Set the stream source
@@ -431,7 +476,7 @@ function startCameraPreview(cameraId) {
         console.error('Error loading camera preview stream');
         // Try to reload after a delay
         setTimeout(() => {
-            if (this.src) {
+            if (container.style.display !== 'none' && this.src) {
                 this.src = `/stream/${cameraId}?${new Date().getTime()}`;
             }
         }, 2000);
@@ -441,6 +486,16 @@ function startCameraPreview(cameraId) {
     previewImg.onload = function() {
         console.log('Camera preview stream loaded');
     };
+    
+    // Refresh stream periodically to keep it alive (every 30 seconds)
+    if (window.cameraPreviewInterval) {
+        clearInterval(window.cameraPreviewInterval);
+    }
+    window.cameraPreviewInterval = setInterval(() => {
+        if (container.style.display !== 'none' && previewImg.src) {
+            previewImg.src = `/stream/${cameraId}?${new Date().getTime()}`;
+        }
+    }, 30000);
 }
 
 function stopCameraPreview() {
@@ -449,8 +504,80 @@ function stopCameraPreview() {
     
     if (!container || !previewImg) return;
     
-    // Hide the preview container
-    container.style.display = 'none';
+    // Clear refresh interval
+    if (window.cameraPreviewInterval) {
+        clearInterval(window.cameraPreviewInterval);
+        window.cameraPreviewInterval = null;
+    }
+    
+    // Keep container visible but clear the stream source
+    // container.style.display = 'none'; // Don't hide - always visible
+    
+    // Clear the stream source
+    previewImg.src = '';
+}
+
+// Camera preview functions (for automatic tab)
+let automaticCameraPreviewInterval = null;
+
+function startAutomaticCameraPreview(cameraId) {
+    const container = document.getElementById('automaticCameraPreviewContainer');
+    const previewImg = document.getElementById('automaticCameraPreview');
+    
+    if (!container || !previewImg || !cameraId) return;
+    
+    // Stop any existing preview
+    stopAutomaticCameraPreview();
+    
+    // Show the preview container
+    container.style.display = 'block';
+    
+    // Function to update stream source
+    function updateStream() {
+        previewImg.src = `/stream/${cameraId}?${new Date().getTime()}`;
+    }
+    
+    // Set initial stream source
+    updateStream();
+    
+    // Handle errors
+    previewImg.onerror = function() {
+        console.error('Error loading automatic camera preview stream');
+        // Try to reload after a delay
+        setTimeout(() => {
+            if (container.style.display !== 'none') {
+                updateStream();
+            }
+        }, 2000);
+    };
+    
+    // Handle load
+    previewImg.onload = function() {
+        console.log('Automatic camera preview stream loaded');
+    };
+    
+    // Refresh stream periodically to keep it alive (every 30 seconds)
+    automaticCameraPreviewInterval = setInterval(() => {
+        if (container.style.display !== 'none' && previewImg.src) {
+            updateStream();
+        }
+    }, 30000);
+}
+
+function stopAutomaticCameraPreview() {
+    const container = document.getElementById('automaticCameraPreviewContainer');
+    const previewImg = document.getElementById('automaticCameraPreview');
+    
+    if (!container || !previewImg) return;
+    
+    // Clear refresh interval
+    if (automaticCameraPreviewInterval) {
+        clearInterval(automaticCameraPreviewInterval);
+        automaticCameraPreviewInterval = null;
+    }
+    
+    // Keep container visible (always displayed)
+    // container.style.display = 'none'; // Commented out - always visible
     
     // Clear the stream source
     previewImg.src = '';
@@ -470,7 +597,7 @@ function setupDebugControls() {
             debugAutoRecordingStatus.textContent = 'Starting...';
             debugAutoRecordingStatus.className = 'debug-status';
             
-            const response = await fetch('/api/debug/start-auto-recording', {
+            const response = await fetch(apiUrl('/api/debug/start-auto-recording'), {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json'
@@ -484,7 +611,13 @@ function setupDebugControls() {
                 debugAutoRecordingStatus.textContent = `✓ ${data.message}`;
                 debugAutoRecordingStatus.className = 'debug-status success';
                 debugStartAutoRecordingBtn.disabled = true;
+                debugStartAutoRecordingBtn.classList.add('active');
                 debugStopAutoRecordingBtn.disabled = false;
+                
+                // Start camera preview if camera_id is available
+                if (data.camera_id) {
+                    startAutomaticCameraPreview(data.camera_id);
+                }
             } else {
                 debugAutoRecordingStatus.textContent = `✗ Error: ${data.error || data.message}`;
                 debugAutoRecordingStatus.className = 'debug-status error';
@@ -505,7 +638,7 @@ function setupDebugControls() {
             debugAutoRecordingStatus.textContent = 'Stopping...';
             debugAutoRecordingStatus.className = 'debug-status';
             
-            const response = await fetch('/api/debug/stop-auto-recording', {
+            const response = await fetch(apiUrl('/api/debug/stop-auto-recording'), {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json'
@@ -521,6 +654,9 @@ function setupDebugControls() {
                 debugStartAutoRecordingBtn.disabled = false;
                 debugStartAutoRecordingBtn.classList.remove('active');
                 debugStopAutoRecordingBtn.disabled = true;
+                
+                // Stop camera preview
+                stopAutomaticCameraPreview();
             } else {
                 debugAutoRecordingStatus.textContent = `✗ Error: ${data.error || data.message}`;
                 debugAutoRecordingStatus.className = 'debug-status error';
@@ -534,7 +670,7 @@ function setupDebugControls() {
         }
     });
     
-    // Debug: Start Video Processing
+    // Debug: Start Video Processing (uses header Detection Mode dropdown)
     const debugStartVideoProcessingBtn = document.getElementById('debugStartVideoProcessingBtn');
     const debugStopVideoProcessingBtn = document.getElementById('debugStopVideoProcessingBtn');
     const debugVideoPathInput = document.getElementById('debugVideoPathInput');
@@ -545,6 +681,8 @@ function setupDebugControls() {
         // Debug button always processes ALL videos in out/recordings directory
         const videoPath = debugVideoPathInput.value.trim();
         const processAll = true; // Always process all videos for debug button
+        const detectionModeEl = document.getElementById('detectionMode');
+        const detectionMode = (detectionModeEl && detectionModeEl.value) ? detectionModeEl.value : 'trailer';
         
         try {
             debugStartVideoProcessingBtn.disabled = true;
@@ -557,10 +695,10 @@ function setupDebugControls() {
                 process_all: processAll, // Always true for debug button
                 gps_log_path: debugGpsLogPathInput.value.trim() || null,
                 detect_every_n: 5,
-                detection_mode: 'trailer'
+                detection_mode: detectionMode
             };
             
-            const response = await fetch('/api/debug/start-video-processing', {
+            const response = await fetch(apiUrl('/api/debug/start-video-processing'), {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json'
@@ -601,7 +739,7 @@ function setupDebugControls() {
             debugVideoProcessingStatus.textContent = 'Stopping...';
             debugVideoProcessingStatus.className = 'debug-status';
             
-            const response = await fetch('/api/debug/stop-video-processing', {
+            const response = await fetch(apiUrl('/api/debug/stop-video-processing'), {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json'
@@ -652,7 +790,7 @@ function setupDebugControls() {
                 camera_id: 'test-video'
             };
             
-            const response = await fetch('/api/debug/start-ocr-processing', {
+            const response = await fetch(apiUrl('/api/debug/start-ocr-processing'), {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json'
@@ -693,7 +831,7 @@ function setupDebugControls() {
             debugOCRProcessingStatus.textContent = 'Stopping...';
             debugOCRProcessingStatus.className = 'debug-status';
             
-            const response = await fetch('/api/debug/stop-ocr-processing', {
+            const response = await fetch(apiUrl('/api/debug/stop-ocr-processing'), {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json'
@@ -728,7 +866,7 @@ function setupDebugControls() {
     
     async function refreshQueueStatus() {
         try {
-            const response = await fetch('/api/debug/processing-queue-status');
+            const response = await fetch(apiUrl('/api/debug/processing-queue-status'));
             const data = await response.json();
             
             if (data.available && data.status) {
@@ -792,7 +930,7 @@ function setupDebugControls() {
 async function updateDebugButtonStates() {
     // Check recording status
     try {
-        const response = await fetch('/api/recording-status');
+        const response = await fetch(apiUrl('/api/recording-status'));
         const data = await response.json();
         const debugStartAutoRecordingBtn = document.getElementById('debugStartAutoRecordingBtn');
         const debugStopAutoRecordingBtn = document.getElementById('debugStopAutoRecordingBtn');
@@ -814,7 +952,7 @@ async function updateDebugButtonStates() {
     
     // Check video processing and OCR status
     try {
-        const response = await fetch('/api/debug/processing-queue-status');
+        const response = await fetch(apiUrl('/api/debug/processing-queue-status'));
         const data = await response.json();
         
         if (data.available && data.status) {
@@ -871,21 +1009,32 @@ function setupApplicationControls() {
     const appRecordingStatus = document.getElementById('appRecordingStatus');
     const appVideoQueue = document.getElementById('appVideoQueue');
     const appOCRQueue = document.getElementById('appOCRQueue');
-    
-    // Start Application
+    const processorResultEl = document.getElementById('processorResult');
+    let lastProcessorResultTime = 0;
+    const PROCESSOR_RESULT_COOLDOWN_MS = 8000;
+
+    // Start Application (allow up to 2 minutes for asset loading)
+    const START_APP_TIMEOUT_MS = 120000;
     startAppBtn.addEventListener('click', async () => {
+        const ac = new AbortController();
+        const timeoutId = setTimeout(() => ac.abort(), START_APP_TIMEOUT_MS);
         try {
             startAppBtn.disabled = true;
-            appStatus.textContent = 'Loading assets...';
+            appStatus.textContent = 'Loading assets... (may take 1–2 minutes)';
             appStatus.className = 'app-status starting';
             
-            const response = await fetch('/api/start-application', {
+            const detectionModeEl = document.getElementById('detectionMode');
+            const detectionMode = (detectionModeEl && detectionModeEl.value) ? detectionModeEl.value : 'trailer';
+            
+            const response = await fetch(apiUrl('/api/start-application'), {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json'
                 },
-                body: JSON.stringify({})
+                body: JSON.stringify({ detection_mode: detectionMode }),
+                signal: ac.signal
             });
+            clearTimeout(timeoutId);
             
             const data = await response.json();
             
@@ -897,6 +1046,11 @@ function setupApplicationControls() {
                 appInfo.style.display = 'block';
                 appStatusText.textContent = 'Running';
                 appCameraId.textContent = data.camera_id || '-';
+                
+                // Start camera preview if camera_id is available
+                if (data.camera_id) {
+                    startAutomaticCameraPreview(data.camera_id);
+                }
                 
                 // Display assets loaded status
                 if (data.assets_loaded) {
@@ -916,8 +1070,13 @@ function setupApplicationControls() {
                 }
             }
         } catch (error) {
+            clearTimeout(timeoutId);
             console.error('Error starting application:', error);
-            appStatus.textContent = `✗ Error: ${error.message}`;
+            const isNetwork = error.name === 'AbortError' || (error.message && /network|fetch|failed to fetch/i.test(error.message));
+            const msg = isNetwork
+                ? 'Request timed out or connection failed. Check that the server is running and try again.'
+                : `Error: ${error.message}`;
+            appStatus.textContent = `✗ ${msg}`;
             appStatus.className = 'app-status error';
             startAppBtn.disabled = false;
         }
@@ -930,7 +1089,7 @@ function setupApplicationControls() {
             appStatus.textContent = 'Stopping recording...';
             appStatus.className = 'app-status stopping';
             
-            const response = await fetch('/api/stop-application', {
+            const response = await fetch(apiUrl('/api/stop-application'), {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json'
@@ -941,20 +1100,21 @@ function setupApplicationControls() {
             const data = await response.json();
             
             if (data.success) {
-                // Check if processing is still ongoing
+                // Recording has stopped; allow starting again even if processing is still ongoing
+                startAppBtn.disabled = false;
+                stopAppBtn.disabled = true;
                 if (data.result && data.result.processing_ongoing) {
-                    appStatus.textContent = 'Application stopped, but processing is still on. Please wait until the process is completed';
+                    appStatus.textContent = 'Recording stopped. Video/OCR still processing in background. You can start recording again anytime.';
                     appStatus.className = 'app-status stopping';
-                    stopAppBtn.disabled = true; // Keep disabled during graceful shutdown
                     appInfo.style.display = 'block';
-                    // Continue polling to show processing status
                     startApplicationStatusPolling();
                 } else {
                     appStatus.textContent = 'Stopped';
                     appStatus.className = 'app-status stopped';
-                    startAppBtn.disabled = false;
-                    stopAppBtn.disabled = true;
                     appInfo.style.display = 'none';
+                    
+                    // Stop camera preview
+                    stopAutomaticCameraPreview();
                     
                     // Stop status polling
                     if (appStatusPollingInterval) {
@@ -975,6 +1135,93 @@ function setupApplicationControls() {
         }
     });
     
+    // Run Processor (CSV parking spots → data processor)
+    const runProcessorBtn = document.getElementById('runProcessorBtn');
+    const dataProcessorCsvInput = document.getElementById('dataProcessorCsvInput');
+    if (runProcessorBtn && dataProcessorCsvInput) {
+        runProcessorBtn.addEventListener('click', () => dataProcessorCsvInput.click());
+        dataProcessorCsvInput.addEventListener('change', async (e) => {
+            const file = e.target.files && e.target.files[0];
+            if (!file) return;
+            const prevStatus = appStatus.textContent;
+            const prevClass = appStatus.className;
+            if (processorResultEl) {
+                processorResultEl.style.display = 'none';
+                processorResultEl.className = 'processor-result';
+            }
+            try {
+                runProcessorBtn.disabled = true;
+                appStatus.textContent = 'Uploading CSV and running processor...';
+                appStatus.className = 'app-status starting';
+                const formData = new FormData();
+                formData.append('file', file);
+                const response = await fetch(apiUrl('/api/data-processor/load-csv'), {
+                    method: 'POST',
+                    body: formData
+                });
+                let data = {};
+                try {
+                    data = await response.json();
+                } catch (_) {
+                    data = { success: false, error: response.statusText || 'Invalid response' };
+                }
+                lastProcessorResultTime = Date.now();
+                const message = data.message || (data.success ? `Loaded ${data.parking_spots_loaded || 0} spots, processed ${data.processed || 0} record(s).` : null);
+                const errorMsg = data.error || (data.success ? null : (message || 'Processor failed'));
+                if (data.success) {
+                    appStatus.textContent = `✓ ${message}`;
+                    appStatus.className = 'app-status running';
+                    if (processorResultEl) {
+                        processorResultEl.textContent = `✓ ${message}`;
+                        processorResultEl.className = 'processor-result';
+                        processorResultEl.style.display = 'block';
+                    }
+                } else {
+                    const err = errorMsg || (response.ok ? '' : `Server error ${response.status}`);
+                    appStatus.textContent = `✗ ${err}`;
+                    appStatus.className = 'app-status error';
+                    if (processorResultEl) {
+                        processorResultEl.textContent = `✗ ${err}`;
+                        processorResultEl.className = 'processor-result error';
+                        processorResultEl.style.display = 'block';
+                    }
+                }
+                if (!response.ok && data.success === undefined) {
+                    appStatus.textContent = `✗ ${data.error || response.statusText || 'Request failed'}`;
+                    appStatus.className = 'app-status error';
+                    if (processorResultEl) {
+                        processorResultEl.textContent = `✗ ${data.error || response.statusText || 'Request failed'}`;
+                        processorResultEl.className = 'processor-result error';
+                        processorResultEl.style.display = 'block';
+                    }
+                }
+            } catch (error) {
+                console.error('Error running processor:', error);
+                lastProcessorResultTime = Date.now();
+                const isNetwork = error.message && /network|fetch|failed to fetch/i.test(error.message);
+                const msg = isNetwork
+                    ? 'Connection failed. Check that the server is running and try again.'
+                    : `Error: ${error.message}`;
+                appStatus.textContent = `✗ ${msg}`;
+                appStatus.className = 'app-status error';
+                if (processorResultEl) {
+                    processorResultEl.textContent = `✗ ${msg}`;
+                    processorResultEl.className = 'processor-result error';
+                    processorResultEl.style.display = 'block';
+                }
+            } finally {
+                runProcessorBtn.disabled = false;
+                dataProcessorCsvInput.value = '';
+                setTimeout(() => {
+                    if (appStatus.textContent.indexOf('✓') === 0 || appStatus.textContent.indexOf('✗') === 0) {
+                        appStatus.textContent = prevStatus;
+                        appStatus.className = prevClass;
+                    }
+                }, 5000);
+            }
+        });
+    }
+    
     // Application status polling
     let appStatusPollingInterval = null;
     
@@ -985,13 +1232,14 @@ function setupApplicationControls() {
         
         async function pollStatus() {
             try {
-                const response = await fetch('/api/application-status');
+                const response = await fetch(apiUrl('/api/application-status'));
                 const data = await response.json();
                 
-                // Check if gracefully shutting down
+                // Check if gracefully shutting down (recording stopped, processing still running)
                 if (data.gracefully_shutting_down) {
-                    appStatus.textContent = 'Application stopped, but processing is still on. Please wait until the process is completed';
+                    appStatus.textContent = 'Recording stopped. Video/OCR still processing in background. You can start recording again anytime.';
                     appStatus.className = 'app-status stopping';
+                    startAppBtn.disabled = false;
                     stopAppBtn.disabled = true;
                     appInfo.style.display = 'block';
                     appStatusText.textContent = 'Processing...';
@@ -999,18 +1247,30 @@ function setupApplicationControls() {
                 } else if (data.running) {
                     appRecordingStatus.textContent = '✓ Recording';
                     appStatusText.textContent = 'Running';
+                    // Show camera preview if camera_id is available
+                    if (data.camera_id) {
+                        appCameraId.textContent = data.camera_id;
+                        startAutomaticCameraPreview(data.camera_id);
+                    }
                 } else {
+                    // Not recording: always allow Start (even if processing still ongoing)
                     appRecordingStatus.textContent = '✗ Not Recording';
                     appStatusText.textContent = 'Stopped';
-                    // If not processing and not recording, fully stopped
-                    if (!data.processing_ongoing) {
-                        appStatus.textContent = 'Stopped';
-                        appStatus.className = 'app-status stopped';
-                        startAppBtn.disabled = false;
-                        stopAppBtn.disabled = true;
-                        if (appStatusPollingInterval) {
-                            clearInterval(appStatusPollingInterval);
-                            appStatusPollingInterval = null;
+                    startAppBtn.disabled = false;
+                    stopAppBtn.disabled = true;
+                    const withinProcessorCooldown = (Date.now() - lastProcessorResultTime) < PROCESSOR_RESULT_COOLDOWN_MS;
+                    if (!withinProcessorCooldown) {
+                        if (data.processing_ongoing) {
+                            appStatus.textContent = 'Recording stopped. Video/OCR still processing in background. You can start recording again anytime.';
+                            appStatus.className = 'app-status stopping';
+                        } else {
+                            appStatus.textContent = 'Stopped';
+                            appStatus.className = 'app-status stopped';
+                            stopAutomaticCameraPreview();
+                            if (appStatusPollingInterval) {
+                                clearInterval(appStatusPollingInterval);
+                                appStatusPollingInterval = null;
+                            }
                         }
                     }
                 }
@@ -1035,7 +1295,7 @@ function setupApplicationControls() {
     // Check initial status on load
     async function checkInitialStatus() {
         try {
-            const response = await fetch('/api/application-status');
+            const response = await fetch(apiUrl('/api/application-status'));
             const data = await response.json();
             
             if (data.running) {
@@ -1044,6 +1304,11 @@ function setupApplicationControls() {
                 startAppBtn.disabled = true;
                 stopAppBtn.disabled = false;
                 appInfo.style.display = 'block';
+                // Show camera preview if camera_id is available
+                if (data.camera_id) {
+                    appCameraId.textContent = data.camera_id;
+                    startAutomaticCameraPreview(data.camera_id);
+                }
                 startApplicationStatusPolling();
             } else {
                 // Ensure Stop button is disabled when not running

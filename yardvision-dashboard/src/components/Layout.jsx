@@ -21,6 +21,7 @@ const Layout = ({ children }) => {
     { path: '/yard-view', label: 'Yard View', icon: MapPin },
     { path: '/camera-health', label: 'Camera Health', icon: Settings },
     { path: '/events', label: 'Events', icon: FileText },
+    { path: '/video-frames', label: 'Video Frames', icon: FileText },
     { path: '/configuration', label: 'Configuration', icon: SlidersHorizontal },
     { path: '/reports', label: 'Reports', icon: BarChart3 },
   ]
