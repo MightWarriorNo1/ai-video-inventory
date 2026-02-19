@@ -105,4 +105,8 @@ The automation is enabled by default when the application starts. To customize:
 
 See the full runbook for detailed documentation.
 
+## AWS deployment (device + cloud dashboard)
+
+To run recording, processing, and OCR on the NVIDIA device and host the backend, database, and YardVision dashboard on an AWS server, use the **separate Flask Dashboard API** in `services/dashboard-api/` and follow **docs/AWS_DEPLOYMENT_GUIDE.md** for a single step-by-step guide.
+
 

@@ -407,3 +407,27 @@ class VideoFrameDB:
                 return {'total': 0, 'unprocessed': 0, 'processed': 0}
             finally:
                 conn.close()
+
+    def delete_records_by_ids(self, ids: List[int]) -> int:
+        """
+        Delete records by their IDs. Used after successful upload to AWS.
+        Returns the number of rows deleted.
+        """
+        if not ids:
+            return 0
+        placeholders = ",".join("?" * len(ids))
+        delete_sql = f"DELETE FROM video_frame_records WHERE id IN ({placeholders})"
+        with self.lock:
+            conn = sqlite3.connect(str(self.db_path))
+            try:
+                cursor = conn.cursor()
+                cursor.execute(delete_sql, ids)
+                deleted = cursor.rowcount
+                conn.commit()
+                return deleted
+            except Exception as e:
+                print(f"[VideoFrameDB] Error deleting records: {e}")
+                conn.rollback()
+                return 0
+            finally:
+                conn.close()

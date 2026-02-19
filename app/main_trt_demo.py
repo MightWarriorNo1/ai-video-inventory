@@ -418,6 +418,88 @@ class TrailerVisionApp:
         except Exception as e:
             log.warning("[TrailerVisionApp] Failed to initialize database: %s", e)
             self.video_frame_db = None
+        
+        # Periodic upload of processed records to AWS (only processed data; delete from SQLite after success)
+        self._upload_thread = None
+        self._upload_thread_stop = threading.Event()
+        if (os.getenv("EDGE_UPLOAD_URL") or os.getenv("AWS_DASHBOARD_API_URL")) and self.video_frame_db:
+            self._upload_thread = threading.Thread(target=self._upload_processed_loop, daemon=True, name="UploadProcessedRecords")
+            self._upload_thread.start()
+            log.info("[TrailerVisionApp] Upload processed-records thread started (interval 60s)")
+    
+    def _upload_processed_loop(self):
+        """Background loop: upload processed records to AWS and delete from SQLite after success."""
+        interval = max(30, int(os.getenv("EDGE_UPLOAD_INTERVAL_SECONDS", "60")))
+        while not self._upload_thread_stop.wait(timeout=interval):
+            if not self.running:
+                continue
+            try:
+                self.upload_processed_records_and_delete()
+            except Exception as e:
+                log.warning("[TrailerVisionApp] Upload processed records error: %s", e)
+    
+    def upload_processed_records_and_delete(self):
+        """
+        Fetch processed records (is_processed=1) from local SQLite, upload to AWS,
+        and delete them from SQLite on success. Only processed data is uploaded.
+        """
+        upload_url = os.getenv("EDGE_UPLOAD_URL") or os.getenv("AWS_DASHBOARD_API_URL")
+        if not upload_url or not self.video_frame_db:
+            return
+        upload_url = upload_url.rstrip("/")
+        ingest_url = f"{upload_url}/api/ingest/video-frame-records"
+        api_key = os.getenv("DASHBOARD_API_KEY")
+        device_id = os.getenv("EDGE_DEVICE_ID", "")
+        batch_size = min(200, max(1, int(os.getenv("EDGE_UPLOAD_BATCH_SIZE", "100"))))
+        
+        records = self.video_frame_db.get_all_records(limit=batch_size, offset=0, is_processed=True, camera_id=None)
+        if not records:
+            return
+        # Build payload: same keys as server expects; ensure timestamp/created_on are strings for JSON
+        payload_records = []
+        ids_to_delete = []
+        for r in records:
+            ids_to_delete.append(r["id"])
+            rec = {
+                "licence_plate_trailer": r.get("licence_plate_trailer"),
+                "latitude": r.get("latitude"),
+                "longitude": r.get("longitude"),
+                "speed": r.get("speed"),
+                "barrier": r.get("barrier"),
+                "confidence": r.get("confidence"),
+                "image_path": r.get("image_path"),
+                "camera_id": r.get("camera_id"),
+                "video_path": r.get("video_path"),
+                "frame_number": r.get("frame_number"),
+                "track_id": r.get("track_id"),
+                "timestamp": r.get("timestamp") or r.get("created_on"),
+                "created_on": r.get("created_on"),
+                "is_processed": True,
+                "assigned_spot_id": r.get("assigned_spot_id"),
+                "assigned_spot_name": r.get("assigned_spot_name"),
+                "assigned_distance_ft": r.get("assigned_distance_ft"),
+                "processed_comment": r.get("processed_comment"),
+            }
+            # Serialize datetime for JSON
+            for key in ("timestamp", "created_on"):
+                if hasattr(rec.get(key), "isoformat"):
+                    rec[key] = rec[key].isoformat()
+            payload_records.append(rec)
+        
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["X-API-Key"] = api_key
+        if device_id:
+            headers["X-Device-ID"] = device_id
+        try:
+            resp = requests.post(ingest_url, json={"records": payload_records, "device_id": device_id or None}, headers=headers, timeout=60)
+            if resp.ok:
+                deleted = self.video_frame_db.delete_records_by_ids(ids_to_delete)
+                log.info("[TrailerVisionApp] Uploaded %s processed records to AWS and deleted %s from SQLite", len(payload_records), deleted)
+            else:
+                log.warning("[TrailerVisionApp] Upload processed records failed: %s %s", resp.status_code, resp.text[:200])
+        except Exception as e:
+            log.warning("[TrailerVisionApp] Upload processed records error: %s", e)
     
     def initialize_assets(self):
         """
@@ -477,7 +559,7 @@ class TrailerVisionApp:
                         self.upload_to_server(video_path, crops_dir, {'type': 'video_processing', 'results': results})
                 
                 def on_ocr_complete(video_path, crops_dir, ocr_results):
-                    """Called when OCR processing completes."""
+                    """Called when OCR processing completes. Only processed data is uploaded (via periodic upload thread)."""
                     log.info(f"[TrailerVisionApp] OCR processing complete: {Path(video_path).name}")
                     log.info(f"  - Processed {len(ocr_results)} crops with OCR")
                     
@@ -485,8 +567,8 @@ class TrailerVisionApp:
                     if self.video_frame_db and ocr_results:
                         self._store_ocr_results_in_db(video_path, crops_dir, ocr_results)
                     
-                    # Extensibility point: Add server upload here
-                    self.upload_to_server(video_path, crops_dir, {'type': 'ocr_complete', 'ocr_results': ocr_results})
+                    # Upload to AWS is done only for processed records (after data processor assigns spots)
+                    # See upload_processed_records_and_delete() and the periodic upload thread.
                     
                     # Delete video, crops, and GPS log permanently after processing is done
                     self._delete_processed_video_assets(video_path, crops_dir)
@@ -1555,7 +1637,7 @@ class TrailerVisionApp:
                 combined_results = batch_processor.match_ocr_to_detections(crops_dir, ocr_results)
                 if self.video_frame_db and combined_results:
                     self._store_ocr_results_in_db(video_path, crops_dir, combined_results)
-                self.upload_to_server(video_path, crops_dir, {'type': 'ocr_complete', 'ocr_results': combined_results})
+                # Upload to AWS is only for processed records (periodic upload thread)
                 log.info(f"[TrailerVisionApp] Deferred OCR: completed {i+1}/{len(pending_jobs)} {Path(crops_dir).name}")
             except Exception as e:
                 log.exception(f"[TrailerVisionApp] Deferred OCR error for {crops_dir}: {e}")
@@ -1660,27 +1742,17 @@ class TrailerVisionApp:
     
     def upload_to_server(self, video_path: str, crops_dir: str, data: Dict):
         """
-        Upload processed data to server.
-        
-        This is an extensibility point - implement your server upload logic here.
-        Called automatically after OCR processing completes.
-        
-        Args:
-            video_path: Path to processed video file
-            crops_dir: Directory containing processed crops
-            data: Processed data (OCR results, events, etc.)
+        Optional hook for uploading data to AWS. Only video_processing type is sent here.
+        Processed records (after data processor assigns spots) are uploaded by
+        upload_processed_records_and_delete() in the periodic upload thread.
         """
-        # TODO: Implement server upload logic
-        # Example:
-        # import requests
-        # response = requests.post('https://your-server.com/api/upload', json=data)
-        # return response.status_code == 200
-        
-        log.info(f"[TrailerVisionApp] Server upload hook called (not implemented)")
-        log.info(f"  - Video: {Path(video_path).name}")
-        log.info(f"  - Crops: {crops_dir}")
-        log.info(f"  - Data keys: {list(data.keys()) if isinstance(data, dict) else 'N/A'}")
-        pass
+        if data.get("type") == "ocr_complete":
+            # Processed data is uploaded only after data processor runs; see upload_processed_records_and_delete
+            return
+        # Optional: handle type == 'video_processing' if needed
+        if data.get("type") != "video_processing" or not data.get("results"):
+            return
+        log.debug("[TrailerVisionApp] Server upload hook: video_processing (optional)")
     
     def stop(self):
         """Stop the application and cleanup."""
@@ -1714,6 +1786,12 @@ class TrailerVisionApp:
         # Stop metrics server
         if self.metrics_server:
             self.metrics_server.stop()
+        
+        # Stop upload processed-records thread
+        if getattr(self, "_upload_thread_stop", None) is not None:
+            self._upload_thread_stop.set()
+        if getattr(self, "_upload_thread", None) is not None and self._upload_thread.is_alive():
+            self._upload_thread.join(timeout=5.0)
         
         log.info("Application stopped.")
 
