@@ -39,11 +39,12 @@ This guide walks you through running **recording, video processing, OCR, and dat
    - Example: database name `trailer_vision`, user `postgres`, password of your choice.
 
 2. **Run the schema** for the dashboard API:
-   - On the AWS server, copy the file:
-     - From the repo: `services/dashboard-api/sql/001_video_frame_records.sql`
-   - Execute it against your PostgreSQL instance, e.g.:
-     - **psql:** `psql -U postgres -d trailer_vision -f 001_video_frame_records.sql`
-     - Or use pgAdmin / any PostgreSQL client to run the script.
+   - On the AWS server, copy the files from `services/dashboard-api/sql/`:
+     - `001_video_frame_records.sql` – main table
+     - `002_add_image_url.sql` – adds `image_url` column (for cropped images). Run this too if the table already existed before (idempotent).
+   - Execute against your PostgreSQL instance, e.g.:
+     - **psql:** `psql -U postgres -d trailer_vision -f 001_video_frame_records.sql` then `psql -U postgres -d trailer_vision -f 002_add_image_url.sql`
+     - Or use pgAdmin / any PostgreSQL client to run both scripts.
 
 3. **Note the connection string**  
    Format:  

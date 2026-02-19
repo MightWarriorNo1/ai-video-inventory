@@ -6,6 +6,7 @@ import './Inventory.css'
 const Inventory = () => {
   const [data, setData] = useState(fallbackData)
   const [loading, setLoading] = useState(true)
+  const [imageModalUrl, setImageModalUrl] = useState(null)
 
   const loadData = async () => {
     setLoading(true)
@@ -80,12 +81,13 @@ const Inventory = () => {
               <th>GPS Coordinates</th>
               <th>Detected At</th>
               <th>OCR Confidence</th>
+              <th>Image</th>
             </tr>
           </thead>
           <tbody>
             {trailers.length === 0 ? (
               <tr>
-                <td colSpan="7" className="no-data">
+                <td colSpan="8" className="no-data">
                   No trailers found. Make sure combined_results.json files exist in out/crops/test-video/ folders.
                 </td>
               </tr>
@@ -128,6 +130,19 @@ const Inventory = () => {
                         <span>{((trailer.ocrConfidence || 0) * 100).toFixed(1)}%</span>
                       </div>
                     </td>
+                    <td>
+                      {trailer.imageUrl ? (
+                        <button
+                          type="button"
+                          className="btn-view-image"
+                          onClick={() => setImageModalUrl(trailer.imageUrl)}
+                        >
+                          View
+                        </button>
+                      ) : (
+                        <span className="no-image">—</span>
+                      )}
+                    </td>
                   </tr>
                 )
               })
@@ -135,6 +150,17 @@ const Inventory = () => {
           </tbody>
         </table>
       </div>
+
+      {imageModalUrl && (
+        <div className="image-modal-overlay" onClick={() => setImageModalUrl(null)} role="presentation">
+          <div className="image-modal" onClick={(e) => e.stopPropagation()}>
+            <button type="button" className="image-modal-close" onClick={() => setImageModalUrl(null)} aria-label="Close">
+              ×
+            </button>
+            <img src={imageModalUrl} alt="Cropped trailer" className="image-modal-img" />
+          </div>
+        </div>
+      )}
     </div>
   )
 }

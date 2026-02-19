@@ -9,11 +9,13 @@ Set DATABASE_URL to your PostgreSQL connection string.
 """
 
 import os
+import uuid
 from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 
 from flask import Flask, jsonify, request, send_from_directory
+from werkzeug.utils import secure_filename
 
 from db import get_all_records, get_statistics, insert_records
 
@@ -22,6 +24,26 @@ app = Flask(__name__)
 # Optional: serve React dashboard static files (set DASHBOARD_STATIC_DIR to yardvision-dashboard/dist)
 DASHBOARD_STATIC_DIR = os.getenv("DASHBOARD_STATIC_DIR")
 API_KEY = os.getenv("DASHBOARD_API_KEY")  # optional; if set, device must send X-API-Key header
+# Upload directory for cropped images from device
+UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "uploads")).resolve()
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+ALLOWED_IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "gif", "webp"}
+
+
+def _save_uploaded_image(file) -> str | None:
+    """Save an uploaded image file to UPLOAD_DIR; return URL path or None."""
+    if not file or file.filename == "":
+        return None
+    ext = (Path(secure_filename(file.filename)).suffix or ".jpg").lower().lstrip(".")
+    if ext not in ALLOWED_IMAGE_EXTENSIONS:
+        ext = "jpg"
+    name = f"{uuid.uuid4().hex}.{ext}"
+    dest = UPLOAD_DIR / name
+    try:
+        file.save(str(dest))
+        return f"/api/images/{name}"
+    except Exception:
+        return None
 
 
 def _filter_records_by_date(records: list, date_str: str | None) -> list:
@@ -168,6 +190,7 @@ def _get_inventory() -> dict:
             "ocrConfidence": float(r.get("confidence") or 0),
             "lat": r.get("latitude"),
             "lon": r.get("longitude"),
+            "imageUrl": (r.get("image_url") or "").strip() or None,
         })
     total = len(trailers)
     parked = sum(1 for t in trailers if t["status"] == "Parked")
@@ -254,18 +277,85 @@ def ingest_video_frame_records():
     err = _require_api_key()
     if err:
         return err
-    data = request.get_json()
-    if not data:
-        return jsonify({"error": "JSON body required"}), 400
-    records = data.get("records")
-    if not isinstance(records, list):
-        return jsonify({"error": "Body must contain 'records' array"}), 400
-    device_id = data.get("device_id") or request.headers.get("X-Device-ID")
+    records = None
+    device_id = request.headers.get("X-Device-ID")
+
+    if request.content_type and "multipart/form-data" in request.content_type:
+        # Single combined request: form part "records" (JSON) + optional "image_0", "image_1", ... (files)
+        import json as json_module
+        records_part = request.form.get("records")
+        if not records_part:
+            return jsonify({"error": "Multipart body must include 'records' form field (JSON)"}), 400
+        try:
+            data = json_module.loads(records_part)
+        except (ValueError, TypeError) as e:
+            return jsonify({"error": f"Invalid 'records' JSON: {e}"}), 400
+        records = data.get("records")
+        if not isinstance(records, list):
+            return jsonify({"error": "Body must contain 'records' array"}), 400
+        device_id = data.get("device_id") or device_id
+        # Attach uploaded images by index: image_0 -> records[0].image_url, etc.
+        for key in request.files:
+            if key.startswith("image_"):
+                try:
+                    idx = int(key[6:])
+                except ValueError:
+                    continue
+                if 0 <= idx < len(records):
+                    url = _save_uploaded_image(request.files[key])
+                    if url:
+                        records[idx]["image_url"] = url
+    else:
+        # JSON body (records only; images already uploaded or none)
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "JSON body required"}), 400
+        records = data.get("records")
+        if not isinstance(records, list):
+            return jsonify({"error": "Body must contain 'records' array"}), 400
+        device_id = data.get("device_id") or device_id
+
     try:
         count = insert_records(records, device_id=device_id)
         return jsonify({"status": "success", "count": count})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/ingest/upload-image", methods=["POST"])
+def ingest_upload_image():
+    """Accept a cropped image file from the device; save and return URL for the record."""
+    err = _require_api_key()
+    if err:
+        return err
+    if "file" not in request.files and "image" not in request.files:
+        return jsonify({"error": "No file part; use 'file' or 'image' form key"}), 400
+    file = request.files.get("file") or request.files.get("image")
+    if not file or file.filename == "":
+        return jsonify({"error": "No selected file"}), 400
+    ext = (Path(secure_filename(file.filename)).suffix or ".jpg").lower().lstrip(".")
+    if ext not in ALLOWED_IMAGE_EXTENSIONS:
+        ext = "jpg"
+    name = f"{uuid.uuid4().hex}.{ext}"
+    dest = UPLOAD_DIR / name
+    try:
+        file.save(str(dest))
+        url = f"/api/images/{name}"
+        return jsonify({"status": "success", "url": url})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/images/<path:filename>")
+def serve_image(filename):
+    """Serve an uploaded cropped image by filename (safe path, no traversal)."""
+    filename = secure_filename(filename)
+    if not filename or ".." in filename:
+        return jsonify({"error": "Invalid filename"}), 400
+    path = UPLOAD_DIR / filename
+    if not path.is_file():
+        return jsonify({"error": "Not found"}), 404
+    return send_from_directory(str(UPLOAD_DIR), filename)
 
 
 # ----- Dashboard API (same contract as device metrics_server) -----

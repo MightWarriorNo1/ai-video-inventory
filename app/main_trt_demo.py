@@ -455,7 +455,7 @@ class TrailerVisionApp:
         records = self.video_frame_db.get_all_records(limit=batch_size, offset=0, is_processed=True, camera_id=None)
         if not records:
             return
-        # Build payload: same keys as server expects; ensure timestamp/created_on are strings for JSON
+        # Build payload records (image_url filled by server when we send multipart with inline images)
         payload_records = []
         ids_to_delete = []
         for r in records:
@@ -479,20 +479,30 @@ class TrailerVisionApp:
                 "assigned_spot_name": r.get("assigned_spot_name"),
                 "assigned_distance_ft": r.get("assigned_distance_ft"),
                 "processed_comment": r.get("processed_comment"),
+                "image_url": None,
             }
-            # Serialize datetime for JSON
             for key in ("timestamp", "created_on"):
                 if hasattr(rec.get(key), "isoformat"):
                     rec[key] = rec[key].isoformat()
             payload_records.append(rec)
-        
-        headers = {"Content-Type": "application/json"}
+        # Single combined request: multipart with "records" (JSON) + "image_0", "image_1", ... for each record with a local image
+        payload_json = json.dumps({"records": payload_records, "device_id": device_id or None})
+        files = [("records", (None, payload_json, "application/json"))]
+        for i, r in enumerate(records):
+            img_path = r.get("image_path")
+            if img_path and Path(img_path).is_file():
+                try:
+                    name = Path(img_path).name or "crop.jpg"
+                    files.append((f"image_{i}", (name, open(img_path, "rb"), "image/jpeg")))
+                except Exception as e:
+                    log.debug("[TrailerVisionApp] Image open skipped for index %s: %s", i, e)
+        headers = {}
         if api_key:
             headers["X-API-Key"] = api_key
         if device_id:
             headers["X-Device-ID"] = device_id
         try:
-            resp = requests.post(ingest_url, json={"records": payload_records, "device_id": device_id or None}, headers=headers, timeout=60)
+            resp = requests.post(ingest_url, files=files, headers=headers, timeout=90)
             if resp.ok:
                 deleted = self.video_frame_db.delete_records_by_ids(ids_to_delete)
                 log.info("[TrailerVisionApp] Uploaded %s processed records to AWS and deleted %s from SQLite", len(payload_records), deleted)
@@ -500,6 +510,15 @@ class TrailerVisionApp:
                 log.warning("[TrailerVisionApp] Upload processed records failed: %s %s", resp.status_code, resp.text[:200])
         except Exception as e:
             log.warning("[TrailerVisionApp] Upload processed records error: %s", e)
+        finally:
+            for part in files[1:]:
+                if len(part) >= 2 and hasattr(part[1], "__iter__") and not isinstance(part[1], (str, bytes)):
+                    try:
+                        f = part[1][1]
+                        if hasattr(f, "close"):
+                            f.close()
+                    except Exception:
+                        pass
     
     def initialize_assets(self):
         """

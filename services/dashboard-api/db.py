@@ -57,6 +57,7 @@ def _row_to_record(row: dict) -> dict:
         "assigned_spot_name": row.get("assigned_spot_name"),
         "assigned_distance_ft": float(row["assigned_distance_ft"]) if row.get("assigned_distance_ft") is not None else None,
         "processed_comment": row.get("processed_comment"),
+        "image_url": row.get("image_url"),
     }
 
 
@@ -90,7 +91,8 @@ def get_all_records(
         SELECT id, licence_plate_trailer, latitude, longitude, speed, barrier,
                confidence, image_path, camera_id, video_path, frame_number,
                track_id, timestamp, created_on, is_processed,
-               assigned_spot_id, assigned_spot_name, assigned_distance_ft, processed_comment
+               assigned_spot_id, assigned_spot_name, assigned_distance_ft, processed_comment,
+               image_url
         FROM video_frame_records
         WHERE 1=1
     """
@@ -120,8 +122,9 @@ def insert_records(records: List[Dict], device_id: Optional[str] = None) -> int:
             licence_plate_trailer, latitude, longitude, speed, barrier,
             confidence, image_path, camera_id, video_path, frame_number,
             track_id, timestamp, is_processed, device_id,
-            assigned_spot_id, assigned_spot_name, assigned_distance_ft, processed_comment
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            assigned_spot_id, assigned_spot_name, assigned_distance_ft, processed_comment,
+            image_url
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """
     rows = []
     for r in records:
@@ -155,6 +158,7 @@ def insert_records(records: List[Dict], device_id: Optional[str] = None) -> int:
             (r.get("assigned_spot_name") or "").strip() or None,
             float(r["assigned_distance_ft"]) if r.get("assigned_distance_ft") is not None else None,
             (r.get("processed_comment") or "").strip() or None,
+            (r.get("image_url") or "").strip() or None,
         ))
     with get_connection() as conn:
         with conn.cursor() as cur:

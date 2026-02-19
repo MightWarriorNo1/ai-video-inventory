@@ -22,7 +22,8 @@ CREATE TABLE IF NOT EXISTS video_frame_records (
     assigned_spot_name TEXT,
     assigned_distance_ft DOUBLE PRECISION,
     processed_comment TEXT,
-    device_id TEXT
+    device_id TEXT,
+    image_url TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_video_frame_records_created ON video_frame_records(created_on DESC);
