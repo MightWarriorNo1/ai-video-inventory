@@ -911,6 +911,30 @@ function setupDebugControls() {
     
     debugRefreshQueueStatusBtn.addEventListener('click', refreshQueueStatus);
     
+    // Debug: Trigger Upload
+    const debugTriggerUploadBtn = document.getElementById('debugTriggerUploadBtn');
+    const debugUploadStatus = document.getElementById('debugUploadStatus');
+    if (debugTriggerUploadBtn && debugUploadStatus) {
+        debugTriggerUploadBtn.addEventListener('click', async () => {
+            debugUploadStatus.textContent = 'Uploading…';
+            debugTriggerUploadBtn.disabled = true;
+            try {
+                const response = await fetch(apiUrl('/api/debug/trigger-upload'), { method: 'POST' });
+                const data = await response.json();
+                if (data.success) {
+                    debugUploadStatus.textContent = `Done. Result: ${data.upload_status?.last_result || '-'}, batch: ${data.upload_status?.last_batch_count ?? '-'}, deleted: ${data.upload_status?.last_deleted_count ?? '-'}`;
+                    if (data.upload_status) updateUploadStatusDisplay(data.upload_status);
+                } else {
+                    debugUploadStatus.textContent = `Error: ${data.error || response.status}`;
+                }
+            } catch (error) {
+                debugUploadStatus.textContent = `Error: ${error.message}`;
+            } finally {
+                debugTriggerUploadBtn.disabled = false;
+            }
+        });
+    }
+    
     // Auto-refresh queue status every 3 seconds
     setInterval(refreshQueueStatus, 3000);
     
@@ -998,6 +1022,77 @@ function checkDebugProcessStatus() {
 }
 
 // ========== APPLICATION CONTROLS ==========
+
+function updateUploadStatusDisplay(u) {
+    const el = (id) => document.getElementById(id);
+    const enabled = el('uploadEnabled');
+    if (!enabled) return;
+    enabled.textContent = u.enabled ? 'Yes' : 'No';
+    const threadAlive = el('uploadThreadAlive');
+    if (threadAlive) threadAlive.textContent = u.thread_alive === true ? 'Running' : (u.thread_alive === false ? 'Not running' : '-');
+    const configWrap = el('uploadConfigWrap');
+    const configMsg = el('uploadConfigMessage');
+    if (configWrap && configMsg) {
+        if (!u.enabled && u.config_message) {
+            configWrap.style.display = 'block';
+            configMsg.textContent = u.config_message;
+        } else {
+            configWrap.style.display = 'none';
+            configMsg.textContent = '';
+        }
+    }
+    const isUploading = el('uploadIsUploading');
+    if (isUploading) isUploading.textContent = u.is_uploading ? 'Yes' : 'No';
+    const lastRun = el('uploadLastRun');
+    if (lastRun) {
+        if (u.last_run_at) {
+            try {
+                const d = new Date(u.last_run_at);
+                lastRun.textContent = d.toLocaleString();
+            } catch (e) {
+                lastRun.textContent = u.last_run_at;
+            }
+        } else {
+            lastRun.textContent = '-';
+        }
+    }
+    const lastResult = el('uploadLastResult');
+    if (lastResult) {
+        lastResult.textContent = u.last_result || '-';
+        lastResult.className = 'upload-result-badge' + (u.last_result === 'success' ? ' success' : u.last_result === 'failed' ? ' failed' : u.last_result === 'skipped' ? ' skipped' : '');
+    }
+    const lastBatch = el('uploadLastBatch');
+    if (lastBatch) lastBatch.textContent = u.last_batch_count != null ? u.last_batch_count : '-';
+    const lastDeleted = el('uploadLastDeleted');
+    if (lastDeleted) lastDeleted.textContent = u.last_deleted_count != null ? u.last_deleted_count : '-';
+    const total = el('uploadTotal');
+    if (total) total.textContent = u.total_uploaded != null ? u.total_uploaded : '-';
+    const responseStatus = el('uploadResponseStatus');
+    const responseBody = el('uploadResponseBody');
+    if (responseStatus) {
+        responseStatus.textContent = u.last_response_status != null ? u.last_response_status.toString() : '-';
+    }
+    if (responseBody) {
+        if (u.last_response_body && u.last_response_body.length > 0) {
+            responseBody.textContent = u.last_response_body;
+            responseBody.style.display = 'block';
+        } else {
+            responseBody.textContent = u.last_response_status != null ? '(empty)' : '';
+            responseBody.style.display = u.last_response_status != null ? 'block' : 'none';
+        }
+    }
+    const errorWrap = el('uploadErrorWrap');
+    const lastError = el('uploadLastError');
+    if (errorWrap && lastError) {
+        if (u.last_error) {
+            errorWrap.style.display = 'block';
+            lastError.textContent = u.last_error;
+        } else {
+            errorWrap.style.display = 'none';
+            lastError.textContent = '';
+        }
+    }
+}
 
 function setupApplicationControls() {
     const startAppBtn = document.getElementById('startApplicationBtn');
@@ -1282,6 +1377,21 @@ function setupApplicationControls() {
                     appVideoQueue.textContent = 'N/A';
                     appOCRQueue.textContent = 'N/A';
                 }
+                const uploadStatus = data.upload_status || {
+                    enabled: false,
+                    thread_alive: false,
+                    config_message: 'Upload status not available from device.',
+                    is_uploading: false,
+                    last_run_at: null,
+                    last_result: null,
+                    last_batch_count: 0,
+                    last_deleted_count: 0,
+                    last_error: null,
+                    total_uploaded: 0,
+                    last_response_status: null,
+                    last_response_body: null
+                };
+                updateUploadStatusDisplay(uploadStatus);
             } catch (error) {
                 console.error('Error polling application status:', error);
             }
@@ -1298,6 +1408,21 @@ function setupApplicationControls() {
             const response = await fetch(apiUrl('/api/application-status'));
             const data = await response.json();
             
+            const uploadStatus = data.upload_status || {
+                enabled: false,
+                thread_alive: false,
+                config_message: 'Upload status not available from device.',
+                is_uploading: false,
+                last_run_at: null,
+                last_result: null,
+                last_batch_count: 0,
+                last_deleted_count: 0,
+                last_error: null,
+                total_uploaded: 0,
+                last_response_status: null,
+                last_response_body: null
+            };
+            updateUploadStatusDisplay(uploadStatus);
             if (data.running) {
                 appStatus.textContent = '✓ Running';
                 appStatus.className = 'app-status running';

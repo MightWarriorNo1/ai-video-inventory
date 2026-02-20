@@ -984,6 +984,35 @@ class MetricsServer:
             except Exception as e:
                 return jsonify({'error': str(e)}), 500
         
+        @self.app.route('/api/debug/trigger-upload', methods=['POST'])
+        def debug_trigger_upload():
+            """Debug: Trigger upload of processed records to AWS once (same as background thread)."""
+            try:
+                app = self.frame_storage if hasattr(self, 'frame_storage') else None
+                if not app or not hasattr(app, 'upload_processed_records_and_delete'):
+                    return jsonify({'success': False, 'error': 'Upload not available'}), 500
+                if not getattr(app, 'upload_status', {}).get('enabled'):
+                    return jsonify({
+                        'success': False,
+                        'error': 'Upload disabled (EDGE_UPLOAD_URL not set or video frame DB not available)'
+                    }), 400
+                app.upload_processed_records_and_delete()
+                if hasattr(app, '_upload_status_lock'):
+                    with app._upload_status_lock:
+                        status = dict(getattr(app, 'upload_status', {}))
+                else:
+                    status = dict(getattr(app, 'upload_status', {}))
+                status['thread_alive'] = (
+                    getattr(app, '_upload_thread', None) is not None and app._upload_thread.is_alive()
+                )
+                return jsonify({
+                    'success': True,
+                    'message': 'Upload triggered',
+                    'upload_status': status
+                }), 200
+            except Exception as e:
+                return jsonify({'success': False, 'error': str(e)}), 500
+
         @self.app.route('/api/debug/processing-queue-status', methods=['GET'])
         def debug_processing_queue_status():
             """Debug: Get processing queue status."""
@@ -1116,6 +1145,15 @@ class MetricsServer:
                 if hasattr(app, 'processing_queue') and app.processing_queue:
                     queue_status = app.processing_queue.get_status()
                 
+                # Get AWS upload status (include thread_alive so dashboard can show "background thread working")
+                upload_status = None
+                if hasattr(app, 'upload_status') and hasattr(app, '_upload_status_lock'):
+                    with app._upload_status_lock:
+                        upload_status = dict(app.upload_status)
+                    upload_status['thread_alive'] = (
+                        getattr(app, '_upload_thread', None) is not None and app._upload_thread.is_alive()
+                    )
+                
                 return jsonify({
                     'running': is_recording,
                     'recording': is_recording,
@@ -1123,7 +1161,8 @@ class MetricsServer:
                     'gracefully_shutting_down': is_gracefully_shutting_down,
                     'processing_ongoing': is_processing_ongoing,
                     'queue_status': queue_status,
-                    'processing_queue_available': hasattr(app, 'processing_queue') and app.processing_queue is not None
+                    'processing_queue_available': hasattr(app, 'processing_queue') and app.processing_queue is not None,
+                    'upload_status': upload_status
                 }), 200
                     
             except Exception as e:
@@ -1131,6 +1170,33 @@ class MetricsServer:
                     'running': False,
                     'error': str(e)
                 }), 200
+        
+        @self.app.route('/api/upload-status', methods=['GET'])
+        def get_upload_status():
+            """Get AWS upload status (thread, config, last run, success/failed/skipped)."""
+            try:
+                app = self.frame_storage if hasattr(self, 'frame_storage') else None
+                if not app or not hasattr(app, 'upload_status'):
+                    return jsonify({
+                        'enabled': False,
+                        'thread_alive': False,
+                        'config_message': 'Application or upload status not available.',
+                        'is_uploading': False,
+                        'last_run_at': None,
+                        'last_result': None,
+                        'last_batch_count': 0,
+                        'last_deleted_count': 0,
+                        'last_error': None,
+                        'total_uploaded': 0
+                    }), 200
+                with app._upload_status_lock:
+                    out = dict(app.upload_status)
+                out['thread_alive'] = (
+                    getattr(app, '_upload_thread', None) is not None and app._upload_thread.is_alive()
+                )
+                return jsonify(out), 200
+            except Exception as e:
+                return jsonify({'error': str(e)}), 500
         
         @self.app.route('/api/processed-frame/<int:frame_number>')
         def get_processed_frame(frame_number):

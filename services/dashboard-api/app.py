@@ -14,6 +14,9 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from flask import Flask, jsonify, request, send_from_directory
 from werkzeug.utils import secure_filename
 
@@ -242,7 +245,7 @@ def _get_reports() -> dict:
         week_start = (datetime.utcnow() - timedelta(days=7)).strftime("%Y-%m-%d")
         daily_count = len(_filter_records_by_date(all_records, today))
         weekly_records = [r for r in all_records if (str(r.get("created_on") or "")[:10] >= week_start)]
-        monthly_records = [r for r in all_records if (str(r.get("created_on") or "")[:10] >= (datetime.utcnow() - timedelta(days=30)).strftime("%Y-%m-%d")]
+        monthly_records = [r for r in all_records if (str(r.get("created_on") or "")[:10] >= (datetime.utcnow() - timedelta(days=30)).strftime("%Y-%m-%d"))]
         return {
             "daily": {"date": today, "totalDetections": daily_count, "ocrAccuracy": round(ocr_pct, 1), "anomalies": anomalies, "avgProcessingTime": 86},
             "weekly": {"week": "Last 7 days", "totalDetections": len(weekly_records), "ocrAccuracy": round(ocr_pct, 1), "anomalies": anomalies, "avgProcessingTime": 92},

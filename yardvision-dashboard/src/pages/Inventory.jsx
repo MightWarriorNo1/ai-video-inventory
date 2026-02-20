@@ -41,6 +41,13 @@ const Inventory = () => {
 
   const { trailers, stats } = data
 
+  // Normalize confidence to 0–100 (API may send 0–1 or 0–100)
+  const confidencePct = (val) => {
+    if (val == null) return 0
+    const pct = val > 1 ? val : val * 100
+    return Math.min(100, Math.max(0, pct))
+  }
+
   return (
     <div className="inventory-page">
       <div className="inventory-stats">
@@ -123,11 +130,13 @@ const Inventory = () => {
                     <td>{detectedAtStr}</td>
                     <td>
                       <div className="confidence-bar">
-                        <div 
-                          className="confidence-fill" 
-                          style={{ width: `${(trailer.ocrConfidence || 0) * 100}%` }}
-                        />
-                        <span>{((trailer.ocrConfidence || 0) * 100).toFixed(1)}%</span>
+                        <div className="confidence-track">
+                          <div
+                            className="confidence-fill"
+                            style={{ width: `${confidencePct(trailer.ocrConfidence)}%` }}
+                          />
+                        </div>
+                        <span>{confidencePct(trailer.ocrConfidence).toFixed(1)}%</span>
                       </div>
                     </td>
                     <td>

@@ -119,13 +119,26 @@
   display: flex;
   align-items: center;
   gap: 8px;
+  width: 100%;
+  min-width: 100px;
+}
+
+.confidence-bar .confidence-track {
+  flex: 1;
+  min-width: 60px;
+  height: 8px;
+  background-color: #e5e7eb;
+  border-radius: 4px;
+  overflow: hidden;
+  display: flex;
 }
 
 .confidence-fill {
-  height: 8px;
+  height: 100%;
   background-color: #10b981;
   border-radius: 4px;
-  min-width: 20px;
+  min-width: 0;
+  transition: width 0.2s ease;
 }
 
 .loading-message {

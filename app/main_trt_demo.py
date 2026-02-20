@@ -422,7 +422,25 @@ class TrailerVisionApp:
         # Periodic upload of processed records to AWS (only processed data; delete from SQLite after success)
         self._upload_thread = None
         self._upload_thread_stop = threading.Event()
-        if (os.getenv("EDGE_UPLOAD_URL") or os.getenv("AWS_DASHBOARD_API_URL")) and self.video_frame_db:
+        self._upload_status_lock = threading.Lock()
+        upload_url_set = bool(os.getenv("EDGE_UPLOAD_URL") or os.getenv("AWS_DASHBOARD_API_URL"))
+        self.upload_status = {
+            "enabled": upload_url_set and self.video_frame_db is not None,
+            "is_uploading": False,
+            "last_run_at": None,
+            "last_result": None,
+            "last_batch_count": 0,
+            "last_deleted_count": 0,
+            "last_error": None,
+            "total_uploaded": 0,
+            "last_response_status": None,
+            "last_response_body": None,
+            "config_message": "" if (upload_url_set and self.video_frame_db) else (
+                "EDGE_UPLOAD_URL (or AWS_DASHBOARD_API_URL) not set. Add to .env to enable upload."
+                if not upload_url_set else "Video frame database not available."
+            ),
+        }
+        if upload_url_set and self.video_frame_db:
             self._upload_thread = threading.Thread(target=self._upload_processed_loop, daemon=True, name="UploadProcessedRecords")
             self._upload_thread.start()
             log.info("[TrailerVisionApp] Upload processed-records thread started (interval 60s)")
@@ -454,7 +472,16 @@ class TrailerVisionApp:
         
         records = self.video_frame_db.get_all_records(limit=batch_size, offset=0, is_processed=True, camera_id=None)
         if not records:
+            with self._upload_status_lock:
+                self.upload_status["last_run_at"] = datetime.utcnow().isoformat() + "Z"
+                self.upload_status["last_result"] = "skipped"
+                self.upload_status["last_batch_count"] = 0
+                self.upload_status["last_error"] = None
             return
+        with self._upload_status_lock:
+            self.upload_status["is_uploading"] = True
+            self.upload_status["last_run_at"] = datetime.utcnow().isoformat() + "Z"
+            self.upload_status["last_error"] = None
         # Build payload records (image_url filled by server when we send multipart with inline images)
         payload_records = []
         ids_to_delete = []
@@ -503,14 +530,43 @@ class TrailerVisionApp:
             headers["X-Device-ID"] = device_id
         try:
             resp = requests.post(ingest_url, files=files, headers=headers, timeout=90)
+            response_status = resp.status_code
+            response_body = (resp.text or "")[:500]
             if resp.ok:
                 deleted = self.video_frame_db.delete_records_by_ids(ids_to_delete)
                 log.info("[TrailerVisionApp] Uploaded %s processed records to AWS and deleted %s from SQLite", len(payload_records), deleted)
+                # Delete uploaded image files and empty crop folders from device
+                self._delete_uploaded_images_and_crop_folders(records)
+                with self._upload_status_lock:
+                    self.upload_status["last_result"] = "success"
+                    self.upload_status["last_batch_count"] = len(payload_records)
+                    self.upload_status["last_deleted_count"] = deleted
+                    self.upload_status["total_uploaded"] = self.upload_status.get("total_uploaded", 0) + deleted
+                    self.upload_status["last_error"] = None
+                    self.upload_status["last_response_status"] = response_status
+                    self.upload_status["last_response_body"] = response_body
             else:
-                log.warning("[TrailerVisionApp] Upload processed records failed: %s %s", resp.status_code, resp.text[:200])
+                err_msg = f"{resp.status_code}: {(resp.text or '')[:200]}"
+                log.warning("[TrailerVisionApp] Upload processed records failed: %s", err_msg)
+                with self._upload_status_lock:
+                    self.upload_status["last_result"] = "failed"
+                    self.upload_status["last_batch_count"] = len(payload_records)
+                    self.upload_status["last_deleted_count"] = 0
+                    self.upload_status["last_error"] = err_msg
+                    self.upload_status["last_response_status"] = response_status
+                    self.upload_status["last_response_body"] = response_body
         except Exception as e:
             log.warning("[TrailerVisionApp] Upload processed records error: %s", e)
+            with self._upload_status_lock:
+                self.upload_status["last_result"] = "failed"
+                self.upload_status["last_batch_count"] = len(payload_records)
+                self.upload_status["last_deleted_count"] = 0
+                self.upload_status["last_error"] = str(e)
+                self.upload_status["last_response_status"] = None
+                self.upload_status["last_response_body"] = None
         finally:
+            with self._upload_status_lock:
+                self.upload_status["is_uploading"] = False
             for part in files[1:]:
                 if len(part) >= 2 and hasattr(part[1], "__iter__") and not isinstance(part[1], (str, bytes)):
                     try:
@@ -1737,6 +1793,44 @@ class TrailerVisionApp:
         
         log.info(f"[TrailerVisionApp] Stored {stored_count} records in database")
     
+    def _delete_uploaded_images_and_crop_folders(self, records: List[Dict]):
+        """
+        After successful upload, delete local image files and empty crop folders for the uploaded records.
+        """
+        deleted_files = 0
+        dirs_to_check = set()
+        for r in records:
+            img_path = r.get("image_path")
+            if not img_path:
+                continue
+            p = Path(img_path)
+            if p.is_file():
+                try:
+                    p.unlink()
+                    deleted_files += 1
+                except Exception as e:
+                    log.warning("[TrailerVisionApp] Failed to delete image %s: %s", img_path, e)
+            if p.parent and p.parent != p:
+                dirs_to_check.add(p.parent)
+        # Remove empty crop directories (and parents up to out/ or cwd)
+        try:
+            stop_at = Path("out").resolve() if Path("out").exists() else Path.cwd()
+        except Exception:
+            stop_at = Path.cwd()
+        for dir_entry in sorted(dirs_to_check, key=lambda x: len(x.parts), reverse=True):
+            try:
+                current = Path(dir_entry).resolve()
+                while current.exists() and current.is_dir() and current != stop_at:
+                    if any(current.iterdir()):
+                        break
+                    current.rmdir()
+                    log.debug("[TrailerVisionApp] Removed empty crop dir: %s", current)
+                    current = current.parent
+            except Exception as e:
+                log.debug("[TrailerVisionApp] Skip removing dir %s: %s", dir_entry, e)
+        if deleted_files or dirs_to_check:
+            log.info("[TrailerVisionApp] Deleted %s image file(s) and cleaned empty crop folder(s)", deleted_files)
+
     def _delete_processed_video_assets(self, video_path: str, crops_dir: str):
         """
         Permanently delete video file and GPS log after processing is complete.

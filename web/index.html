@@ -62,6 +62,43 @@
                             <strong>OCR Queue:</strong> <span id="appOCRQueue">-</span>
                         </div>
                     </div>
+                    <div id="uploadStatusSection" class="upload-status-section">
+                        <h3>AWS Upload Status</h3>
+                        <div class="upload-status-grid">
+                            <div class="upload-status-item">
+                                <strong>Enabled:</strong> <span id="uploadEnabled">-</span>
+                            </div>
+                            <div class="upload-status-item">
+                                <strong>Background thread:</strong> <span id="uploadThreadAlive">-</span>
+                            </div>
+                            <div class="upload-status-item upload-status-config" id="uploadConfigWrap" style="display: none;">
+                                <strong>Config / env:</strong> <span id="uploadConfigMessage"></span>
+                            </div>
+                            <div class="upload-status-item">
+                                <strong>Currently uploading:</strong> <span id="uploadIsUploading">-</span>
+                            </div>
+                            <div class="upload-status-item">
+                                <strong>Last run:</strong> <span id="uploadLastRun">-</span>
+                            </div>
+                            <div class="upload-status-item">
+                                <strong>Last result:</strong> <span id="uploadLastResult" class="upload-result-badge">-</span>
+                            </div>
+                            <div class="upload-status-item">
+                                <strong>Last batch:</strong> <span id="uploadLastBatch">-</span> records sent, <span id="uploadLastDeleted">-</span> deleted from device
+                            </div>
+                            <div class="upload-status-item">
+                                <strong>Total uploaded:</strong> <span id="uploadTotal">-</span>
+                            </div>
+                            <div class="upload-status-item upload-status-response">
+                                <strong>Upload API response:</strong>
+                                <span id="uploadResponseStatus">-</span>
+                                <pre id="uploadResponseBody" class="upload-response-body"></pre>
+                            </div>
+                            <div class="upload-status-item upload-status-error" id="uploadErrorWrap" style="display: none;">
+                                <strong>Last error:</strong> <span id="uploadLastError"></span>
+                            </div>
+                        </div>
+                    </div>
                 </div>
             </div>
 
@@ -108,6 +145,14 @@
                         <h3>Queue Status</h3>
                         <button id="debugRefreshQueueStatusBtn" class="btn-debug">Refresh Queue Status</button>
                         <div id="debugQueueStatus" class="debug-status-box"></div>
+                    </div>
+                    <div class="debug-control-group">
+                        <h3>Upload</h3>
+                        <p class="debug-hint">Manually trigger upload of processed records to AWS (same as background thread).</p>
+                        <div class="debug-button-group">
+                            <button id="debugTriggerUploadBtn" class="btn-debug">Trigger Upload Now</button>
+                        </div>
+                        <span id="debugUploadStatus" class="debug-status"></span>
                     </div>
                 </div>
             </div>

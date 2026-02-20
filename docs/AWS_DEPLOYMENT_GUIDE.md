@@ -130,7 +130,7 @@ This guide walks you through running **recording, video processing, OCR, and dat
 1. **On the device**, set environment variables (e.g. in `.env` in the project root or in the shell that starts the app):
    - **Required:**  
      `EDGE_UPLOAD_URL=http://<AWS_SERVER_IP>:8080`  
-     (Use the real AWS server IP or hostname; use `https://` if you put the API behind TLS.)
+     Use the real AWS server IP or hostname. **Use `http://`** — the Dashboard API Flask app runs plain HTTP by default (no SSL). If you put the API behind a reverse proxy or load balancer with TLS, then use `https://` and the proxy’s host/port.
    - **Optional:**  
      `DASHBOARD_API_KEY=<same secret as on server>`  
      (Only if you set `DASHBOARD_API_KEY` on the server.)  
@@ -201,3 +201,6 @@ This guide walks you through running **recording, video processing, OCR, and dat
 
 - **CORS**  
   The dashboard is expected to be served from the same origin as the API (or use a reverse proxy). If you serve the dashboard from a different origin, you may need to enable CORS in the Flask app for that origin.
+
+- **Device: SSL error (WRONG_VERSION_NUMBER) or server: Bad request version with garbled request**  
+  The device is using `https://` in `EDGE_UPLOAD_URL` while the Dashboard API runs plain HTTP (no TLS). Use **`http://`** in `EDGE_UPLOAD_URL`, e.g. `http://3.227.37.0:8080` or `:8081` to match the server port. Only use `https://` if the API is behind an SSL-terminating proxy (e.g. nginx or a load balancer with TLS).

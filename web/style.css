@@ -1036,4 +1036,111 @@ tbody tr:hover {
     color: white;
 }
 
+.upload-status-section {
+    margin-top: 20px;
+    padding: 20px;
+    background: rgba(255, 255, 255, 0.1);
+    border-radius: 8px;
+    backdrop-filter: blur(10px);
+}
+
+.upload-status-section h3 {
+    font-size: 16px;
+    margin-bottom: 12px;
+    opacity: 0.95;
+}
+
+.upload-status-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 12px;
+}
+
+.upload-status-item {
+    font-size: 14px;
+}
+
+.upload-status-item strong {
+    display: block;
+    margin-bottom: 4px;
+    opacity: 0.85;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.upload-status-item span {
+    display: inline;
+    font-size: 14px;
+    font-weight: 600;
+    color: white;
+}
+
+.upload-result-badge {
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 12px;
+    font-weight: 700;
+    text-transform: uppercase;
+}
+
+.upload-result-badge.success {
+    background: rgba(34, 197, 94, 0.9);
+    color: white;
+}
+
+.upload-result-badge.failed {
+    background: rgba(239, 68, 68, 0.9);
+    color: white;
+}
+
+.upload-result-badge.skipped {
+    background: rgba(156, 163, 175, 0.9);
+    color: white;
+}
+
+.upload-status-config {
+    grid-column: 1 / -1;
+}
+
+.upload-status-config span {
+    font-size: 13px;
+    font-weight: 500;
+    color: #fcd34d;
+}
+
+.upload-status-response {
+    grid-column: 1 / -1;
+}
+
+.upload-status-response strong {
+    display: block;
+    margin-bottom: 4px;
+}
+
+.upload-response-body {
+    display: block;
+    margin: 8px 0 0;
+    padding: 10px;
+    font-size: 12px;
+    font-family: ui-monospace, monospace;
+    background: rgba(0, 0, 0, 0.25);
+    border-radius: 6px;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 120px;
+    overflow-y: auto;
+    color: #e5e7eb;
+}
+
+.upload-status-error {
+    grid-column: 1 / -1;
+}
+
+.upload-status-error span {
+    font-size: 13px;
+    font-weight: 500;
+    color: #fecaca;
+}
+
 
